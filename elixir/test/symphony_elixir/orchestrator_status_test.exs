@@ -99,6 +99,10 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
              message: %{method: "some-event"},
              timestamp: now
            }
+
+    assert snapshot_entry.progress_phase == "Starting Codex"
+    assert snapshot_entry.progress_detail == "Codex session started"
+    assert snapshot_entry.progress_updated_at == now
   end
 
   test "orchestrator snapshot tracks codex thread totals and app-server pid" do
@@ -1298,6 +1302,33 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     refute plain =~ " notification "
   end
 
+  test "status dashboard renders stable progress detail when present" do
+    row =
+      StatusDashboard.format_running_summary_for_test(%{
+        identifier: "MT-234",
+        state: "In Progress",
+        session_id: "thread-1234567890",
+        codex_app_server_pid: "4242",
+        codex_total_tokens: 12,
+        runtime_seconds: 15,
+        progress_phase: "Running lint",
+        progress_detail: "pnpm lint",
+        last_codex_event: :notification,
+        last_codex_message: %{
+          event: :notification,
+          message: %{
+            "method" => "codex/event/token_count",
+            "params" => %{"total_tokens" => 12}
+          }
+        }
+      })
+
+    plain = Regex.replace(~r/\e\[[\\d;]*m/, row, "")
+
+    assert plain =~ "Running lint: pnpm lint"
+    refute plain =~ "token count update"
+  end
+
   test "status dashboard strips ANSI and control bytes from last codex message" do
     payload =
       "cmd: " <>
@@ -1401,6 +1432,45 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
 
       assert humanized =~ expected_fragment
     end)
+  end
+
+  test "status dashboard classifies meaningful codex progress updates" do
+    lint_update = %{
+      event: :notification,
+      message: %{
+        "method" => "codex/event/exec_command_begin",
+        "params" => %{"msg" => %{"command" => "pnpm lint"}}
+      },
+      timestamp: DateTime.utc_now()
+    }
+
+    review_update = %{
+      event: :notification,
+      message: %{
+        "method" => "codex/event/exec_command_begin",
+        "params" => %{"msg" => %{"command" => "codex review --base origin/main"}}
+      },
+      timestamp: DateTime.utc_now()
+    }
+
+    token_update = %{
+      event: :notification,
+      message: %{
+        "method" => "codex/event/token_count",
+        "params" => %{
+          "token_usage" => %{"input_tokens" => 10, "output_tokens" => 2, "total_tokens" => 12}
+        }
+      },
+      timestamp: DateTime.utc_now()
+    }
+
+    assert %{phase: "Running lint", detail: "pnpm lint"} =
+             StatusDashboard.codex_progress_update_for_test(lint_update)
+
+    assert %{phase: "Running PR review", detail: "codex review --base origin/main"} =
+             StatusDashboard.codex_progress_update_for_test(review_update)
+
+    assert StatusDashboard.codex_progress_update_for_test(token_update) == nil
   end
 
   test "status dashboard humanizes dynamic tool wrapper events" do

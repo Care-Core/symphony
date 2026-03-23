@@ -174,6 +174,7 @@ defmodule SymphonyElixir.Orchestrator do
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+          |> maybe_refresh_progress_for_runtime_info(runtime_info)
 
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
@@ -331,6 +332,14 @@ defmodule SymphonyElixir.Orchestrator do
   @spec select_worker_host_for_test(term(), String.t() | nil) :: String.t() | nil | :no_worker_capacity
   def select_worker_host_for_test(%State{} = state, preferred_worker_host) do
     select_worker_host(state, preferred_worker_host)
+  end
+
+  @doc false
+  @spec claim_issue_for_dispatch_for_test(Issue.t(), (String.t(), String.t() -> :ok | {:error, term()})) ::
+          Issue.t()
+  def claim_issue_for_dispatch_for_test(%Issue{} = issue, issue_state_updater)
+      when is_function(issue_state_updater, 2) do
+    claim_issue_for_dispatch(issue, issue_state_updater)
   end
 
   defp reconcile_running_issue_states([], state, _active_states, _terminal_states), do: state
@@ -696,21 +705,27 @@ defmodule SymphonyElixir.Orchestrator do
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
+        claimed_issue = claim_issue_for_dispatch(issue)
+        started_at = DateTime.utc_now()
+        initial_progress = initial_progress_snapshot(issue, claimed_issue)
 
-        Logger.info("Dispatching issue to agent: #{issue_context(issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
+        Logger.info("Dispatching issue to agent: #{issue_context(claimed_issue)} pid=#{inspect(pid)} attempt=#{inspect(attempt)} worker_host=#{worker_host || "local"}")
 
         running =
           Map.put(state.running, issue.id, %{
             pid: pid,
             ref: ref,
-            identifier: issue.identifier,
-            issue: issue,
+            identifier: claimed_issue.identifier,
+            issue: claimed_issue,
             worker_host: worker_host,
             workspace_path: nil,
             session_id: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
+            progress_phase: initial_progress.phase,
+            progress_detail: initial_progress.detail,
+            progress_updated_at: started_at,
             codex_app_server_pid: nil,
             codex_input_tokens: 0,
             codex_output_tokens: 0,
@@ -720,7 +735,7 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_total_tokens: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
-            started_at: DateTime.utc_now()
+            started_at: started_at
           })
 
         %{
@@ -1114,6 +1129,9 @@ defmodule SymphonyElixir.Orchestrator do
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: metadata.session_id,
           codex_app_server_pid: metadata.codex_app_server_pid,
+          progress_phase: Map.get(metadata, :progress_phase),
+          progress_detail: Map.get(metadata, :progress_detail),
+          progress_updated_at: Map.get(metadata, :progress_updated_at),
           codex_input_tokens: metadata.codex_input_tokens,
           codex_output_tokens: metadata.codex_output_tokens,
           codex_total_tokens: metadata.codex_total_tokens,
@@ -1171,6 +1189,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)
+    summarized_update = summarize_codex_update(update)
+    progress_update = StatusDashboard.codex_progress_update(summarized_update)
     codex_input_tokens = Map.get(running_entry, :codex_input_tokens, 0)
     codex_output_tokens = Map.get(running_entry, :codex_output_tokens, 0)
     codex_total_tokens = Map.get(running_entry, :codex_total_tokens, 0)
@@ -1183,9 +1203,12 @@ defmodule SymphonyElixir.Orchestrator do
     {
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
-        last_codex_message: summarize_codex_update(update),
+        last_codex_message: summarized_update,
         session_id: session_id_for_update(running_entry.session_id, update),
         last_codex_event: event,
+        progress_phase: Map.get(progress_update || %{}, :phase, Map.get(running_entry, :progress_phase)),
+        progress_detail: Map.get(progress_update || %{}, :detail, Map.get(running_entry, :progress_detail)),
+        progress_updated_at: Map.get(progress_update || %{}, :updated_at, Map.get(running_entry, :progress_updated_at)),
         codex_app_server_pid: codex_app_server_pid_for_update(codex_app_server_pid, update),
         codex_input_tokens: codex_input_tokens + token_delta.input_tokens,
         codex_output_tokens: codex_output_tokens + token_delta.output_tokens,
@@ -1242,6 +1265,65 @@ defmodule SymphonyElixir.Orchestrator do
       timestamp: update[:timestamp]
     }
   end
+
+  defp claim_issue_for_dispatch(issue, issue_state_updater \\ &Tracker.update_issue_state/2)
+
+  defp claim_issue_for_dispatch(%Issue{id: issue_id, state: state_name} = issue, issue_state_updater)
+       when is_binary(issue_id) and is_binary(state_name) and is_function(issue_state_updater, 2) do
+    if normalize_issue_state(state_name) == "todo" do
+      case issue_state_updater.(issue_id, "In Progress") do
+        :ok ->
+          %{issue | state: "In Progress"}
+
+        {:error, reason} ->
+          Logger.warning("Failed to move issue to In Progress before agent start: #{issue_context(issue)} reason=#{inspect(reason)}")
+          issue
+      end
+    else
+      issue
+    end
+  end
+
+  defp claim_issue_for_dispatch(%Issue{} = issue, _issue_state_updater), do: issue
+
+  defp initial_progress_snapshot(%Issue{state: original_state}, %Issue{state: claimed_state})
+       when is_binary(original_state) and is_binary(claimed_state) do
+    cond do
+      normalize_issue_state(original_state) == "todo" and normalize_issue_state(claimed_state) == "in progress" ->
+        %{phase: "Claimed", detail: "Moved to In Progress; preparing workspace"}
+
+      normalize_issue_state(claimed_state) == "in progress" ->
+        %{phase: "Resuming", detail: "Preparing existing In Progress workspace"}
+
+      true ->
+        %{phase: "Claimed", detail: "Preparing workspace"}
+    end
+  end
+
+  defp initial_progress_snapshot(_original_issue, _claimed_issue) do
+    %{phase: "Claimed", detail: "Preparing workspace"}
+  end
+
+  defp maybe_refresh_progress_for_runtime_info(running_entry, runtime_info) when is_map(runtime_info) do
+    workspace_path = Map.get(runtime_info, :workspace_path)
+
+    cond do
+      not is_binary(workspace_path) or workspace_path == "" ->
+        running_entry
+
+      Map.get(running_entry, :last_codex_message) != nil ->
+        running_entry
+
+      true ->
+        Map.merge(running_entry, %{
+          progress_phase: "Bootstrapping",
+          progress_detail: "Workspace #{Path.basename(workspace_path)} ready; starting Codex",
+          progress_updated_at: DateTime.utc_now()
+        })
+    end
+  end
+
+  defp maybe_refresh_progress_for_runtime_info(running_entry, _runtime_info), do: running_entry
 
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
     if is_reference(state.tick_timer_ref) do

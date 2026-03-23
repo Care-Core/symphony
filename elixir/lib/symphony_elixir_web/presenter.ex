@@ -106,6 +106,9 @@ defmodule SymphonyElixirWeb.Presenter do
       turn_count: Map.get(entry, :turn_count, 0),
       last_event: entry.last_codex_event,
       last_message: summarize_message(entry.last_codex_message),
+      progress_phase: Map.get(entry, :progress_phase),
+      progress_detail: Map.get(entry, :progress_detail),
+      progress_updated_at: iso8601(Map.get(entry, :progress_updated_at)),
       started_at: iso8601(entry.started_at),
       last_event_at: iso8601(entry.last_codex_timestamp),
       tokens: %{
@@ -138,6 +141,9 @@ defmodule SymphonyElixirWeb.Presenter do
       started_at: iso8601(running.started_at),
       last_event: running.last_codex_event,
       last_message: summarize_message(running.last_codex_message),
+      progress_phase: Map.get(running, :progress_phase),
+      progress_detail: Map.get(running, :progress_detail),
+      progress_updated_at: iso8601(Map.get(running, :progress_updated_at)),
       last_event_at: iso8601(running.last_codex_timestamp),
       tokens: %{
         input_tokens: running.codex_input_tokens,
@@ -172,7 +178,9 @@ defmodule SymphonyElixirWeb.Presenter do
       %{
         at: iso8601(running.last_codex_timestamp),
         event: running.last_codex_event,
-        message: summarize_message(running.last_codex_message)
+        message: summarize_message(running.last_codex_message),
+        progress_phase: Map.get(running, :progress_phase),
+        progress_detail: Map.get(running, :progress_detail)
       }
     ]
     |> Enum.reject(&is_nil(&1.at))

@@ -144,7 +144,7 @@ defmodule SymphonyElixirWeb.DashboardLive do
                     <th>State</th>
                     <th>Session</th>
                     <th>Runtime / turns</th>
-                    <th>Codex update</th>
+                    <th>Progress</th>
                     <th>Tokens</th>
                   </tr>
                 </thead>
@@ -183,8 +183,11 @@ defmodule SymphonyElixirWeb.DashboardLive do
                       <div class="detail-stack">
                         <span
                           class="event-text"
-                          title={entry.last_message || to_string(entry.last_event || "n/a")}
-                        ><%= entry.last_message || to_string(entry.last_event || "n/a") %></span>
+                          title={progress_title(entry)}
+                        ><%= progress_headline(entry) %></span>
+                        <span class="muted event-meta">
+                          <%= progress_detail(entry) %>
+                        </span>
                         <span class="muted event-meta">
                           <%= entry.last_event || "n/a" %>
                           <%= if entry.last_event_at do %>
@@ -255,6 +258,21 @@ defmodule SymphonyElixirWeb.DashboardLive do
 
   defp orchestrator do
     Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator
+  end
+
+  defp progress_headline(entry) do
+    entry.progress_phase || entry.last_message || to_string(entry.last_event || "n/a")
+  end
+
+  defp progress_detail(entry) do
+    entry.progress_detail || entry.last_message || "No detailed progress yet"
+  end
+
+  defp progress_title(entry) do
+    [progress_headline(entry), progress_detail(entry)]
+    |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
+    |> Enum.uniq()
+    |> Enum.join(" — ")
   end
 
   defp snapshot_timeout_ms do
