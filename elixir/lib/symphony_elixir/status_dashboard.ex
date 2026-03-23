@@ -598,7 +598,7 @@ defmodule SymphonyElixir.StatusDashboard do
     turn_count = Map.get(running_entry, :turn_count, 0)
     age = format_cell(format_runtime_and_turns(runtime_seconds, turn_count), @running_age_width)
     event = running_entry.last_codex_event || "none"
-    event_label = format_cell(summarize_message(running_entry.last_codex_message), running_event_width)
+    event_label = format_cell(progress_summary(running_entry), running_event_width)
 
     tokens = format_count(total_tokens) |> format_cell(@running_tokens_width, :right)
 
@@ -745,7 +745,7 @@ defmodule SymphonyElixir.StatusDashboard do
         format_cell("AGE / TURN", @running_age_width),
         format_cell("TOKENS", @running_tokens_width),
         format_cell("SESSION", @running_session_width),
-        format_cell("EVENT", running_event_width)
+        format_cell("PROGRESS", running_event_width)
       ]
       |> Enum.join(" ")
 
@@ -1093,6 +1093,78 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp summarize_message(message), do: humanize_codex_message(message)
+
+  defp progress_summary(running_entry) when is_map(running_entry) do
+    phase = Map.get(running_entry, :progress_phase)
+    detail = Map.get(running_entry, :progress_detail)
+
+    cond do
+      is_binary(phase) and is_binary(detail) and detail != "" ->
+        "#{phase}: #{detail}"
+
+      is_binary(detail) and detail != "" ->
+        detail
+
+      is_binary(phase) and phase != "" ->
+        phase
+
+      true ->
+        summarize_message(Map.get(running_entry, :last_codex_message))
+    end
+  end
+
+  @doc false
+  @spec codex_progress_update(map()) ::
+          %{phase: String.t(), detail: String.t(), updated_at: DateTime.t() | nil} | nil
+  def codex_progress_update(%{event: event, message: message} = update) do
+    payload = unwrap_codex_message_payload(message)
+    detail = humanize_codex_message(update)
+    method = map_value(payload, ["method", :method])
+    wrapper_event = wrapper_event_name(method)
+    command = extract_command(payload)
+
+    cond do
+      event == :session_started ->
+        progress_snapshot("Starting Codex", "Codex session started", update[:timestamp])
+
+      noisy_progress_method?(method) or noisy_progress_wrapper_event?(wrapper_event) ->
+        nil
+
+      is_binary(command) and String.trim(command) != "" ->
+        classify_command_progress(command, update[:timestamp])
+
+      method == "turn/plan/updated" ->
+        progress_snapshot("Planning", detail, update[:timestamp])
+
+      method == "turn/diff/updated" or wrapper_event == "turn_diff" ->
+        progress_snapshot("Editing", detail, update[:timestamp])
+
+      method == "turn/started" ->
+        progress_snapshot("Working", detail, update[:timestamp])
+
+      method == "turn/completed" ->
+        progress_snapshot("Working", detail, update[:timestamp])
+
+      method == "item/tool/requestUserInput" or method == "tool/requestUserInput" ->
+        progress_snapshot("Waiting", detail, update[:timestamp])
+
+      wrapper_event == "mcp_tool_call_begin" ->
+        progress_snapshot("Calling tools", detail, update[:timestamp])
+
+      wrapper_event == "task_started" ->
+        progress_snapshot("Starting Codex", "Task started", update[:timestamp])
+
+      true ->
+        nil
+    end
+  end
+
+  def codex_progress_update(_update), do: nil
+
+  @doc false
+  @spec codex_progress_update_for_test(map()) ::
+          %{phase: String.t(), detail: String.t(), updated_at: DateTime.t() | nil} | nil
+  def codex_progress_update_for_test(update), do: codex_progress_update(update)
 
   defp humanize_codex_event(:session_started, _message, payload) do
     session_id = map_value(payload, ["session_id", :session_id])
@@ -1527,6 +1599,107 @@ defmodule SymphonyElixir.StatusDashboard do
     end
   end
 
+  defp progress_snapshot(phase, detail, timestamp) when is_binary(phase) and is_binary(detail) do
+    %{phase: phase, detail: truncate(detail, 140), updated_at: timestamp}
+  end
+
+  defp noisy_progress_method?(method)
+       when method in [
+              "account/rateLimits/updated",
+              "thread/tokenUsage/updated",
+              "item/agentMessage/delta",
+              "item/plan/delta",
+              "item/reasoning/summaryTextDelta",
+              "item/reasoning/summaryPartAdded",
+              "item/reasoning/textDelta",
+              "item/commandExecution/outputDelta",
+              "item/fileChange/outputDelta"
+            ],
+       do: true
+
+  defp noisy_progress_method?(_method), do: false
+
+  defp noisy_progress_wrapper_event?(event)
+       when event in [
+              "mcp_startup_update",
+              "mcp_startup_complete",
+              "agent_message_delta",
+              "agent_message_content_delta",
+              "agent_reasoning_delta",
+              "reasoning_content_delta",
+              "exec_command_output_delta",
+              "token_count"
+            ],
+       do: true
+
+  defp noisy_progress_wrapper_event?(_event), do: false
+
+  defp wrapper_event_name(<<"codex/event/", suffix::binary>>), do: suffix
+  defp wrapper_event_name(_method), do: nil
+
+  defp classify_command_progress(command, timestamp) when is_binary(command) do
+    normalized =
+      command
+      |> normalize_command()
+      |> to_string()
+      |> String.trim()
+      |> String.downcase()
+
+    phase =
+      cond do
+        String.contains?(normalized, "pnpm docs:check") ->
+          "Running docs check"
+
+        String.contains?(normalized, "pnpm repo:check") ->
+          "Running repo checks"
+
+        String.contains?(normalized, "pnpm lint") ->
+          "Running lint"
+
+        String.contains?(normalized, "pnpm build") or String.contains?(normalized, "next build") ->
+          "Running build"
+
+        String.contains?(normalized, "pnpm test") or String.contains?(normalized, "vitest") or
+          String.contains?(normalized, "jest") or String.contains?(normalized, "playwright test") or
+            String.contains?(normalized, "pytest") ->
+          "Running tests"
+
+        String.contains?(normalized, "codex review") ->
+          "Running PR review"
+
+        String.contains?(normalized, "security-best-practices") ->
+          "Running security review"
+
+        String.contains?(normalized, "gh pr create") ->
+          "Opening PR"
+
+        String.starts_with?(normalized, "git push") ->
+          "Pushing branch"
+
+        String.starts_with?(normalized, "git commit") or String.contains?(normalized, "scripts/committer") ->
+          "Committing"
+
+        String.contains?(normalized, "pnpm proof:video") ->
+          "Recording proof of work"
+
+        String.contains?(normalized, "pnpm workspace:bootstrap") ->
+          "Bootstrapping workspace"
+
+        String.contains?(normalized, "pnpm workspace:dev") ->
+          "Starting app"
+
+        String.starts_with?(normalized, "rg ") or String.starts_with?(normalized, "sed ") or
+          String.starts_with?(normalized, "cat ") or String.starts_with?(normalized, "ls ") or
+          String.starts_with?(normalized, "git diff") or String.starts_with?(normalized, "git status") ->
+          "Inspecting repo"
+
+        true ->
+          "Running command"
+      end
+
+    progress_snapshot(phase, inline_text(command), timestamp)
+  end
+
   defp humanize_exec_command_begin(payload) do
     command =
       map_path(payload, ["params", "msg", "command"]) ||
@@ -1717,6 +1890,9 @@ defmodule SymphonyElixir.StatusDashboard do
 
   defp fallback_command(nil, payload) do
     map_path(payload, ["params", "command"]) ||
+      map_path(payload, ["params", "msg", "command"]) ||
+      map_path(payload, ["params", "msg", "parsed_cmd"]) ||
+      map_path(payload, ["params", "msg", "parsedCmd"]) ||
       map_path(payload, ["params", "cmd"]) ||
       map_path(payload, ["params", "argv"]) ||
       map_path(payload, ["params", "args"])

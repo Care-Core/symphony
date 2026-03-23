@@ -476,6 +476,38 @@ defmodule SymphonyElixir.CoreTest do
     assert updated_entry.issue.state == "In Progress"
   end
 
+  test "claim_issue_for_dispatch_for_test moves Todo issues to In Progress" do
+    issue = %Issue{
+      id: "issue-claim",
+      identifier: "MT-CLAIM",
+      state: "Todo",
+      title: "Claim me",
+      description: "Claim me",
+      labels: []
+    }
+
+    assert %Issue{state: "In Progress"} =
+             Orchestrator.claim_issue_for_dispatch_for_test(issue, fn "issue-claim", "In Progress" ->
+               :ok
+             end)
+  end
+
+  test "claim_issue_for_dispatch_for_test leaves Todo issues unchanged when state update fails" do
+    issue = %Issue{
+      id: "issue-claim-fail",
+      identifier: "MT-CLAIM-FAIL",
+      state: "Todo",
+      title: "Claim me",
+      description: "Claim me",
+      labels: []
+    }
+
+    assert %Issue{state: "Todo"} =
+             Orchestrator.claim_issue_for_dispatch_for_test(issue, fn "issue-claim-fail", "In Progress" ->
+               {:error, :boom}
+             end)
+  end
+
   test "reconcile stops running issue when it is reassigned away from this worker" do
     issue_id = "issue-reassigned"
 
