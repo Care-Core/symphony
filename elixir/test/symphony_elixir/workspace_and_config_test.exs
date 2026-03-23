@@ -371,6 +371,25 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     refute issue.assigned_to_worker
   end
 
+  test "linear client requires configured labels before routing to worker" do
+    raw_issue = %{
+      "id" => "issue-100",
+      "identifier" => "MT-100",
+      "title" => "Agent task",
+      "state" => %{"name" => "Todo"},
+      "assignee" => %{"id" => "user-1"},
+      "labels" => %{"nodes" => [%{"name" => " Agent Ready "}, %{"name" => "Backend"}]}
+    }
+
+    issue = Client.normalize_issue_for_test(raw_issue, "user-1", ["agent ready"])
+
+    assert issue.assigned_to_worker
+    assert issue.labels == ["agent ready", "backend"]
+
+    issue_without_required_label = Client.normalize_issue_for_test(raw_issue, "user-1", ["agent ready", "bug"])
+    refute issue_without_required_label.assigned_to_worker
+  end
+
   test "linear client pagination merge helper preserves issue ordering" do
     issue_page_1 = [
       %Issue{id: "issue-1", identifier: "MT-1"},
