@@ -1503,10 +1503,15 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp extract_rate_limits(update) do
     rate_limits_from_payload(update[:rate_limits]) ||
+      rate_limits_from_payload(update[:rateLimits]) ||
       rate_limits_from_payload(Map.get(update, "rate_limits")) ||
+      rate_limits_from_payload(Map.get(update, "rateLimits")) ||
       rate_limits_from_payload(Map.get(update, :rate_limits)) ||
+      rate_limits_from_payload(Map.get(update, :rateLimits)) ||
       rate_limits_from_payload(update[:payload]) ||
+      rate_limits_from_payload(update[:details]) ||
       rate_limits_from_payload(Map.get(update, "payload")) ||
+      rate_limits_from_payload(Map.get(update, "details")) ||
       rate_limits_from_payload(update)
   end
 
@@ -1544,7 +1549,11 @@ defmodule SymphonyElixir.Orchestrator do
   defp turn_completed_usage_from_payload(_payload), do: nil
 
   defp rate_limits_from_payload(payload) when is_map(payload) do
-    direct = Map.get(payload, "rate_limits") || Map.get(payload, :rate_limits)
+    direct =
+      Map.get(payload, "rate_limits") ||
+        Map.get(payload, :rate_limits) ||
+        Map.get(payload, "rateLimits") ||
+        Map.get(payload, :rateLimits)
 
     cond do
       rate_limits_map?(direct) ->
@@ -1593,19 +1602,24 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp rate_limits_map?(payload) when is_map(payload) do
-    limit_id =
-      Map.get(payload, "limit_id") ||
-        Map.get(payload, :limit_id) ||
-        Map.get(payload, "limit_name") ||
-        Map.get(payload, :limit_name)
-
     has_buckets =
       Enum.any?(
-        ["primary", :primary, "secondary", :secondary, "credits", :credits],
+        [
+          "primary",
+          :primary,
+          "secondary",
+          :secondary,
+          "credits",
+          :credits,
+          "rateLimits",
+          :rateLimits,
+          "rate_limits",
+          :rate_limits
+        ],
         &Map.has_key?(payload, &1)
       )
 
-    !is_nil(limit_id) and has_buckets
+    has_buckets
   end
 
   defp rate_limits_map?(_payload), do: false
