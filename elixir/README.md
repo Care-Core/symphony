@@ -89,6 +89,8 @@ Minimal example:
 ---
 tracker:
   kind: linear
+  # Optional: narrow polling to one Linear project slugId.
+  # Omit for workspace-wide polling.
   project_slug: "..."
 workspace:
   root: ~/code/workspaces

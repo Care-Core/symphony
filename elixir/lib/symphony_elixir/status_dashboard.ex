@@ -399,7 +399,7 @@ defmodule SymphonyElixir.StatusDashboard do
           colorize(linear_project_url(project_slug), @ansi_cyan)
 
         _ ->
-          colorize("n/a", @ansi_gray)
+          colorize("workspace-wide (no project filter)", @ansi_gray)
       end
 
     project_line = colorize("│ Project: ", @ansi_bold) <> project_part

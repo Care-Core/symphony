@@ -477,6 +477,49 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert log =~ "Variable \\\"$ids\\\" got invalid value"
   end
 
+  test "linear client fetches by states without a project slug by using workspace-wide query" do
+    raw_issue = fn issue_id ->
+      %{
+        "id" => issue_id,
+        "identifier" => "MT-#{issue_id}",
+        "title" => "Workspace-wide issue #{issue_id}",
+        "description" => "Fetched without project scope",
+        "priority" => 2,
+        "state" => %{"name" => "Todo"},
+        "branchName" => "feature/#{issue_id}",
+        "url" => "https://linear.app/example/#{issue_id}",
+        "assignee" => nil,
+        "labels" => %{"nodes" => []},
+        "inverseRelations" => %{"nodes" => []},
+        "createdAt" => "2026-03-30T00:00:00Z",
+        "updatedAt" => "2026-03-30T00:00:00Z"
+      }
+    end
+
+    graphql_fun = fn query, variables ->
+      send(self(), {:fetch_workspace_states, query, variables})
+
+      {:ok,
+       %{
+         "data" => %{
+           "issues" => %{
+             "nodes" => [raw_issue.("issue-1")],
+             "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+           }
+         }
+       }}
+    end
+
+    assert {:ok, [%Issue{id: "issue-1"}]} =
+             Client.fetch_issues_by_states_for_test(["Todo"], nil, graphql_fun)
+
+    assert_receive {:fetch_workspace_states, query, %{stateNames: ["Todo"], first: 50, relationFirst: 50, after: nil} = variables}
+
+    refute Map.has_key?(variables, :projectSlug)
+    assert query =~ "SymphonyLinearPollWorkspace"
+    refute query =~ "projectSlug"
+  end
+
   test "orchestrator sorts dispatch by priority then oldest created_at" do
     issue_same_priority_older = %Issue{
       id: "issue-old-high",
