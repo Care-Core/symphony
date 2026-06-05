@@ -561,6 +561,103 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server auto-approves MCP server elicitation tool approvals when approval policy is never" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-mcp-elicitation-auto-approve-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-720")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-mcp-elicitation-auto-approve.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-mcp-elicitation-auto-approve.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-720"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-720"}}}'
+            printf '%s\\n' '{"id":112,"method":"mcpServer/elicitation/request","params":{"threadId":"thread-720","turnId":"turn-720","serverName":"codex_apps","mode":"form","message":"Allow Linear to run tool \\"linear_save_comment\\"?","requestedSchema":{"type":"object","properties":{}},"_meta":{"codex_approval_kind":"mcp_tool_call","source":"connector","tool_title":"save_comment","persist":["session","always"]}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "never"
+      )
+
+      issue = %Issue{
+        id: "issue-mcp-elicitation-auto-approve",
+        identifier: "MT-720",
+        title: "Auto approve MCP server elicitation",
+        description: "Ensure newer app-server MCP elicitations continue automatically",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-720",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Handle MCP elicitation approval", issue)
+
+      trace = File.read!(trace_file)
+      lines = String.split(trace, "\n", trim: true)
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 payload =
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+
+                 payload["id"] == 112 and payload["result"] == %{"action" => "accept", "content" => %{}}
+               else
+                 false
+               end
+             end)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server sends a generic non-interactive answer for freeform tool input prompts" do
     test_root =
       Path.join(
@@ -626,6 +723,112 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert {:ok, _result} =
                AppServer.run(workspace, "Handle generic tool input", issue, on_message: on_message)
+
+      assert_received {:app_server_message,
+                       %{
+                         event: :tool_input_auto_answered,
+                         answer: "This is a non-interactive session. Operator input is unavailable."
+                       }}
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server declines non-approval MCP server elicitations in unattended runs" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-mcp-elicitation-decline-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-721")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-mcp-elicitation-decline.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEx_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEx_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-mcp-elicitation-decline.trace}"
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            ;;
+          3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-721"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-721"}}}'
+            printf '%s\\n' '{"id":113,"method":"mcpServer/elicitation/request","params":{"threadId":"thread-721","turnId":"turn-721","serverName":"codex_apps","mode":"form","message":"Provide extra context","requestedSchema":{"type":"object","properties":{"comment":{"type":"string"}}}}}'
+            ;;
+          5)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "never"
+      )
+
+      issue = %Issue{
+        id: "issue-mcp-elicitation-decline",
+        identifier: "MT-721",
+        title: "Decline MCP server elicitation",
+        description: "Ensure arbitrary MCP elicitations cannot stall unattended runs",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-721",
+        labels: ["backend"]
+      }
+
+      on_message = fn message -> send(self(), {:app_server_message, message}) end
+
+      assert {:ok, _result} =
+               AppServer.run(workspace, "Handle arbitrary MCP elicitation", issue, on_message: on_message)
+
+      trace = File.read!(trace_file)
+      lines = String.split(trace, "\n", trim: true)
+
+      assert Enum.any?(lines, fn line ->
+               if String.starts_with?(line, "JSON:") do
+                 payload =
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+
+                 payload["id"] == 113 and payload["result"] == %{"action" => "decline"}
+               else
+                 false
+               end
+             end)
 
       assert_received {:app_server_message,
                        %{
