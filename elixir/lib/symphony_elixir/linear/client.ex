@@ -153,14 +153,12 @@ defmodule SymphonyElixir.Linear.Client do
     tracker = Config.settings!().tracker
     project_slug = tracker.project_slug
 
-    cond do
-      is_nil(tracker.api_key) ->
-        {:error, :missing_linear_api_token}
-
-      true ->
-        with {:ok, routing_filter} <- routing_filter() do
-          do_fetch_by_states(project_slug, tracker.active_states, routing_filter)
-        end
+    if is_nil(tracker.api_key) do
+      {:error, :missing_linear_api_token}
+    else
+      with {:ok, routing_filter} <- routing_filter() do
+        do_fetch_by_states(project_slug, tracker.active_states, routing_filter)
+      end
     end
   end
 
@@ -174,12 +172,10 @@ defmodule SymphonyElixir.Linear.Client do
       tracker = Config.settings!().tracker
       project_slug = tracker.project_slug
 
-      cond do
-        is_nil(tracker.api_key) ->
-          {:error, :missing_linear_api_token}
-
-        true ->
-          do_fetch_by_states(project_slug, normalized_states, nil)
+      if is_nil(tracker.api_key) do
+        {:error, :missing_linear_api_token}
+      else
+        do_fetch_by_states(project_slug, normalized_states, nil)
       end
     end
   end
@@ -556,10 +552,6 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp issue_routable_to_worker?(assignee, labels, %{assignee: assignee_filter, required_labels: required_labels}) do
     assignee_matches?(assignee, assignee_filter) and labels_match?(labels, required_labels)
-  end
-
-  defp issue_routable_to_worker?(assignee, labels, assignee_filter) do
-    assignee_matches?(assignee, assignee_filter) and labels_match?(labels, [])
   end
 
   defp assignee_matches?(_assignee, nil), do: true

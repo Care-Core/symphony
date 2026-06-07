@@ -153,6 +153,16 @@ defmodule SymphonyElixir.AppServerTest do
       Enum.each(policy_cases, fn configured_policy ->
         File.rm(trace_file)
 
+        expected_policy =
+          case configured_policy do
+            %{"type" => "workspaceWrite"} ->
+              {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+              Map.put(configured_policy, "writableRoots", ["relative/path", canonical_workspace])
+
+            _ ->
+              configured_policy
+          end
+
         write_workflow_file!(Workflow.workflow_file_path(),
           workspace_root: workspace_root,
           codex_command: "#{codex_binary} app-server",
@@ -171,7 +181,7 @@ defmodule SymphonyElixir.AppServerTest do
                    |> Jason.decode!()
                    |> then(fn payload ->
                      payload["method"] == "turn/start" &&
-                       get_in(payload, ["params", "sandboxPolicy"]) == configured_policy
+                       get_in(payload, ["params", "sandboxPolicy"]) == expected_policy
                    end)
                  else
                    false

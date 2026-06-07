@@ -1323,8 +1323,6 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp maybe_refresh_progress_for_runtime_info(running_entry, _runtime_info), do: running_entry
-
   defp schedule_tick(%State{} = state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
     if is_reference(state.tick_timer_ref) do
       Process.cancel_timer(state.tick_timer_ref)
@@ -1502,17 +1500,25 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp extract_rate_limits(update) do
-    rate_limits_from_payload(update[:rate_limits]) ||
-      rate_limits_from_payload(update[:rateLimits]) ||
-      rate_limits_from_payload(Map.get(update, "rate_limits")) ||
-      rate_limits_from_payload(Map.get(update, "rateLimits")) ||
-      rate_limits_from_payload(Map.get(update, :rate_limits)) ||
-      rate_limits_from_payload(Map.get(update, :rateLimits)) ||
-      rate_limits_from_payload(update[:payload]) ||
-      rate_limits_from_payload(update[:details]) ||
-      rate_limits_from_payload(Map.get(update, "payload")) ||
-      rate_limits_from_payload(Map.get(update, "details")) ||
-      rate_limits_from_payload(update)
+    update
+    |> rate_limit_payload_candidates()
+    |> Enum.find_value(&rate_limits_from_payload/1)
+  end
+
+  defp rate_limit_payload_candidates(update) do
+    [
+      update[:rate_limits],
+      update[:rateLimits],
+      Map.get(update, "rate_limits"),
+      Map.get(update, "rateLimits"),
+      Map.get(update, :rate_limits),
+      Map.get(update, :rateLimits),
+      update[:payload],
+      update[:details],
+      Map.get(update, "payload"),
+      Map.get(update, "details"),
+      update
+    ]
   end
 
   defp absolute_token_usage_from_payload(payload) when is_map(payload) do

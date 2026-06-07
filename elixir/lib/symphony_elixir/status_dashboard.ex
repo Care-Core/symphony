@@ -1133,29 +1133,8 @@ defmodule SymphonyElixir.StatusDashboard do
       is_binary(command) and String.trim(command) != "" ->
         classify_command_progress(command, update[:timestamp])
 
-      method == "turn/plan/updated" ->
-        progress_snapshot("Planning", detail, update[:timestamp])
-
-      method == "turn/diff/updated" or wrapper_event == "turn_diff" ->
-        progress_snapshot("Editing", detail, update[:timestamp])
-
-      method == "turn/started" ->
-        progress_snapshot("Working", detail, update[:timestamp])
-
-      method == "turn/completed" ->
-        progress_snapshot("Working", detail, update[:timestamp])
-
-      method == "item/tool/requestUserInput" or method == "tool/requestUserInput" ->
-        progress_snapshot("Waiting", detail, update[:timestamp])
-
-      wrapper_event == "mcp_tool_call_begin" ->
-        progress_snapshot("Calling tools", detail, update[:timestamp])
-
-      wrapper_event == "task_started" ->
-        progress_snapshot("Starting Codex", "Task started", update[:timestamp])
-
       true ->
-        nil
+        codex_progress_snapshot_for_method(method, wrapper_event, detail, update[:timestamp])
     end
   end
 
@@ -1637,6 +1616,31 @@ defmodule SymphonyElixir.StatusDashboard do
   defp wrapper_event_name(<<"codex/event/", suffix::binary>>), do: suffix
   defp wrapper_event_name(_method), do: nil
 
+  defp codex_progress_snapshot_for_method(method, wrapper_event, detail, timestamp) do
+    cond do
+      method == "turn/plan/updated" ->
+        progress_snapshot("Planning", detail, timestamp)
+
+      method == "turn/diff/updated" or wrapper_event == "turn_diff" ->
+        progress_snapshot("Editing", detail, timestamp)
+
+      method in ["turn/started", "turn/completed"] ->
+        progress_snapshot("Working", detail, timestamp)
+
+      method in ["item/tool/requestUserInput", "tool/requestUserInput"] ->
+        progress_snapshot("Waiting", detail, timestamp)
+
+      wrapper_event == "mcp_tool_call_begin" ->
+        progress_snapshot("Calling tools", detail, timestamp)
+
+      wrapper_event == "task_started" ->
+        progress_snapshot("Starting Codex", "Task started", timestamp)
+
+      true ->
+        nil
+    end
+  end
+
   defp classify_command_progress(command, timestamp) when is_binary(command) do
     normalized =
       command
@@ -1645,60 +1649,42 @@ defmodule SymphonyElixir.StatusDashboard do
       |> String.trim()
       |> String.downcase()
 
-    phase =
-      cond do
-        String.contains?(normalized, "pnpm docs:check") ->
-          "Running docs check"
-
-        String.contains?(normalized, "pnpm repo:check") ->
-          "Running repo checks"
-
-        String.contains?(normalized, "pnpm lint") ->
-          "Running lint"
-
-        String.contains?(normalized, "pnpm build") or String.contains?(normalized, "next build") ->
-          "Running build"
-
-        String.contains?(normalized, "pnpm test") or String.contains?(normalized, "vitest") or
-          String.contains?(normalized, "jest") or String.contains?(normalized, "playwright test") or
-            String.contains?(normalized, "pytest") ->
-          "Running tests"
-
-        String.contains?(normalized, "codex review") ->
-          "Running PR review"
-
-        String.contains?(normalized, "security-best-practices") ->
-          "Running security review"
-
-        String.contains?(normalized, "gh pr create") ->
-          "Opening PR"
-
-        String.starts_with?(normalized, "git push") ->
-          "Pushing branch"
-
-        String.starts_with?(normalized, "git commit") or String.contains?(normalized, "scripts/committer") ->
-          "Committing"
-
-        String.contains?(normalized, "pnpm proof:video") ->
-          "Recording proof of work"
-
-        String.contains?(normalized, "pnpm workspace:bootstrap") ->
-          "Bootstrapping workspace"
-
-        String.contains?(normalized, "pnpm workspace:dev") ->
-          "Starting app"
-
-        String.starts_with?(normalized, "rg ") or String.starts_with?(normalized, "sed ") or
-          String.starts_with?(normalized, "cat ") or String.starts_with?(normalized, "ls ") or
-          String.starts_with?(normalized, "git diff") or String.starts_with?(normalized, "git status") ->
-          "Inspecting repo"
-
-        true ->
-          "Running command"
-      end
-
-    progress_snapshot(phase, inline_text(command), timestamp)
+    progress_snapshot(command_progress_phase(normalized), inline_text(command), timestamp)
   end
+
+  defp command_progress_phase(normalized) do
+    Enum.find_value(command_progress_rules(), "Running command", fn {phase, matchers} ->
+      if Enum.any?(matchers, &command_matches?(normalized, &1)), do: phase
+    end)
+  end
+
+  defp command_progress_rules do
+    [
+      {"Running docs check", contains("pnpm docs:check")},
+      {"Running repo checks", contains("pnpm repo:check")},
+      {"Running lint", contains("pnpm lint")},
+      {"Running build", contains(["pnpm build", "next build"])},
+      {"Running tests", contains(["pnpm test", "vitest", "jest", "playwright test", "pytest"])},
+      {"Running PR review", contains("codex review")},
+      {"Running security review", contains("security-best-practices")},
+      {"Opening PR", contains("gh pr create")},
+      {"Pushing branch", starts_with("git push")},
+      {"Committing", starts_with("git commit") ++ contains("scripts/committer")},
+      {"Recording proof of work", contains("pnpm proof:video")},
+      {"Bootstrapping workspace", contains("pnpm workspace:bootstrap")},
+      {"Starting app", contains("pnpm workspace:dev")},
+      {"Inspecting repo", starts_with(["rg ", "sed ", "cat ", "ls ", "git diff", "git status"])}
+    ]
+  end
+
+  defp contains(fragments) when is_list(fragments), do: Enum.map(fragments, &{:contains, &1})
+  defp contains(fragment), do: contains([fragment])
+
+  defp starts_with(prefixes) when is_list(prefixes), do: Enum.map(prefixes, &{:starts_with, &1})
+  defp starts_with(prefix), do: starts_with([prefix])
+
+  defp command_matches?(normalized, {:contains, fragment}), do: String.contains?(normalized, fragment)
+  defp command_matches?(normalized, {:starts_with, prefix}), do: String.starts_with?(normalized, prefix)
 
   defp humanize_exec_command_begin(payload) do
     command =

@@ -3,7 +3,7 @@ defmodule SymphonyElixir.Config do
   Runtime configuration loaded from `WORKFLOW.md`.
   """
 
-  alias SymphonyElixir.Config.Schema
+  alias SymphonyElixir.{Config.Schema, PathSafety}
   alias SymphonyElixir.Workflow
 
   @default_prompt_template """
@@ -63,7 +63,7 @@ defmodule SymphonyElixir.Config do
 
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
-    case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do
+    case runtime_turn_sandbox_policy(settings!(), workspace) do
       {:ok, policy} ->
         policy
 
@@ -102,8 +102,7 @@ defmodule SymphonyElixir.Config do
           {:ok, codex_runtime_settings()} | {:error, term()}
   def codex_runtime_settings(workspace \\ nil, opts \\ []) do
     with {:ok, settings} <- settings() do
-      with {:ok, turn_sandbox_policy} <-
-             Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
+      with {:ok, turn_sandbox_policy} <- runtime_turn_sandbox_policy(settings, workspace, opts) do
         {:ok,
          %{
            approval_policy: settings.codex.approval_policy,
@@ -111,6 +110,69 @@ defmodule SymphonyElixir.Config do
            turn_sandbox_policy: turn_sandbox_policy
          }}
       end
+    end
+  end
+
+  defp runtime_turn_sandbox_policy(settings, workspace, opts \\ []) do
+    with {:ok, policy} <- Schema.resolve_runtime_turn_sandbox_policy(settings, workspace, opts) do
+      add_local_workspace_write_roots(policy, workspace, opts)
+    end
+  end
+
+  defp add_local_workspace_write_roots(%{"type" => "workspaceWrite"} = policy, workspace, opts)
+       when is_binary(workspace) and workspace != "" do
+    if Keyword.get(opts, :remote, false) do
+      {:ok, put_writable_roots(policy, [workspace])}
+    else
+      with {:ok, canonical_workspace} <- PathSafety.canonicalize(Path.expand(workspace)) do
+        roots = [canonical_workspace] ++ git_common_dir_roots(canonical_workspace)
+        {:ok, put_writable_roots(policy, roots)}
+      end
+    end
+  end
+
+  defp add_local_workspace_write_roots(policy, _workspace, _opts), do: {:ok, policy}
+
+  defp put_writable_roots(policy, roots) do
+    existing_roots =
+      case Map.get(policy, "writableRoots") do
+        roots when is_list(roots) -> roots
+        _ -> []
+      end
+
+    Map.put(policy, "writableRoots", Enum.uniq(existing_roots ++ roots))
+  end
+
+  defp git_common_dir_roots(workspace) do
+    case System.cmd("git", ["-C", workspace, "rev-parse", "--git-common-dir"], stderr_to_stdout: true) do
+      {raw_git_common_dir, 0} ->
+        raw_git_common_dir
+        |> String.trim()
+        |> expand_git_path(workspace)
+        |> canonical_git_root()
+
+      _ ->
+        []
+    end
+  rescue
+    _ -> []
+  end
+
+  defp expand_git_path("", _workspace), do: ""
+
+  defp expand_git_path(path, workspace) do
+    case Path.type(path) do
+      :absolute -> path
+      _ -> Path.expand(path, workspace)
+    end
+  end
+
+  defp canonical_git_root(""), do: []
+
+  defp canonical_git_root(path) do
+    case PathSafety.canonicalize(path) do
+      {:ok, canonical_path} -> [canonical_path]
+      _ -> []
     end
   end
 
