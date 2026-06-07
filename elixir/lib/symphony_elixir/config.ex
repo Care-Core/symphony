@@ -125,7 +125,7 @@ defmodule SymphonyElixir.Config do
       {:ok, put_writable_roots(policy, [workspace])}
     else
       with {:ok, canonical_workspace} <- PathSafety.canonicalize(Path.expand(workspace)) do
-        roots = [canonical_workspace] ++ git_common_dir_roots(canonical_workspace)
+        roots = [canonical_workspace] ++ git_metadata_roots(canonical_workspace)
         {:ok, put_writable_roots(policy, roots)}
       end
     end
@@ -143,19 +143,32 @@ defmodule SymphonyElixir.Config do
     Map.put(policy, "writableRoots", Enum.uniq(existing_roots ++ roots))
   end
 
-  defp git_common_dir_roots(workspace) do
-    case System.cmd("git", ["-C", workspace, "rev-parse", "--git-common-dir"], stderr_to_stdout: true) do
-      {raw_git_common_dir, 0} ->
-        raw_git_common_dir
+  defp git_metadata_roots(workspace) do
+    workspace
+    |> git_metadata_root_candidates()
+    |> Enum.flat_map(&canonical_git_root/1)
+    |> Enum.uniq()
+  end
+
+  defp git_metadata_root_candidates(workspace) do
+    [
+      git_rev_parse_path(workspace, "--absolute-git-dir"),
+      git_rev_parse_path(workspace, "--git-common-dir")
+    ]
+  end
+
+  defp git_rev_parse_path(workspace, arg) do
+    case System.cmd("git", ["-C", workspace, "rev-parse", arg], stderr_to_stdout: true) do
+      {raw_path, 0} ->
+        raw_path
         |> String.trim()
         |> expand_git_path(workspace)
-        |> canonical_git_root()
 
       _ ->
-        []
+        ""
     end
   rescue
-    _ -> []
+    _ -> ""
   end
 
   defp expand_git_path("", _workspace), do: ""

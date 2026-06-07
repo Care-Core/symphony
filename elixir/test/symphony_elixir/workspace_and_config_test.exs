@@ -1236,7 +1236,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
-  test "runtime sandbox policy includes linked worktree git metadata root" do
+  test "runtime sandbox policy includes linked worktree git metadata roots" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1272,7 +1272,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert {:ok, canonical_issue_workspace} =
                SymphonyElixir.PathSafety.canonicalize(issue_workspace)
 
-      assert {:ok, canonical_git_metadata_root} =
+      {worktree_git_root, 0} =
+        System.cmd("git", ["-C", issue_workspace, "rev-parse", "--absolute-git-dir"])
+
+      assert {:ok, canonical_worktree_git_root} =
+               worktree_git_root
+               |> String.trim()
+               |> SymphonyElixir.PathSafety.canonicalize()
+
+      assert {:ok, canonical_common_git_root} =
                SymphonyElixir.PathSafety.canonicalize(Path.join(source_repo, ".git"))
 
       assert runtime_settings.turn_sandbox_policy["type"] == "workspaceWrite"
@@ -1280,7 +1288,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert runtime_settings.turn_sandbox_policy["writableRoots"] == [
                canonical_issue_workspace,
-               canonical_git_metadata_root
+               canonical_worktree_git_root,
+               canonical_common_git_root
              ]
     after
       File.rm_rf(test_root)
