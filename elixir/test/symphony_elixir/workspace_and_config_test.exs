@@ -513,7 +513,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:ok, [%Issue{id: "issue-1"}]} =
              Client.fetch_issues_by_states_for_test(["Todo"], nil, graphql_fun)
 
-    assert_receive {:fetch_workspace_states, query, %{stateNames: ["Todo"], first: 50, relationFirst: 50, after: nil} = variables}
+    assert_receive {:fetch_workspace_states, query, variables}
+
+    assert variables == %{stateNames: ["Todo"], first: 50, relationFirst: 50, after: nil}
 
     refute Map.has_key?(variables, :projectSlug)
     assert query =~ "SymphonyLinearPollWorkspace"
@@ -1106,6 +1108,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert settings.tracker.api_key == "fallback-linear-token"
     assert settings.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
+
+    assert {:ok, settings} = Schema.parse(%{tracker: %{required_labels: nil}})
+    assert settings.tracker.required_labels == []
+
+    assert {:ok, settings} =
+             Schema.parse(%{tracker: %{required_labels: [" Agent Ready ", "", "QA", "agent ready"]}})
+
+    assert settings.tracker.required_labels == ["agent ready", "qa"]
   end
 
   test "schema resolves sandbox policies from explicit and default workspaces" do
@@ -1175,7 +1185,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
            }
   end
 
-  test "runtime sandbox policy resolution passes explicit policies through unchanged" do
+  test "runtime sandbox policy resolution augments explicit workspace write policies" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1198,9 +1208,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
       assert {:ok, runtime_settings} = Config.codex_runtime_settings(issue_workspace)
 
+      assert {:ok, canonical_issue_workspace} =
+               SymphonyElixir.PathSafety.canonicalize(issue_workspace)
+
       assert runtime_settings.turn_sandbox_policy == %{
                "type" => "workspaceWrite",
-               "writableRoots" => ["relative/path"],
+               "writableRoots" => ["relative/path", canonical_issue_workspace],
                "networkAccess" => true
              }
 
@@ -1218,6 +1231,57 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                "type" => "futureSandbox",
                "nested" => %{"flag" => true}
              }
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "runtime sandbox policy includes linked worktree git metadata root" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-linked-worktree-sandbox-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      source_repo = Path.join(test_root, "source")
+      workspace_root = Path.join(test_root, "workspaces")
+      issue_workspace = Path.join(workspace_root, "MT-102")
+
+      File.mkdir_p!(source_repo)
+      File.mkdir_p!(workspace_root)
+      File.write!(Path.join(source_repo, "README.md"), "initial\n")
+      System.cmd("git", ["-C", source_repo, "init", "-b", "main"])
+      System.cmd("git", ["-C", source_repo, "config", "user.name", "Test User"])
+      System.cmd("git", ["-C", source_repo, "config", "user.email", "test@example.com"])
+      System.cmd("git", ["-C", source_repo, "add", "README.md"])
+      System.cmd("git", ["-C", source_repo, "commit", "-m", "initial"])
+      System.cmd("git", ["-C", source_repo, "worktree", "add", "-b", "feature/mt-102", issue_workspace])
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_turn_sandbox_policy: %{
+          type: "workspaceWrite",
+          writableRoots: [],
+          networkAccess: true
+        }
+      )
+
+      assert {:ok, runtime_settings} = Config.codex_runtime_settings(issue_workspace)
+
+      assert {:ok, canonical_issue_workspace} =
+               SymphonyElixir.PathSafety.canonicalize(issue_workspace)
+
+      assert {:ok, canonical_git_metadata_root} =
+               SymphonyElixir.PathSafety.canonicalize(Path.join(source_repo, ".git"))
+
+      assert runtime_settings.turn_sandbox_policy["type"] == "workspaceWrite"
+      assert runtime_settings.turn_sandbox_policy["networkAccess"] == true
+
+      assert runtime_settings.turn_sandbox_policy["writableRoots"] == [
+               canonical_issue_workspace,
+               canonical_git_metadata_root
+             ]
     after
       File.rm_rf(test_root)
     end

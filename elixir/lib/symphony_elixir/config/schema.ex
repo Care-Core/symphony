@@ -397,16 +397,12 @@ defmodule SymphonyElixir.Config.Schema do
   defp normalize_keys(value) when is_list(value), do: Enum.map(value, &normalize_keys/1)
   defp normalize_keys(value), do: value
 
-  defp normalize_label_filters(nil), do: []
-
   defp normalize_label_filters(labels) when is_list(labels) do
     labels
     |> Enum.map(&normalize_label_filter/1)
     |> Enum.reject(&is_nil/1)
     |> Enum.uniq()
   end
-
-  defp normalize_label_filters(value), do: normalize_label_filters([value])
 
   defp normalize_label_filter(value) when is_binary(value) do
     value
@@ -417,8 +413,6 @@ defmodule SymphonyElixir.Config.Schema do
       normalized -> normalized
     end
   end
-
-  defp normalize_label_filter(value), do: value |> to_string() |> normalize_label_filter()
 
   defp normalize_optional_map(nil), do: nil
   defp normalize_optional_map(value) when is_map(value), do: normalize_keys(value)
