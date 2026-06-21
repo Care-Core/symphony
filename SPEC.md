@@ -867,6 +867,8 @@ Execution contract:
   `cwd`.
 - On POSIX systems, `sh -lc <script>` (or a stricter equivalent such as `bash -lc <script>`) is a
   conforming default.
+- Hook environments should include `SYMPHONY_ISSUE_ID`, `SYMPHONY_ISSUE_IDENTIFIER`, and
+  `SYMPHONY_ISSUE_BRANCH_NAME` when the tracker provides those fields.
 - Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
 - Log hook start, failures, and timeouts.
 

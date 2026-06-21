@@ -18,6 +18,8 @@ defmodule SymphonyElixir.PromptBuilder do
     |> Solid.render!(
       %{
         "attempt" => Keyword.get(opts, :attempt),
+        "claimed_from_todo" => Keyword.get(opts, :claimed_from_todo, false),
+        "original_state" => Keyword.get(opts, :original_state),
         "issue" => issue |> Map.from_struct() |> to_solid_map()
       },
       @render_opts

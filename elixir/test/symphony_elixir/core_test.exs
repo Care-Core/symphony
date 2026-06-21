@@ -296,7 +296,7 @@ defmodule SymphonyElixir.CoreTest do
     end
   end
 
-  test "terminal issue state stops running agent and cleans workspace" do
+  test "terminal issue state keeps the worker alive briefly to capture final updates" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -350,10 +350,17 @@ defmodule SymphonyElixir.CoreTest do
 
       updated_state = Orchestrator.reconcile_issue_states_for_test([issue], state)
 
-      refute Map.has_key?(updated_state.running, issue_id)
-      refute MapSet.member?(updated_state.claimed, issue_id)
-      refute Process.alive?(agent_pid)
-      refute File.exists?(workspace)
+      assert Map.has_key?(updated_state.running, issue_id)
+      assert MapSet.member?(updated_state.claimed, issue_id)
+      assert Process.alive?(agent_pid)
+      assert File.exists?(workspace)
+
+      updated_entry = updated_state.running[issue_id]
+      assert updated_entry.issue.state == "Closed"
+      assert updated_entry.progress_phase == "Finishing"
+      assert updated_entry.progress_detail =~ "waiting for final Codex updates"
+      assert updated_entry.cleanup_workspace_on_finish == true
+      assert %DateTime{} = updated_entry.terminal_state_reached_at
     after
       File.rm_rf(test_root)
     end
@@ -593,6 +600,240 @@ defmodule SymphonyElixir.CoreTest do
     assert %{attempt: 1, due_at_ms: due_at_ms} = state.retry_attempts[issue_id]
     assert is_integer(due_at_ms)
     assert_due_in_range(due_at_ms, 500, 1_100)
+    assert [%{identifier: "MT-558", outcome: "completed_turn", session_id: "n/a"} | _] = Map.get(state, :recent_outcomes, [])
+  end
+
+  test "completed worker run writes archive summary, events, and issue index when archive root is configured" do
+    previous_archive_root = Application.get_env(:symphony_elixir, :run_archive_root)
+    archive_root = Path.join(System.tmp_dir!(), "symphony-run-archive-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :run_archive_root, archive_root)
+
+    on_exit(fn ->
+      restore_app_env(:run_archive_root, previous_archive_root)
+      File.rm_rf(archive_root)
+    end)
+
+    issue_id = "issue-archive"
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :ArchiveOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    started_at = DateTime.utc_now() |> DateTime.truncate(:second)
+    initial_state = :sys.get_state(pid)
+
+    running_entry = %{
+      pid: self(),
+      ref: ref,
+      run_id: "run-archive-1",
+      identifier: "MT-ARCHIVE",
+      issue: %Issue{
+        id: issue_id,
+        identifier: "MT-ARCHIVE",
+        title: "Archived issue",
+        url: "https://linear.app/care-core/issue/MT-ARCHIVE",
+        state: "In Progress"
+      },
+      started_at: started_at,
+      session_id: nil,
+      thread_id: nil,
+      current_turn_id: nil,
+      recent_codex_events: [],
+      turn_count: 1
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+      |> Map.put(:retry_attempts, %{})
+    end)
+
+    update = %{
+      event: :notification,
+      timestamp: DateTime.utc_now() |> DateTime.truncate(:second),
+      session_id: "thread-archive-turn-1",
+      thread_id: "thread-archive",
+      turn_id: "turn-archive-1",
+      raw: "{\"method\":\"item/completed\",\"type\":\"agentMessage\"}",
+      payload: %{
+        "method" => "item/completed",
+        "params" => %{
+          "threadId" => "thread-archive",
+          "turnId" => "turn-archive-1",
+          "item" => %{
+            "id" => "msg-archive",
+            "type" => "agentMessage",
+            "text" => "Archived assistant summary"
+          }
+        }
+      }
+    }
+
+    send(pid, {:codex_worker_update, issue_id, update})
+    Process.sleep(25)
+    send(pid, {:DOWN, ref, :process, self(), :normal})
+    Process.sleep(200)
+    state = :sys.get_state(pid)
+
+    refute Map.has_key?(state.running, issue_id)
+    assert [%{identifier: "MT-ARCHIVE", outcome: "completed_turn", run_id: "run-archive-1"} | _] = state.recent_outcomes
+
+    events_path = Path.join([archive_root, "runs", "run-archive-1", "events.jsonl"])
+    summary_path = Path.join([archive_root, "runs", "run-archive-1", "summary.json"])
+    issue_index_path = Path.join([archive_root, "issues", "MT-ARCHIVE.json"])
+
+    assert File.exists?(events_path)
+    assert File.exists?(summary_path)
+    assert File.exists?(issue_index_path)
+
+    [archived_event_json] =
+      events_path
+      |> File.read!()
+      |> String.split("\n", trim: true)
+
+    assert %{
+             "issue_identifier" => "MT-ARCHIVE",
+             "at" => _,
+             "method" => "item/completed",
+             "session_id" => "thread-archive-turn-1"
+           } = Jason.decode!(archived_event_json)
+
+    assert %{
+             "run_id" => "run-archive-1",
+             "issue_identifier" => "MT-ARCHIVE",
+             "issue_id" => "issue-archive",
+             "issue_url" => "https://linear.app/care-core/issue/MT-ARCHIVE",
+             "title" => "Archived issue",
+             "outcome" => "completed_turn",
+             "session_id" => "thread-archive-turn-1",
+             "thread_id" => "thread-archive",
+             "current_turn_id" => "turn-archive-1",
+             "operator_transcript" => [%{"kind" => "assistant", "body" => "Archived assistant summary"} | _]
+           } = Jason.decode!(File.read!(summary_path))
+
+    assert %{
+             "issue_identifier" => "MT-ARCHIVE",
+             "run_id" => "run-archive-1",
+             "latest_session_id" => "thread-archive-turn-1"
+           } = Jason.decode!(File.read!(issue_index_path))
+  end
+
+  test "terminal issue finishing captures trailing codex updates before archiving" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-terminal-finish-#{System.unique_integer([:positive])}"
+      )
+
+    issue_id = "issue-terminal-finish"
+    issue_identifier = "MT-FINISH"
+    workspace = Path.join(test_root, issue_identifier)
+    ref = make_ref()
+    orchestrator_name = Module.concat(__MODULE__, :TerminalFinishingOrchestrator)
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: test_root,
+        tracker_active_states: ["Todo", "In Progress", "In Review"],
+        tracker_terminal_states: ["Closed", "Cancelled", "Canceled", "Duplicate", "Done"]
+      )
+
+      File.mkdir_p!(workspace)
+      {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+      on_exit(fn ->
+        if Process.alive?(pid) do
+          Process.exit(pid, :normal)
+        end
+      end)
+
+      initial_state = :sys.get_state(pid)
+
+      running_entry = %{
+        pid: self(),
+        ref: ref,
+        run_id: "run-finish-1",
+        identifier: issue_identifier,
+        issue: %Issue{
+          id: issue_id,
+          identifier: issue_identifier,
+          title: "Finishing issue",
+          url: "https://linear.app/care-core/issue/#{issue_identifier}",
+          state: "In Progress"
+        },
+        workspace_path: workspace,
+        started_at: DateTime.utc_now() |> DateTime.truncate(:second),
+        session_id: nil,
+        thread_id: nil,
+        current_turn_id: nil,
+        recent_codex_events: [],
+        turn_count: 1,
+        cleanup_workspace_on_finish: false,
+        terminal_state: nil,
+        terminal_state_reached_at: nil
+      }
+
+      finishing_state =
+        Orchestrator.reconcile_issue_states_for_test(
+          [
+            %Issue{
+              id: issue_id,
+              identifier: issue_identifier,
+              title: "Finishing issue",
+              url: "https://linear.app/care-core/issue/#{issue_identifier}",
+              state: "Done"
+            }
+          ],
+          initial_state
+          |> Map.put(:running, %{issue_id => running_entry})
+          |> Map.put(:claimed, MapSet.new([issue_id]))
+          |> Map.put(:retry_attempts, %{})
+        )
+
+      :sys.replace_state(pid, fn _ -> finishing_state end)
+
+      update = %{
+        event: :notification,
+        timestamp: DateTime.utc_now() |> DateTime.truncate(:second),
+        session_id: "thread-finish-turn-1",
+        thread_id: "thread-finish",
+        turn_id: "turn-finish-1",
+        raw: "{\"method\":\"item/completed\",\"type\":\"agentMessage\"}",
+        payload: %{
+          "method" => "item/completed",
+          "params" => %{
+            "threadId" => "thread-finish",
+            "turnId" => "turn-finish-1",
+            "item" => %{
+              "id" => "msg-finish",
+              "type" => "agentMessage",
+              "text" => "All terminal cleanup is complete."
+            }
+          }
+        }
+      }
+
+      send(pid, {:codex_worker_update, issue_id, update})
+      Process.sleep(25)
+      send(pid, {:DOWN, ref, :process, self(), :normal})
+      Process.sleep(100)
+      state = :sys.get_state(pid)
+
+      refute Map.has_key?(state.running, issue_id)
+      refute MapSet.member?(state.claimed, issue_id)
+      refute File.exists?(workspace)
+
+      assert [%{identifier: ^issue_identifier, outcome: "completed_turn", last_message: "All terminal cleanup is complete."} | _] =
+               state.recent_outcomes
+    after
+      File.rm_rf(test_root)
+    end
   end
 
   test "abnormal worker exit increments retry attempt progressively" do
@@ -825,6 +1066,29 @@ defmodule SymphonyElixir.CoreTest do
     assert prompt =~ "Ticket S-1 Refactor backend request path"
     assert prompt =~ "labels=backend"
     assert prompt =~ "attempt=3"
+  end
+
+  test "prompt builder renders dispatch claim context from opts" do
+    workflow_prompt =
+      "Ticket {{ issue.identifier }} current={{ issue.state }} original={{ original_state }} claimed_from_todo={{ claimed_from_todo }}"
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: workflow_prompt)
+
+    issue = %Issue{
+      identifier: "S-2",
+      title: "Claim context",
+      description: "Prompt should know whether this run claimed Todo",
+      state: "In Progress",
+      url: "https://example.org/issues/S-2",
+      labels: ["backend"]
+    }
+
+    prompt = PromptBuilder.build_prompt(issue, original_state: "Todo", claimed_from_todo: true)
+
+    assert prompt =~ "Ticket S-2"
+    assert prompt =~ "current=In Progress"
+    assert prompt =~ "original=Todo"
+    assert prompt =~ "claimed_from_todo=true"
   end
 
   test "prompt builder renders issue datetime fields without crashing" do
@@ -1203,6 +1467,117 @@ defmodule SymphonyElixir.CoreTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  test "orchestrator snapshot retains recent codex events and inspector identifiers" do
+    issue_id = "issue-live-events"
+    orchestrator_name = Module.concat(__MODULE__, :RecentCodexEventsOrchestrator)
+    {:ok, pid} = Orchestrator.start_link(name: orchestrator_name)
+
+    on_exit(fn ->
+      if Process.alive?(pid) do
+        Process.exit(pid, :normal)
+      end
+    end)
+
+    initial_state = :sys.get_state(pid)
+    started_at = DateTime.utc_now()
+
+    running_entry = %{
+      pid: self(),
+      ref: nil,
+      identifier: "MT-EVT",
+      issue: %Issue{id: issue_id, identifier: "MT-EVT", title: "Retain codex events", state: "In Progress"},
+      worker_host: nil,
+      workspace_path: nil,
+      session_id: nil,
+      thread_id: nil,
+      current_turn_id: nil,
+      last_codex_message: nil,
+      last_codex_timestamp: nil,
+      last_codex_event: nil,
+      progress_phase: "Claimed",
+      progress_detail: "Preparing workspace",
+      progress_updated_at: started_at,
+      codex_app_server_pid: nil,
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      recent_codex_events: [],
+      turn_count: 0,
+      retry_attempt: 1,
+      started_at: started_at
+    }
+
+    :sys.replace_state(pid, fn _ ->
+      initial_state
+      |> Map.put(:running, %{issue_id => running_entry})
+      |> Map.put(:claimed, MapSet.new([issue_id]))
+    end)
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :session_started,
+         timestamp: DateTime.utc_now(),
+         session_id: "thread-live-turn-1",
+         thread_id: "thread-live",
+         turn_id: "turn-1"
+       }}
+    )
+
+    send(
+      pid,
+      {:codex_worker_update, issue_id,
+       %{
+         event: :notification,
+         timestamp: DateTime.utc_now(),
+         payload: %{
+           "method" => "item/agentMessage/delta",
+           "params" => %{
+             "threadId" => "thread-live",
+             "turnId" => "turn-1",
+             "itemId" => "msg-1",
+             "delta" => "hello"
+           }
+         },
+         raw: "{\"method\":\"item/agentMessage/delta\"}"
+       }}
+    )
+
+    Process.sleep(50)
+
+    snapshot =
+      Enum.find_value(1..10, fn _attempt ->
+        case Orchestrator.snapshot(orchestrator_name, 1_000) do
+          %{} = value ->
+            value
+
+          _ ->
+            Process.sleep(25)
+            nil
+        end
+      end) || flunk("expected orchestrator snapshot to become available")
+
+    [entry] = snapshot[:running]
+
+    assert entry.session_id == "thread-live-turn-1"
+    assert entry.thread_id == "thread-live"
+    assert entry.current_turn_id == "turn-1"
+    assert entry.last_codex_event == :notification
+    assert length(entry.recent_codex_events) == 2
+    assert Enum.map(entry.recent_codex_events, & &1.method) == [nil, "item/agentMessage/delta"]
+
+    [session_started_event, agent_delta_event] = entry.recent_codex_events
+    assert session_started_event.event == :session_started
+    assert agent_delta_event.category == "agent_message"
+    assert agent_delta_event.summary =~ "hello"
+    assert agent_delta_event.item_id == "msg-1"
+    assert agent_delta_event.turn_id == "turn-1"
   end
 
   test "agent runner surfaces ssh startup failures instead of silently hopping hosts" do

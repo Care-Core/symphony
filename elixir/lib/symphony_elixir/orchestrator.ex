@@ -7,19 +7,22 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, RunArchive, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
+  @terminal_finish_grace_ms 15_000
   @empty_codex_totals %{
     input_tokens: 0,
     output_tokens: 0,
     total_tokens: 0,
     seconds_running: 0
   }
+  @recent_codex_event_limit 200
+  @recent_outcome_limit 50
 
   defmodule State do
     @moduledoc """
@@ -38,7 +41,8 @@ defmodule SymphonyElixir.Orchestrator do
       claimed: MapSet.new(),
       retry_attempts: %{},
       codex_totals: nil,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      recent_outcomes: []
     ]
   end
 
@@ -61,7 +65,8 @@ defmodule SymphonyElixir.Orchestrator do
       tick_timer_ref: nil,
       tick_token: nil,
       codex_totals: @empty_codex_totals,
-      codex_rate_limits: nil
+      codex_rate_limits: nil,
+      recent_outcomes: []
     }
 
     run_terminal_workspace_cleanup()
@@ -126,30 +131,55 @@ defmodule SymphonyElixir.Orchestrator do
 
       issue_id ->
         {running_entry, state} = pop_running_entry(state, issue_id)
-        state = record_session_completion_totals(state, running_entry)
+
+        state =
+          state
+          |> record_session_completion_totals(running_entry)
+          |> record_recent_outcome(running_entry, outcome_for_exit_reason(reason))
+
         session_id = running_entry_session_id(running_entry)
 
         state =
-          case reason do
-            :normal ->
+          case {reason, terminal_completion_pending?(running_entry)} do
+            {:normal, true} ->
+              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id} after terminal issue state; sealing finished run")
+
+              state
+              |> maybe_cleanup_finished_workspace(running_entry)
+              |> complete_issue(issue_id)
+              |> release_issue_claim(issue_id)
+
+            {:normal, false} ->
               Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
               state
               |> complete_issue(issue_id)
               |> schedule_issue_retry(issue_id, 1, %{
                 identifier: running_entry.identifier,
+                title: Map.get(Map.get(running_entry, :issue, %{}), :title),
+                url: Map.get(Map.get(running_entry, :issue, %{}), :url),
                 delay_type: :continuation,
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path)
               })
 
-            _ ->
+            {_reason, true} ->
+              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} after terminal issue state reason=#{inspect(reason)}; sealing finished run without retry")
+
+              state
+              |> maybe_cleanup_finished_workspace(running_entry)
+              |> complete_issue(issue_id)
+              |> release_issue_claim(issue_id)
+
+            {_reason, false} ->
               Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
 
               next_attempt = next_retry_attempt_from_running(running_entry)
 
               schedule_issue_retry(state, issue_id, next_attempt, %{
                 identifier: running_entry.identifier,
+                title: Map.get(Map.get(running_entry, :issue, %{}), :title),
+                url: Map.get(Map.get(running_entry, :issue, %{}), :url),
                 error: "agent exited: #{inspect(reason)}",
                 worker_host: Map.get(running_entry, :worker_host),
                 workspace_path: Map.get(running_entry, :workspace_path)
@@ -190,13 +220,14 @@ defmodule SymphonyElixir.Orchestrator do
         {:noreply, state}
 
       running_entry ->
-        {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        {updated_running_entry, token_delta, archived_event} = integrate_codex_update(running_entry, update)
 
         state =
           state
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
 
+        :ok = RunArchive.append_event(updated_running_entry, archived_event)
         notify_dashboard()
         {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
     end
@@ -278,7 +309,7 @@ defmodule SymphonyElixir.Orchestrator do
     running_ids = Map.keys(state.running)
 
     if running_ids == [] do
-      state
+      reconcile_finishing_running_issues(state)
     else
       case Tracker.fetch_issue_states_by_ids(running_ids) do
         {:ok, issues} ->
@@ -289,11 +320,12 @@ defmodule SymphonyElixir.Orchestrator do
             terminal_state_set()
           )
           |> reconcile_missing_running_issue_ids(running_ids, issues)
+          |> reconcile_finishing_running_issues()
 
         {:error, reason} ->
           Logger.debug("Failed to refresh running issue states: #{inspect(reason)}; keeping active workers")
 
-          state
+          reconcile_finishing_running_issues(state)
       end
     end
   end
@@ -356,9 +388,9 @@ defmodule SymphonyElixir.Orchestrator do
   defp reconcile_issue_state(%Issue{} = issue, state, active_states, terminal_states) do
     cond do
       terminal_issue_state?(issue.state, terminal_states) ->
-        Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
+        Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; waiting briefly for final Codex updates before cleanup")
 
-        terminate_running_issue(state, issue.id, true)
+        mark_issue_finishing(state, issue, true)
 
       !issue_routable_to_worker?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
@@ -421,13 +453,17 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
+  defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace, outcome \\ "terminated") do
     case Map.get(state.running, issue_id) do
       nil ->
         release_issue_claim(state, issue_id)
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
-        state = record_session_completion_totals(state, running_entry)
+        state =
+          state
+          |> record_session_completion_totals(running_entry)
+          |> record_recent_outcome(running_entry, outcome)
+
         worker_host = Map.get(running_entry, :worker_host)
 
         if cleanup_workspace do
@@ -488,6 +524,8 @@ defmodule SymphonyElixir.Orchestrator do
       |> terminate_running_issue(issue_id, false)
       |> schedule_issue_retry(issue_id, next_attempt, %{
         identifier: identifier,
+        title: Map.get(Map.get(running_entry, :issue, %{}), :title),
+        url: Map.get(Map.get(running_entry, :issue, %{}), :url),
         error: "stalled for #{elapsed_ms}ms without codex activity"
       })
     else
@@ -700,8 +738,18 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+    original_state = Map.get(issue, :state)
+    claimed_from_todo = normalize_issue_state(original_state) == "todo"
+
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           AgentRunner.run(
+             issue,
+             recipient,
+             attempt: attempt,
+             worker_host: worker_host,
+             original_state: original_state,
+             claimed_from_todo: claimed_from_todo
+           )
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -715,11 +763,14 @@ defmodule SymphonyElixir.Orchestrator do
           Map.put(state.running, issue.id, %{
             pid: pid,
             ref: ref,
+            run_id: build_run_id(claimed_issue.identifier),
             identifier: claimed_issue.identifier,
             issue: claimed_issue,
             worker_host: worker_host,
             workspace_path: nil,
             session_id: nil,
+            thread_id: nil,
+            current_turn_id: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
             last_codex_event: nil,
@@ -733,8 +784,12 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
+            recent_codex_events: [],
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
+            terminal_state: nil,
+            terminal_state_reached_at: nil,
+            cleanup_workspace_on_finish: false,
             started_at: started_at
           })
 
@@ -751,6 +806,8 @@ defmodule SymphonyElixir.Orchestrator do
 
         schedule_issue_retry(state, issue.id, next_attempt, %{
           identifier: issue.identifier,
+          title: issue.title,
+          url: issue.url,
           error: "failed to spawn agent: #{inspect(reason)}",
           worker_host: worker_host
         })
@@ -794,6 +851,8 @@ defmodule SymphonyElixir.Orchestrator do
     retry_token = make_ref()
     due_at_ms = System.monotonic_time(:millisecond) + delay_ms
     identifier = pick_retry_identifier(issue_id, previous_retry, metadata)
+    title = pick_retry_title(previous_retry, metadata)
+    issue_url = pick_retry_url(previous_retry, metadata)
     error = pick_retry_error(previous_retry, metadata)
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
@@ -817,6 +876,8 @@ defmodule SymphonyElixir.Orchestrator do
             retry_token: retry_token,
             due_at_ms: due_at_ms,
             identifier: identifier,
+            title: title,
+            url: issue_url,
             error: error,
             worker_host: worker_host,
             workspace_path: workspace_path
@@ -829,6 +890,8 @@ defmodule SymphonyElixir.Orchestrator do
       %{attempt: attempt, retry_token: ^retry_token} = retry_entry ->
         metadata = %{
           identifier: Map.get(retry_entry, :identifier),
+          title: Map.get(retry_entry, :title),
+          url: Map.get(retry_entry, :url),
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path)
@@ -894,6 +957,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
 
+  defp maybe_cleanup_finished_workspace(%State{} = state, running_entry) when is_map(running_entry) do
+    if Map.get(running_entry, :cleanup_workspace_on_finish) do
+      cleanup_issue_workspace(Map.get(running_entry, :identifier), Map.get(running_entry, :worker_host))
+    end
+
+    state
+  end
+
+  defp maybe_cleanup_finished_workspace(state, _running_entry), do: state
+
   defp run_terminal_workspace_cleanup do
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
@@ -930,6 +1003,7 @@ defmodule SymphonyElixir.Orchestrator do
          attempt + 1,
          Map.merge(metadata, %{
            identifier: issue.identifier,
+           url: issue.url,
            error: "no available orchestrator slots"
          })
        )}
@@ -965,6 +1039,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp pick_retry_identifier(issue_id, previous_retry, metadata) do
     metadata[:identifier] || Map.get(previous_retry, :identifier) || issue_id
+  end
+
+  defp pick_retry_title(previous_retry, metadata) do
+    metadata[:title] || Map.get(previous_retry, :title)
+  end
+
+  defp pick_retry_url(previous_retry, metadata) do
+    metadata[:url] || Map.get(previous_retry, :url)
   end
 
   defp pick_retry_error(previous_retry, metadata) do
@@ -1124,10 +1206,14 @@ defmodule SymphonyElixir.Orchestrator do
         %{
           issue_id: issue_id,
           identifier: metadata.identifier,
+          url: metadata.issue.url,
+          title: metadata.issue.title,
           state: metadata.issue.state,
           worker_host: Map.get(metadata, :worker_host),
           workspace_path: Map.get(metadata, :workspace_path),
           session_id: metadata.session_id,
+          thread_id: Map.get(metadata, :thread_id),
+          current_turn_id: Map.get(metadata, :current_turn_id),
           codex_app_server_pid: metadata.codex_app_server_pid,
           progress_phase: Map.get(metadata, :progress_phase),
           progress_detail: Map.get(metadata, :progress_detail),
@@ -1135,6 +1221,7 @@ defmodule SymphonyElixir.Orchestrator do
           codex_input_tokens: metadata.codex_input_tokens,
           codex_output_tokens: metadata.codex_output_tokens,
           codex_total_tokens: metadata.codex_total_tokens,
+          recent_codex_events: Map.get(metadata, :recent_codex_events, []),
           turn_count: Map.get(metadata, :turn_count, 0),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
@@ -1152,6 +1239,8 @@ defmodule SymphonyElixir.Orchestrator do
           attempt: attempt,
           due_in_ms: max(0, due_at_ms - now_ms),
           identifier: Map.get(retry, :identifier),
+          url: Map.get(retry, :url),
+          title: Map.get(retry, :title),
           error: Map.get(retry, :error),
           worker_host: Map.get(retry, :worker_host),
           workspace_path: Map.get(retry, :workspace_path)
@@ -1162,6 +1251,7 @@ defmodule SymphonyElixir.Orchestrator do
      %{
        running: running,
        retrying: retrying,
+       recent_outcomes: Enum.map(state.recent_outcomes, &normalize_recent_outcome/1),
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1199,12 +1289,20 @@ defmodule SymphonyElixir.Orchestrator do
     last_reported_output = Map.get(running_entry, :codex_last_reported_output_tokens, 0)
     last_reported_total = Map.get(running_entry, :codex_last_reported_total_tokens, 0)
     turn_count = Map.get(running_entry, :turn_count, 0)
+    updated_session_id = session_id_for_update(running_entry.session_id, update)
+    updated_thread_id = thread_id_for_update(Map.get(running_entry, :thread_id), update)
+    updated_turn_id = turn_id_for_update(Map.get(running_entry, :current_turn_id), update)
+    recent_codex_event = build_recent_codex_event(running_entry, update)
+    recent_codex_events = append_recent_codex_event(Map.get(running_entry, :recent_codex_events, []), recent_codex_event)
+    archived_event = archived_event_payload(running_entry, recent_codex_event)
 
     {
       Map.merge(running_entry, %{
         last_codex_timestamp: timestamp,
         last_codex_message: summarized_update,
-        session_id: session_id_for_update(running_entry.session_id, update),
+        session_id: updated_session_id,
+        thread_id: updated_thread_id,
+        current_turn_id: updated_turn_id,
         last_codex_event: event,
         progress_phase: Map.get(progress_update || %{}, :phase, Map.get(running_entry, :progress_phase)),
         progress_detail: Map.get(progress_update || %{}, :detail, Map.get(running_entry, :progress_detail)),
@@ -1216,9 +1314,11 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
+        recent_codex_events: recent_codex_events,
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
       }),
-      token_delta
+      token_delta,
+      archived_event
     }
   end
 
@@ -1239,6 +1339,24 @@ defmodule SymphonyElixir.Orchestrator do
     do: session_id
 
   defp session_id_for_update(existing, _update), do: existing
+
+  defp thread_id_for_update(_existing, %{thread_id: thread_id}) when is_binary(thread_id),
+    do: thread_id
+
+  defp thread_id_for_update(existing, %{payload: %{"params" => params}}) when is_map(params) do
+    Map.get(params, "threadId") || get_in(params, ["thread", "id"]) || existing
+  end
+
+  defp thread_id_for_update(existing, _update), do: existing
+
+  defp turn_id_for_update(_existing, %{turn_id: turn_id}) when is_binary(turn_id),
+    do: turn_id
+
+  defp turn_id_for_update(existing, %{payload: %{"params" => params}}) when is_map(params) do
+    Map.get(params, "turnId") || get_in(params, ["turn", "id"]) || existing
+  end
+
+  defp turn_id_for_update(existing, _update), do: existing
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,
@@ -1265,6 +1383,183 @@ defmodule SymphonyElixir.Orchestrator do
       timestamp: update[:timestamp]
     }
   end
+
+  defp append_recent_codex_event(events, recent_event) when is_list(events) and is_map(recent_event) do
+    (events ++ [recent_event])
+    |> Enum.take(-@recent_codex_event_limit)
+  end
+
+  defp append_recent_codex_event(events, _recent_event) when is_list(events), do: events
+  defp append_recent_codex_event(_events, _recent_event), do: []
+
+  defp reconcile_finishing_running_issues(%State{} = state) do
+    now = DateTime.utc_now()
+
+    Enum.reduce(state.running, state, fn {issue_id, running_entry}, state_acc ->
+      maybe_timeout_finishing_issue(state_acc, issue_id, running_entry, now)
+    end)
+  end
+
+  defp maybe_timeout_finishing_issue(%State{} = state, issue_id, running_entry, %DateTime{} = now) do
+    if finishing_issue_timed_out?(running_entry, now) do
+      Logger.info("Finishing window elapsed for issue_id=#{issue_id} issue_identifier=#{Map.get(running_entry, :identifier)}; sealing run with captured terminal updates")
+
+      terminate_running_issue(
+        state,
+        issue_id,
+        Map.get(running_entry, :cleanup_workspace_on_finish, false),
+        "completed"
+      )
+    else
+      state
+    end
+  end
+
+  defp maybe_timeout_finishing_issue(state, _issue_id, _running_entry, _now), do: state
+
+  defp mark_issue_finishing(%State{} = state, %Issue{} = issue, cleanup_workspace) do
+    case Map.get(state.running, issue.id) do
+      %{issue: _} = running_entry ->
+        now = DateTime.utc_now()
+        terminal_state_reached_at = Map.get(running_entry, :terminal_state_reached_at) || now
+
+        updated_running_entry =
+          running_entry
+          |> Map.put(:issue, issue)
+          |> Map.put(:terminal_state, issue.state)
+          |> Map.put(:terminal_state_reached_at, terminal_state_reached_at)
+          |> Map.put(:cleanup_workspace_on_finish, Map.get(running_entry, :cleanup_workspace_on_finish, false) || cleanup_workspace)
+          |> Map.put(:progress_phase, "Finishing")
+          |> Map.put(:progress_detail, "Issue reached terminal state #{issue.state}; waiting for final Codex updates")
+          |> Map.put(:progress_updated_at, now)
+
+        %{state | running: Map.put(state.running, issue.id, updated_running_entry)}
+
+      _ ->
+        state
+    end
+  end
+
+  defp mark_issue_finishing(state, _issue, _cleanup_workspace), do: state
+
+  defp terminal_completion_pending?(running_entry) when is_map(running_entry) do
+    not is_nil(Map.get(running_entry, :terminal_state_reached_at))
+  end
+
+  defp terminal_completion_pending?(_running_entry), do: false
+
+  defp finishing_issue_timed_out?(running_entry, %DateTime{} = now) when is_map(running_entry) do
+    case Map.get(running_entry, :terminal_state_reached_at) do
+      %DateTime{} = terminal_state_reached_at ->
+        DateTime.diff(now, terminal_state_reached_at, :millisecond) >= @terminal_finish_grace_ms
+
+      _ ->
+        false
+    end
+  end
+
+  defp finishing_issue_timed_out?(_running_entry, _now), do: false
+
+  defp build_recent_codex_event(running_entry, %{event: event, timestamp: timestamp} = update) do
+    method = codex_method_from_update(update)
+    payload = Map.get(update, :payload)
+
+    %{
+      event_id: System.unique_integer([:positive, :monotonic]),
+      event: event,
+      method: method,
+      category: codex_event_category(event, method),
+      summary: codex_event_summary(update),
+      timestamp: timestamp,
+      session_id: session_id_for_update(running_entry.session_id, update),
+      thread_id: thread_id_for_update(Map.get(running_entry, :thread_id), update),
+      turn_id: turn_id_for_update(Map.get(running_entry, :current_turn_id), update),
+      item_id: codex_item_id_from_payload(payload),
+      raw: Map.get(update, :raw),
+      payload: payload
+    }
+  end
+
+  defp archived_event_payload(running_entry, recent_event) when is_map(running_entry) and is_map(recent_event) do
+    %{
+      event_id: Map.get(recent_event, :event_id),
+      issue_identifier: Map.get(running_entry, :identifier),
+      at: archive_iso8601(Map.get(recent_event, :timestamp)),
+      event: normalize_archived_event(Map.get(recent_event, :event)),
+      method: Map.get(recent_event, :method),
+      category: Map.get(recent_event, :category),
+      summary: Map.get(recent_event, :summary),
+      message: Map.get(recent_event, :summary),
+      session_id: Map.get(recent_event, :session_id),
+      thread_id: Map.get(recent_event, :thread_id),
+      turn_id: Map.get(recent_event, :turn_id),
+      item_id: Map.get(recent_event, :item_id),
+      raw: Map.get(recent_event, :raw),
+      payload: Map.get(recent_event, :payload)
+    }
+  end
+
+  defp archived_event_payload(_running_entry, _recent_event), do: %{}
+
+  defp codex_method_from_update(%{payload: %{"method" => method}}) when is_binary(method), do: method
+  defp codex_method_from_update(_update), do: nil
+
+  defp codex_item_id_from_payload(%{"params" => params}) when is_map(params) do
+    Map.get(params, "itemId") || get_in(params, ["item", "id"])
+  end
+
+  defp codex_item_id_from_payload(_payload), do: nil
+
+  defp codex_event_summary(%{event: :session_started}), do: "session started"
+  defp codex_event_summary(%{event: :turn_ended_with_error}), do: "turn ended with error"
+  defp codex_event_summary(%{event: :startup_failed}), do: "startup failed"
+
+  defp codex_event_summary(update) do
+    update
+    |> summarize_codex_update()
+    |> StatusDashboard.humanize_codex_message()
+    |> case do
+      text when is_binary(text) and text != "" -> text
+      _ -> codex_method_from_update(update) || to_string(update[:event] || "event")
+    end
+  end
+
+  defp codex_event_category(:approval_required, _method), do: "approval"
+  defp codex_event_category(:approval_auto_approved, _method), do: "approval"
+  defp codex_event_category(:turn_input_required, _method), do: "approval"
+  defp codex_event_category(:tool_input_auto_answered, _method), do: "approval"
+  defp codex_event_category(:session_started, _method), do: "lifecycle"
+  defp codex_event_category(:turn_completed, _method), do: "lifecycle"
+  defp codex_event_category(:turn_failed, _method), do: "lifecycle"
+  defp codex_event_category(:turn_cancelled, _method), do: "lifecycle"
+
+  defp codex_event_category(_event, method) when is_binary(method) do
+    cond do
+      agent_message_method?(method) -> "agent_message"
+      reasoning_method?(method) -> "reasoning"
+      file_change_method?(method) -> "file_change"
+      command_method?(method) -> "command"
+      token_usage_method?(method) -> "token_usage"
+      lifecycle_method?(method) -> "lifecycle"
+      true -> "system"
+    end
+  end
+
+  defp codex_event_category(_event, _method), do: "system"
+
+  defp agent_message_method?(method), do: String.starts_with?(method, "item/agentMessage")
+  defp reasoning_method?(method), do: String.starts_with?(method, "item/reasoning")
+
+  defp file_change_method?(method),
+    do: String.starts_with?(method, "item/fileChange") or method == "turn/diff/updated"
+
+  defp command_method?(method),
+    do: String.starts_with?(method, "item/commandExecution") or String.starts_with?(method, "codex/event/exec_command")
+
+  defp token_usage_method?(method), do: method == "thread/tokenUsage/updated"
+
+  defp lifecycle_method?(method),
+    do: String.starts_with?(method, "turn/") or String.starts_with?(method, "thread/")
 
   defp claim_issue_for_dispatch(issue, issue_state_updater \\ &Tracker.update_issue_state/2)
 
@@ -1374,6 +1669,109 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp record_session_completion_totals(state, _running_entry), do: state
+
+  defp record_recent_outcome(%State{} = state, running_entry, outcome) when is_map(running_entry) do
+    outcome_entry = build_recent_outcome(running_entry, outcome)
+    :ok = RunArchive.write_summary(outcome_entry)
+    %{state | recent_outcomes: [outcome_entry | state.recent_outcomes] |> Enum.take(@recent_outcome_limit)}
+  end
+
+  defp record_recent_outcome(state, _running_entry, _outcome), do: state
+
+  defp build_recent_outcome(running_entry, outcome) when is_map(running_entry) do
+    last_message = final_recent_outcome_message(running_entry)
+
+    %{
+      run_id: Map.get(running_entry, :run_id),
+      issue_id: Map.get(Map.get(running_entry, :issue, %{}), :id),
+      identifier: Map.get(running_entry, :identifier),
+      url: Map.get(Map.get(running_entry, :issue, %{}), :url),
+      title: Map.get(Map.get(running_entry, :issue, %{}), :title),
+      outcome: outcome,
+      session_id: running_entry_session_id(running_entry),
+      thread_id: Map.get(running_entry, :thread_id),
+      current_turn_id: Map.get(running_entry, :current_turn_id),
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      turn_count: Map.get(running_entry, :turn_count, 0),
+      started_at: Map.get(running_entry, :started_at),
+      last_event: normalize_recent_outcome_event(Map.get(running_entry, :last_codex_event)),
+      last_message: recent_outcome_message(last_message),
+      last_event_at: Map.get(running_entry, :last_codex_timestamp),
+      progress_phase: Map.get(running_entry, :progress_phase),
+      progress_detail: Map.get(running_entry, :progress_detail),
+      recent_codex_events: Map.get(running_entry, :recent_codex_events, []),
+      runtime_seconds: running_seconds(Map.get(running_entry, :started_at), DateTime.utc_now()),
+      finished_at: DateTime.utc_now(),
+      tokens: %{
+        input_tokens: Map.get(running_entry, :codex_input_tokens, 0),
+        output_tokens: Map.get(running_entry, :codex_output_tokens, 0),
+        total_tokens: Map.get(running_entry, :codex_total_tokens, 0)
+      }
+    }
+  end
+
+  defp outcome_for_exit_reason(:normal), do: "completed_turn"
+  defp outcome_for_exit_reason(reason), do: "#{inspect(reason)}"
+
+  defp final_recent_outcome_message(running_entry) when is_map(running_entry) do
+    latest_completed_agent_message_text(Map.get(running_entry, :recent_codex_events, [])) ||
+      Map.get(running_entry, :last_codex_message)
+  end
+
+  defp final_recent_outcome_message(_running_entry), do: nil
+
+  defp latest_completed_agent_message_text(events) when is_list(events) do
+    events
+    |> Enum.reverse()
+    |> Enum.find_value(&completed_agent_message_text/1)
+  end
+
+  defp latest_completed_agent_message_text(_events), do: nil
+
+  defp completed_agent_message_text(%{method: "item/completed", payload: payload}) when is_map(payload) do
+    case get_in(payload, ["params", "item"]) do
+      %{"type" => "agentMessage", "text" => text} when is_binary(text) and text != "" -> text
+      _ -> nil
+    end
+  end
+
+  defp completed_agent_message_text(_event), do: nil
+
+  defp recent_outcome_message(nil), do: nil
+  defp recent_outcome_message(message), do: StatusDashboard.humanize_codex_message(message)
+
+  defp normalize_recent_outcome_event(event) when is_atom(event), do: Atom.to_string(event)
+  defp normalize_recent_outcome_event(event) when is_binary(event), do: event
+  defp normalize_recent_outcome_event(_event), do: nil
+
+  defp normalize_archived_event(event) when is_atom(event), do: Atom.to_string(event)
+  defp normalize_archived_event(event), do: event
+
+  defp archive_iso8601(%DateTime{} = datetime) do
+    datetime
+    |> DateTime.truncate(:second)
+    |> DateTime.to_iso8601()
+  end
+
+  defp archive_iso8601(datetime) when is_binary(datetime), do: datetime
+  defp archive_iso8601(_datetime), do: nil
+
+  defp build_run_id(identifier) when is_binary(identifier) do
+    sanitized = String.replace(identifier, ~r/[^a-zA-Z0-9._-]/, "_")
+    "#{sanitized}-#{System.unique_integer([:positive, :monotonic])}"
+  end
+
+  defp build_run_id(_identifier), do: "run-#{System.unique_integer([:positive, :monotonic])}"
+
+  defp normalize_recent_outcome(outcome) when is_map(outcome) do
+    outcome
+    |> Map.update(:finished_at, nil, &normalize_recent_outcome_finished_at/1)
+    |> Map.update(:last_event, nil, &normalize_recent_outcome_event/1)
+  end
+
+  defp normalize_recent_outcome_finished_at(%DateTime{} = datetime), do: datetime
+  defp normalize_recent_outcome_finished_at(value), do: value
 
   defp refresh_runtime_config(%State{} = state) do
     config = Config.settings!()

@@ -40,6 +40,38 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "workspace hooks receive issue metadata in environment variables" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-env-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: """
+        printf '%s\\n' "$SYMPHONY_ISSUE_ID" > hook-issue-id.txt
+        printf '%s\\n' "$SYMPHONY_ISSUE_IDENTIFIER" > hook-issue-identifier.txt
+        printf '%s\\n' "$SYMPHONY_ISSUE_BRANCH_NAME" > hook-issue-branch.txt
+        """
+      )
+
+      issue = %Issue{
+        id: "issue-hook-env",
+        identifier: "MT-HOOK-ENV",
+        branch_name: "feature/mt-hook-env"
+      }
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert File.read!(Path.join(workspace, "hook-issue-id.txt")) == "issue-hook-env\n"
+      assert File.read!(Path.join(workspace, "hook-issue-identifier.txt")) == "MT-HOOK-ENV\n"
+      assert File.read!(Path.join(workspace, "hook-issue-branch.txt")) == "feature/mt-hook-env\n"
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
   test "workspace path is deterministic per issue identifier" do
     workspace_root =
       Path.join(

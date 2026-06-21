@@ -101,6 +101,20 @@ defmodule SymphonyElixir.ExtensionsTest do
     :ok
   end
 
+  setup do
+    archive_root = Application.get_env(:symphony_elixir, :run_archive_root)
+
+    on_exit(fn ->
+      if is_nil(archive_root) do
+        Application.delete_env(:symphony_elixir, :run_archive_root)
+      else
+        Application.put_env(:symphony_elixir, :run_archive_root, archive_root)
+      end
+    end)
+
+    :ok
+  end
+
   test "workflow store reloads changes, keeps last good workflow, and falls back when stopped" do
     ensure_workflow_store_running()
     assert {:ok, %{prompt: "You are an agent for this repository."}} = Workflow.current()
@@ -339,82 +353,134 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     conn = get(build_conn(), "/api/v1/state")
     state_payload = json_response(conn, 200)
+    running_entry = state_payload["running"] |> List.first()
 
-    assert state_payload == %{
-             "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1},
-             "running" => [
-               %{
-                 "issue_id" => "issue-http",
-                 "issue_identifier" => "MT-HTTP",
-                 "state" => "In Progress",
-                 "worker_host" => nil,
-                 "workspace_path" => nil,
-                 "session_id" => "thread-http",
-                 "turn_count" => 7,
-                 "last_event" => "notification",
-                 "last_message" => "rendered",
-                 "progress_phase" => nil,
-                 "progress_detail" => nil,
-                 "progress_updated_at" => nil,
-                 "started_at" => state_payload["running"] |> List.first() |> Map.fetch!("started_at"),
-                 "last_event_at" => nil,
-                 "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
-               }
-             ],
-             "retrying" => [
-               %{
-                 "issue_id" => "issue-retry",
-                 "issue_identifier" => "MT-RETRY",
-                 "attempt" => 2,
-                 "due_at" => state_payload["retrying"] |> List.first() |> Map.fetch!("due_at"),
-                 "error" => "boom",
-                 "worker_host" => nil,
-                 "workspace_path" => nil
-               }
-             ],
-             "codex_totals" => %{
-               "input_tokens" => 4,
-               "output_tokens" => 8,
-               "total_tokens" => 12,
-               "seconds_running" => 42.5
-             },
-             "rate_limits" => %{"primary" => %{"remaining" => 11}}
-           }
+    assert state_payload["counts"] == %{"running" => 1, "retrying" => 1}
+    assert state_payload["alerts"] == []
+    assert state_payload["polling"] == %{"checking?" => false, "next_poll_in_ms" => nil, "poll_interval_ms" => nil}
+    assert state_payload["rate_limits"] == %{"primary" => %{"remaining" => 11}}
+
+    assert state_payload["recent_outcomes"] == [
+             %{
+               "issue_id" => "issue-done",
+               "issue_identifier" => "MT-DONE",
+               "issue_url" => "https://linear.app/care-core/issue/MT-DONE",
+               "title" => "Completed issue",
+               "outcome" => "completed_turn",
+               "status" => "completed",
+               "state" => "Completed",
+               "session_id" => "thread-done-turn-1",
+               "last_event" => "turn_completed",
+               "last_message" => "turn completed",
+               "runtime_seconds" => 12,
+               "finished_at" => state_payload["recent_outcomes"] |> List.first() |> Map.fetch!("finished_at"),
+               "tokens" => %{"input_tokens" => 3, "output_tokens" => 5, "total_tokens" => 8},
+               "display_message" => state_payload["recent_outcomes"] |> List.first() |> Map.fetch!("display_message"),
+               "display_message_preview" => state_payload["recent_outcomes"] |> List.first() |> Map.fetch!("display_message_preview"),
+               "display_message_expandable" => true
+             }
+           ]
+
+    assert state_payload["recent_outcomes"] |> List.first() |> Map.fetch!("display_message") =~ "Created the hello world file"
+
+    assert running_entry["issue_id"] == "issue-http"
+    assert running_entry["issue_identifier"] == "MT-HTTP"
+    assert running_entry["issue_url"] == "https://linear.app/care-core/issue/MT-HTTP"
+    assert running_entry["title"] == "Observe HTTP issue"
+    assert running_entry["state"] == "In Progress"
+    assert running_entry["session_id"] == "thread-http"
+    assert running_entry["thread_id"] == "thread-http"
+    assert running_entry["current_turn_id"] == "turn-http-7"
+    assert running_entry["health"] == "healthy"
+    assert running_entry["event_count"] == 2
+    assert running_entry["turn_count"] == 7
+    assert running_entry["last_event"] == "notification"
+    assert running_entry["last_message"] == "rendered"
+    assert running_entry["tokens"] == %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+    assert is_number(running_entry["burn_rate_tokens_per_min"])
 
     conn = get(build_conn(), "/api/v1/MT-HTTP")
     issue_payload = json_response(conn, 200)
 
-    assert issue_payload == %{
-             "issue_identifier" => "MT-HTTP",
-             "issue_id" => "issue-http",
-             "status" => "running",
-             "workspace" => %{
-               "path" => Path.join(Config.settings!().workspace.root, "MT-HTTP"),
-               "host" => nil
-             },
-             "attempts" => %{"restart_count" => 0, "current_retry_attempt" => 0},
-             "running" => %{
-               "worker_host" => nil,
-               "workspace_path" => nil,
-               "session_id" => "thread-http",
-               "turn_count" => 7,
-               "state" => "In Progress",
-               "started_at" => issue_payload["running"]["started_at"],
-               "last_event" => "notification",
-               "last_message" => "rendered",
-               "progress_phase" => nil,
-               "progress_detail" => nil,
-               "progress_updated_at" => nil,
-               "last_event_at" => nil,
-               "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
-             },
-             "retry" => nil,
-             "logs" => %{"codex_session_logs" => []},
-             "recent_events" => [],
-             "last_error" => nil,
-             "tracked" => %{}
+    assert issue_payload["issue_identifier"] == "MT-HTTP"
+    assert issue_payload["issue_id"] == "issue-http"
+    assert issue_payload["issue_url"] == "https://linear.app/care-core/issue/MT-HTTP"
+    assert issue_payload["title"] == "Observe HTTP issue"
+    assert issue_payload["status"] == "running"
+    assert issue_payload["event_count"] == 2
+
+    assert issue_payload["workspace"] == %{
+             "path" => Path.join(Config.settings!().workspace.root, "MT-HTTP"),
+             "host" => nil
            }
+
+    assert issue_payload["running"]["thread_id"] == "thread-http"
+    assert issue_payload["running"]["current_turn_id"] == "turn-http-7"
+    assert issue_payload["running"]["health"] == "healthy"
+    assert issue_payload["running"]["tokens"] == %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
+
+    assert Enum.map(issue_payload["recent_events"], & &1["method"]) == [
+             "turn/started",
+             "item/agentMessage/delta"
+           ]
+
+    conn = get(build_conn(), "/api/v1/runs/MT-HTTP")
+    inspector_payload = json_response(conn, 200)
+
+    assert inspector_payload["issue_identifier"] == "MT-HTTP"
+    assert inspector_payload["event_count"] == 2
+    assert inspector_payload["inspector_path"] == "/runs/MT-HTTP"
+
+    assert inspector_payload["operator_transcript"] == [
+             %{
+               "kind" => "assistant",
+               "title" => "Assistant",
+               "body" => "rendered",
+               "timestamp" => inspector_payload["operator_transcript"] |> List.first() |> Map.fetch!("timestamp"),
+               "raw" => inspector_payload["operator_transcript"] |> List.first() |> Map.fetch!("raw")
+             }
+           ]
+
+    conn = get(build_conn(), "/api/v1/runs/MT-HTTP/events")
+    events_payload = json_response(conn, 200)
+
+    assert events_payload["issue_identifier"] == "MT-HTTP"
+    assert events_payload["issue_id"] == "issue-http"
+    assert events_payload["next_cursor"] == nil
+    assert length(events_payload["events"]) == 2
+
+    assert Enum.map(events_payload["events"], & &1["method"]) == [
+             "turn/started",
+             "item/agentMessage/delta"
+           ]
+
+    conn = get(build_conn(), "/api/v1/MT-DONE")
+    recent_issue_payload = json_response(conn, 200)
+
+    assert recent_issue_payload["issue_identifier"] == "MT-DONE"
+    assert recent_issue_payload["issue_id"] == "issue-done"
+    assert recent_issue_payload["title"] == "Completed issue"
+    assert recent_issue_payload["status"] == "completed"
+    assert recent_issue_payload["event_count"] == 1
+    assert recent_issue_payload["recent_outcome"]["thread_id"] == "thread-done-turn-1"
+    assert recent_issue_payload["recent_outcome"]["current_turn_id"] == "turn-done-1"
+    assert recent_issue_payload["recent_outcome"]["status"] == "completed"
+    assert recent_issue_payload["recent_outcome"]["state"] == "Completed"
+    assert recent_issue_payload["recent_outcome"]["outcome"] == "completed_turn"
+    assert Enum.map(recent_issue_payload["recent_events"], & &1["method"]) == ["item/completed"]
+    assert recent_issue_payload["operator_transcript"] |> List.first() |> Map.fetch!("body") =~ "Created the hello world file"
+
+    conn = get(build_conn(), "/api/v1/runs/MT-DONE/events")
+    recent_events_payload = json_response(conn, 200)
+
+    assert recent_events_payload["issue_identifier"] == "MT-DONE"
+    assert recent_events_payload["issue_id"] == "issue-done"
+    assert recent_events_payload["status"] == "completed"
+    assert recent_events_payload["next_cursor"] == nil
+    assert Enum.map(recent_events_payload["events"], & &1["method"]) == ["item/completed"]
+
+    limited_events_payload = json_response(get(build_conn(), "/api/v1/runs/MT-HTTP/events?limit=1"), 200)
+    assert Enum.map(limited_events_payload["events"], & &1["method"]) == ["item/agentMessage/delta"]
 
     conn = get(build_conn(), "/api/v1/MT-RETRY")
 
@@ -427,10 +493,126 @@ defmodule SymphonyElixir.ExtensionsTest do
              "error" => %{"code" => "issue_not_found", "message" => "Issue not found"}
            }
 
+    conn = get(build_conn(), "/api/v1/runs/MT-MISSING/events")
+
+    assert json_response(conn, 404) == %{
+             "error" => %{"code" => "issue_not_found", "message" => "Issue not found"}
+           }
+
     conn = post(build_conn(), "/api/v1/refresh", %{})
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "phoenix observability api and run inspector fall back to archived runs when live snapshot misses" do
+    archive_root = Path.join(System.tmp_dir!(), "symphony-archive-#{System.unique_integer([:positive])}")
+    Application.put_env(:symphony_elixir, :run_archive_root, archive_root)
+    write_archived_run!(archive_root)
+
+    on_exit(fn ->
+      File.rm_rf(archive_root)
+    end)
+
+    orchestrator_name = Module.concat(__MODULE__, :ArchiveFallbackOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: %{
+          running: [],
+          retrying: [],
+          codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+          rate_limits: %{"primary" => %{"remaining" => 11}},
+          recent_outcomes: [],
+          polling: %{checking?: false, next_poll_in_ms: nil, poll_interval_ms: nil}
+        }
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+
+    assert state_payload["counts"] == %{"running" => 0, "retrying" => 0}
+
+    assert state_payload["recent_outcomes"] == [
+             %{
+               "issue_id" => "issue-archive",
+               "issue_identifier" => "MT-ARCHIVE",
+               "issue_url" => "https://linear.app/care-core/issue/MT-ARCHIVE",
+               "title" => "Archived issue",
+               "outcome" => "completed_turn",
+               "status" => "completed",
+               "state" => "Completed",
+               "session_id" => "thread-archive-turn-1",
+               "last_event" => "turn_completed",
+               "last_message" => "archived turn completed",
+               "runtime_seconds" => 18,
+               "finished_at" => state_payload["recent_outcomes"] |> List.first() |> Map.fetch!("finished_at"),
+               "tokens" => %{"input_tokens" => 13, "output_tokens" => 21, "total_tokens" => 34},
+               "display_message" => "Archived assistant summary",
+               "display_message_preview" => "Archived assistant summary",
+               "display_message_expandable" => false
+             }
+           ]
+
+    archived_run = json_response(get(build_conn(), "/api/v1/runs/MT-ARCHIVE"), 200)
+
+    assert archived_run["issue_identifier"] == "MT-ARCHIVE"
+    assert archived_run["issue_id"] == "issue-archive"
+    assert archived_run["title"] == "Archived issue"
+    assert archived_run["status"] == "completed"
+    assert archived_run["event_count"] == 2
+
+    assert archived_run["workspace"] == %{
+             "path" => Path.join(Config.settings!().workspace.root, "MT-ARCHIVE"),
+             "host" => "spark"
+           }
+
+    assert archived_run["recent_outcome"]["thread_id"] == "thread-archive"
+    assert archived_run["recent_outcome"]["current_turn_id"] == "turn-archive-1"
+    assert archived_run["recent_outcome"]["status"] == "completed"
+    assert archived_run["recent_outcome"]["state"] == "Completed"
+    assert archived_run["recent_outcome"]["outcome"] == "completed_turn"
+    assert Enum.map(archived_run["recent_events"], & &1["method"]) == ["item/completed", "item/completed"]
+
+    assert archived_run["operator_transcript"] == [
+             %{
+               "kind" => "assistant",
+               "title" => "Assistant",
+               "body" => "Archived assistant summary",
+               "timestamp" => archived_run["operator_transcript"] |> List.first() |> Map.fetch!("timestamp"),
+               "raw" => archived_run["operator_transcript"] |> List.first() |> Map.fetch!("raw")
+             },
+             %{
+               "kind" => "command",
+               "title" => "Command",
+               "body" => "git status --short",
+               "timestamp" => archived_run["operator_transcript"] |> Enum.at(1) |> Map.fetch!("timestamp"),
+               "raw" => archived_run["operator_transcript"] |> Enum.at(1) |> Map.fetch!("raw"),
+               "meta" => "exit 0"
+             },
+             %{
+               "kind" => "command_output",
+               "title" => "Command output",
+               "body" => "M archived.txt",
+               "timestamp" => archived_run["operator_transcript"] |> List.last() |> Map.fetch!("timestamp"),
+               "raw" => archived_run["operator_transcript"] |> List.last() |> Map.fetch!("raw")
+             }
+           ]
+
+    archived_events = json_response(get(build_conn(), "/api/v1/runs/MT-ARCHIVE/events"), 200)
+    assert archived_events["issue_identifier"] == "MT-ARCHIVE"
+    assert archived_events["issue_id"] == "issue-archive"
+    assert archived_events["status"] == "completed"
+    assert Enum.map(archived_events["events"], & &1["method"]) == ["item/completed", "item/completed"]
+
+    assert {:ok, _view, html} = live(build_conn(), "/runs/MT-ARCHIVE")
+    assert html =~ "MT-ARCHIVE"
+    assert html =~ "Archived issue"
+    assert html =~ "Archived assistant summary"
+    assert html =~ "git status --short"
+    refute html =~ "Run unavailable"
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -447,6 +629,12 @@ defmodule SymphonyElixir.ExtensionsTest do
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
     assert json_response(post(build_conn(), "/api/v1/MT-1", %{}), 405) ==
+             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+
+    assert json_response(post(build_conn(), "/api/v1/runs/MT-1", %{}), 405) ==
+             %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
+
+    assert json_response(post(build_conn(), "/api/v1/runs/MT-1/events", %{}), 405) ==
              %{"error" => %{"code" => "method_not_allowed", "message" => "Method not allowed"}}
 
     assert json_response(get(build_conn(), "/unknown"), 404) ==
@@ -467,6 +655,14 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "message" => "Orchestrator is unavailable"
                }
              }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-HTTP"), 503) == %{
+             "error" => %{"code" => "snapshot_unavailable", "message" => "Snapshot unavailable"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-HTTP/events"), 503) == %{
+             "error" => %{"code" => "snapshot_unavailable", "message" => "Snapshot unavailable"}
+           }
   end
 
   test "phoenix observability api preserves snapshot timeout behavior" do
@@ -481,6 +677,14 @@ defmodule SymphonyElixir.ExtensionsTest do
                "generated_at" => timeout_payload["generated_at"],
                "error" => %{"code" => "snapshot_timeout", "message" => "Snapshot timed out"}
              }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-HTTP"), 504) == %{
+             "error" => %{"code" => "snapshot_timeout", "message" => "Snapshot timed out"}
+           }
+
+    assert json_response(get(build_conn(), "/api/v1/runs/MT-HTTP/events"), 504) == %{
+             "error" => %{"code" => "snapshot_timeout", "message" => "Snapshot timed out"}
+           }
   end
 
   test "dashboard bootstraps liveview from embedded static assets" do
@@ -501,7 +705,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
     html = html_response(get(build_conn(), "/"), 200)
-    assert html =~ "/dashboard.css"
+    assert html =~ "/dashboard.css?v="
+    refute html =~ "href=\"/dashboard.css\""
+    refute Regex.match?(~r/href=\"\/dashboard\.css\?v=\d+\"/, html)
+    assert Regex.match?(~r/href=\"\/dashboard\.css\?v=[0-9a-f]{8,}\"/, html)
     assert html =~ "/vendor/phoenix_html/phoenix_html.js"
     assert html =~ "/vendor/phoenix/phoenix.js"
     assert html =~ "/vendor/phoenix_live_view/phoenix_live_view.js"
@@ -510,7 +717,13 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     dashboard_css = response(get(build_conn(), "/dashboard.css"), 200)
     assert dashboard_css =~ ":root {"
+    assert dashboard_css =~ "color-scheme: light"
+    refute dashboard_css =~ "color-scheme: dark"
     assert dashboard_css =~ ".status-badge-live"
+    assert dashboard_css =~ ".transcript-body"
+    assert dashboard_css =~ "white-space: pre-wrap"
+    assert dashboard_css =~ ".inspector-main-stack,"
+    assert dashboard_css =~ "align-content: start;\n  min-width: 0;"
     assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-live"
     assert dashboard_css =~ "[data-phx-main].phx-connected .status-badge-offline"
 
@@ -546,28 +759,38 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     {:ok, view, html} = live(build_conn(), "/")
     assert html =~ "Operations Dashboard"
+    assert html =~ "symphony · observability"
+    refute html =~ "atlas · symphony observability"
+    assert html =~ "<p class=\"eyebrow\">Symphony</p>"
+    assert html =~ "href=\"https://linear.app/care-core/issue/MT-HTTP\""
+    assert html =~ "href=\"https://linear.app/care-core/issue/MT-DONE\""
+    assert html =~ "Active Runs"
+    assert html =~ "Recent Outcomes"
     assert html =~ "MT-HTTP"
     assert html =~ "MT-RETRY"
-    assert html =~ "rendered"
-    assert html =~ "Runtime"
+    assert html =~ "MT-DONE"
+    assert html =~ "/runs/MT-DONE"
+    assert html =~ "Completed issue"
+    refute html =~ ">turn completed<"
+    assert html =~ "Created the hello world file, posted the Linear note, and verified the artifact still exists for handoff."
+    assert html =~ "Show more"
+    assert html =~ "Observe HTTP issue"
+    assert html =~ "Inspect"
     assert html =~ "Live"
     assert html =~ "Offline"
-    assert html =~ "Copy ID"
-    assert html =~ "Progress"
-    refute html =~ "data-runtime-clock="
-    refute html =~ "setInterval(refreshRuntimeClocks"
-    refute html =~ "Refresh now"
-    refute html =~ "Transport"
-    assert html =~ "status-badge-live"
-    assert html =~ "status-badge-offline"
+    assert html =~ "Health"
 
     updated_snapshot =
       put_in(snapshot.running, [
         %{
           issue_id: "issue-http",
           identifier: "MT-HTTP",
+          url: "https://linear.app/care-core/issue/MT-HTTP",
+          title: "Observe HTTP issue",
           state: "In Progress",
           session_id: "thread-http",
+          thread_id: "thread-http",
+          current_turn_id: "turn-http-8",
           turn_count: 8,
           last_codex_event: :notification,
           last_codex_message: %{
@@ -587,6 +810,30 @@ defmodule SymphonyElixir.ExtensionsTest do
           codex_input_tokens: 10,
           codex_output_tokens: 12,
           codex_total_tokens: 22,
+          recent_codex_events: [
+            %{
+              event_id: 3,
+              event: :notification,
+              method: "item/agentMessage/delta",
+              category: "agent_message",
+              summary: "structured update",
+              timestamp: DateTime.utc_now(),
+              session_id: "thread-http",
+              thread_id: "thread-http",
+              turn_id: "turn-http-8",
+              item_id: "msg-http",
+              raw: "{\"method\":\"item/agentMessage/delta\"}",
+              payload: %{
+                "method" => "item/agentMessage/delta",
+                "params" => %{
+                  "threadId" => "thread-http",
+                  "turnId" => "turn-http-8",
+                  "itemId" => "msg-http",
+                  "delta" => "structured update"
+                }
+              }
+            }
+          ],
           started_at: DateTime.utc_now()
         }
       ])
@@ -598,8 +845,124 @@ defmodule SymphonyElixir.ExtensionsTest do
     StatusDashboard.notify_update()
 
     assert_eventually(fn ->
-      render(view) =~ "agent message content streaming: structured update"
+      render(view) =~ "structured update"
     end)
+
+    {:ok, _inspect_view, inspect_html} = live(build_conn(), "/?inspect=MT-HTTP")
+    assert inspect_html =~ "Quick view"
+    assert inspect_html =~ "Raw payload"
+  end
+
+  test "run inspector liveview renders codex-style operator transcript" do
+    orchestrator_name = Module.concat(__MODULE__, :RunInspectorOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: transcript_snapshot(),
+        refresh: %{
+          queued: true,
+          coalesced: true,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/runs/MT-TRANSCRIPT")
+    assert html =~ "Latest Assistant Update"
+    assert html =~ "Operator Transcript"
+    assert html =~ "Recent Event Feed"
+    assert html =~ "Copy Resume Cmd"
+    assert html =~ "codex --yolo resume"
+    assert html =~ "Copy Cmd"
+    assert html =~ "data-copy-text=\"thread-transcript\""
+    assert html =~ "Assistant"
+    assert html =~ "I’ve created the file."
+    assert html =~ "Command"
+    assert html =~ "cat HELLO_FROM_SYMPHONY.txt"
+    assert html =~ "hello from symphony live dashboard demo"
+    assert html =~ "Tool call linear_graphql"
+    assert html =~ "Tool response linear_graphql"
+    assert html =~ "File change"
+    assert html =~ "Open in Linear"
+    assert html =~ "href=\"https://linear.app/care-core/issue/MT-TRANSCRIPT\""
+    assert html =~ "phx-hook=\"PersistDetailsState\""
+    assert html =~ "data-details-key=\"raw:"
+    refute html =~ "agent message streaming:"
+  end
+
+  test "run payload compacts streamed agent-message deltas for the inspector feed" do
+    orchestrator_name = Module.concat(__MODULE__, :CompactedInspectorFeedOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: compacted_feed_snapshot(),
+        refresh: %{
+          queued: true,
+          coalesced: true,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    payload = json_response(get(build_conn(), "/api/v1/runs/MT-COMPACT"), 200)
+
+    assert Enum.map(payload["recent_events"], & &1["method"]) == [
+             "item/agentMessage/delta",
+             "item/completed"
+           ]
+
+    assert payload["recent_events"] |> List.first() |> Map.fetch!("summary") ==
+             "agent message streaming: Move issue to Done"
+
+    assert payload["recent_events"] |> List.first() |> Map.fetch!("message") ==
+             "Move issue to Done"
+
+    raw_payload = json_response(get(build_conn(), "/api/v1/runs/MT-COMPACT/events"), 200)
+
+    assert Enum.map(raw_payload["events"], & &1["method"]) == [
+             "item/agentMessage/delta",
+             "item/agentMessage/delta",
+             "item/agentMessage/delta",
+             "item/completed"
+           ]
+  end
+
+  test "run inspector liveview renders recent outcomes after completion" do
+    orchestrator_name = Module.concat(__MODULE__, :RecentOutcomeInspectorOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        refresh: %{
+          queued: true,
+          coalesced: true,
+          requested_at: DateTime.utc_now(),
+          operations: ["poll"]
+        }
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    {:ok, _view, html} = live(build_conn(), "/runs/MT-DONE")
+    assert html =~ "Run Inspector"
+    assert html =~ "Completed issue"
+    assert html =~ "thread-done-turn-1"
+    assert html =~ "turn-done-1"
+    assert html =~ "Latest Assistant Update"
+    assert html =~ "Operator Transcript"
+    assert html =~ "Recent Event Feed"
+    assert html =~ "Copy Resume Cmd"
+    assert html =~ "Copy Cmd"
+    assert html =~ "Created the hello world file"
+    assert html =~ "phx-hook=\"PersistDetailsState\""
+    assert html =~ "phx-hook=\"ClipboardCopy\""
   end
 
   test "dashboard liveview renders an unavailable state without crashing" do
@@ -689,22 +1052,300 @@ defmodule SymphonyElixir.ExtensionsTest do
     start_supervised!({SymphonyElixirWeb.Endpoint, []})
   end
 
+  defp transcript_snapshot do
+    %{
+      running: [
+        %{
+          issue_id: "issue-transcript",
+          identifier: "MT-TRANSCRIPT",
+          url: "https://linear.app/care-core/issue/MT-TRANSCRIPT",
+          title: "Codex transcript demo",
+          state: "In Progress",
+          session_id: "thread-transcript",
+          thread_id: "thread-transcript",
+          current_turn_id: "turn-transcript-1",
+          turn_count: 1,
+          codex_app_server_pid: nil,
+          last_codex_message: "completed transcript demo",
+          last_codex_timestamp: DateTime.utc_now(),
+          last_codex_event: :notification,
+          codex_input_tokens: 42,
+          codex_output_tokens: 18,
+          codex_total_tokens: 60,
+          recent_codex_events: [
+            %{
+              event_id: 1,
+              event: :notification,
+              method: "item/completed",
+              category: "system",
+              summary: "item completed: agent message (msg-transcript-1)",
+              timestamp: DateTime.utc_now(),
+              session_id: "thread-transcript",
+              thread_id: "thread-transcript",
+              turn_id: "turn-transcript-1",
+              item_id: "msg-transcript-1",
+              raw: "{\"method\":\"item/completed\",\"type\":\"agentMessage\"}",
+              payload: %{
+                "method" => "item/completed",
+                "params" => %{
+                  "threadId" => "thread-transcript",
+                  "turnId" => "turn-transcript-1",
+                  "item" => %{
+                    "id" => "msg-transcript-1",
+                    "type" => "agentMessage",
+                    "text" => "I’ve created the file."
+                  }
+                }
+              }
+            },
+            %{
+              event_id: 2,
+              event: :notification,
+              method: "item/completed",
+              category: "command",
+              summary: "item completed: command execution (call-transcript-cmd, completed)",
+              timestamp: DateTime.utc_now(),
+              session_id: "thread-transcript",
+              thread_id: "thread-transcript",
+              turn_id: "turn-transcript-1",
+              item_id: "call-transcript-cmd",
+              raw: "{\"method\":\"item/completed\",\"type\":\"commandExecution\"}",
+              payload: %{
+                "method" => "item/completed",
+                "params" => %{
+                  "threadId" => "thread-transcript",
+                  "turnId" => "turn-transcript-1",
+                  "item" => %{
+                    "id" => "call-transcript-cmd",
+                    "type" => "commandExecution",
+                    "command" => "/bin/bash -lc 'cat HELLO_FROM_SYMPHONY.txt'",
+                    "aggregatedOutput" => "hello from symphony live dashboard demo\n",
+                    "exitCode" => 0,
+                    "status" => "completed"
+                  }
+                }
+              }
+            },
+            %{
+              event_id: 3,
+              event: :tool_call_completed,
+              method: "item/tool/call",
+              category: "tool",
+              summary: "dynamic tool call completed (linear_graphql)",
+              timestamp: DateTime.utc_now(),
+              session_id: "thread-transcript",
+              thread_id: "thread-transcript",
+              turn_id: "turn-transcript-1",
+              item_id: "call-transcript-tool",
+              raw: "{\"method\":\"item/tool/call\"}",
+              payload: %{
+                "method" => "item/tool/call",
+                "params" => %{
+                  "threadId" => "thread-transcript",
+                  "turnId" => "turn-transcript-1",
+                  "callId" => "call-transcript-tool",
+                  "tool" => "linear_graphql",
+                  "arguments" => %{
+                    "query" => "mutation AddComment { commentCreate { success } }",
+                    "variables" => %{"issueId" => "issue-transcript", "body" => "done"}
+                  }
+                }
+              }
+            },
+            %{
+              event_id: 4,
+              event: :notification,
+              method: "item/completed",
+              category: "file_change",
+              summary: "item completed: file change (call-transcript-file, completed)",
+              timestamp: DateTime.utc_now(),
+              session_id: "thread-transcript",
+              thread_id: "thread-transcript",
+              turn_id: "turn-transcript-1",
+              item_id: "call-transcript-file",
+              raw: "{\"method\":\"item/completed\",\"type\":\"fileChange\"}",
+              payload: %{
+                "method" => "item/completed",
+                "params" => %{
+                  "threadId" => "thread-transcript",
+                  "turnId" => "turn-transcript-1",
+                  "item" => %{
+                    "id" => "call-transcript-file",
+                    "type" => "fileChange",
+                    "status" => "completed",
+                    "changes" => [
+                      %{
+                        "path" => "/tmp/symphony-linear-observability-demo/workspaces/MT-TRANSCRIPT/HELLO_FROM_SYMPHONY.txt",
+                        "kind" => %{"type" => "add"},
+                        "diff" => "hello from symphony live dashboard demo\n"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          ],
+          started_at: DateTime.utc_now()
+        }
+      ],
+      retrying: [],
+      codex_totals: %{input_tokens: 42, output_tokens: 18, total_tokens: 60, seconds_running: 9.0},
+      rate_limits: %{"primary" => %{"remaining" => 11}},
+      recent_outcomes: [],
+      polling: %{checking?: false, next_poll_in_ms: nil, poll_interval_ms: nil}
+    }
+  end
+
+  defp compacted_feed_snapshot do
+    %{
+      running: [
+        %{
+          issue_id: "issue-compact",
+          identifier: "MT-COMPACT",
+          url: "https://linear.app/care-core/issue/MT-COMPACT",
+          title: "Compacted event feed demo",
+          state: "In Progress",
+          session_id: "thread-compact",
+          thread_id: "thread-compact",
+          current_turn_id: "turn-compact-1",
+          turn_count: 1,
+          codex_app_server_pid: nil,
+          last_codex_message: "Move issue to Done",
+          last_codex_timestamp: DateTime.utc_now(),
+          last_codex_event: :notification,
+          codex_input_tokens: 10,
+          codex_output_tokens: 4,
+          codex_total_tokens: 14,
+          recent_codex_events: [
+            streamed_delta_event(1, "thread-compact", "turn-compact-1", "msg-compact", "Move "),
+            streamed_delta_event(2, "thread-compact", "turn-compact-1", "msg-compact", "issue "),
+            streamed_delta_event(3, "thread-compact", "turn-compact-1", "msg-compact", "to Done"),
+            %{
+              event_id: 4,
+              event: :notification,
+              method: "item/completed",
+              category: "system",
+              summary: "item completed: agent message (msg-compact)",
+              timestamp: DateTime.utc_now(),
+              session_id: "thread-compact",
+              thread_id: "thread-compact",
+              turn_id: "turn-compact-1",
+              item_id: "msg-compact",
+              raw: "{\"method\":\"item/completed\",\"type\":\"agentMessage\"}",
+              payload: %{
+                "method" => "item/completed",
+                "params" => %{
+                  "threadId" => "thread-compact",
+                  "turnId" => "turn-compact-1",
+                  "item" => %{
+                    "id" => "msg-compact",
+                    "type" => "agentMessage",
+                    "text" => "Move issue to Done"
+                  }
+                }
+              }
+            }
+          ],
+          started_at: DateTime.utc_now()
+        }
+      ],
+      retrying: [],
+      codex_totals: %{input_tokens: 10, output_tokens: 4, total_tokens: 14, seconds_running: 3.0},
+      rate_limits: %{"primary" => %{"remaining" => 11}},
+      recent_outcomes: [],
+      polling: %{checking?: false, next_poll_in_ms: nil, poll_interval_ms: nil}
+    }
+  end
+
+  defp streamed_delta_event(event_id, thread_id, turn_id, item_id, delta) do
+    %{
+      event_id: event_id,
+      event: :notification,
+      method: "item/agentMessage/delta",
+      category: "agent_message",
+      summary: "agent message streaming: #{delta}",
+      timestamp: DateTime.utc_now(),
+      session_id: thread_id,
+      thread_id: thread_id,
+      turn_id: turn_id,
+      item_id: item_id,
+      raw: "{\"method\":\"item/agentMessage/delta\"}",
+      payload: %{
+        "method" => "item/agentMessage/delta",
+        "params" => %{
+          "threadId" => thread_id,
+          "turnId" => turn_id,
+          "itemId" => item_id,
+          "delta" => delta
+        }
+      }
+    }
+  end
+
   defp static_snapshot do
     %{
       running: [
         %{
           issue_id: "issue-http",
           identifier: "MT-HTTP",
+          url: "https://linear.app/care-core/issue/MT-HTTP",
+          title: "Observe HTTP issue",
           state: "In Progress",
           session_id: "thread-http",
+          thread_id: "thread-http",
+          current_turn_id: "turn-http-7",
           turn_count: 7,
           codex_app_server_pid: nil,
           last_codex_message: "rendered",
-          last_codex_timestamp: nil,
+          last_codex_timestamp: DateTime.utc_now(),
           last_codex_event: :notification,
           codex_input_tokens: 4,
           codex_output_tokens: 8,
           codex_total_tokens: 12,
+          recent_codex_events: [
+            %{
+              event_id: 1,
+              event: :notification,
+              method: "turn/started",
+              category: "lifecycle",
+              summary: "turn started",
+              timestamp: DateTime.utc_now(),
+              session_id: "thread-http",
+              thread_id: "thread-http",
+              turn_id: "turn-http-7",
+              item_id: nil,
+              raw: "{\"method\":\"turn/started\"}",
+              payload: %{
+                "method" => "turn/started",
+                "params" => %{
+                  "threadId" => "thread-http",
+                  "turn" => %{"id" => "turn-http-7", "status" => "inProgress"}
+                }
+              }
+            },
+            %{
+              event_id: 2,
+              event: :notification,
+              method: "item/agentMessage/delta",
+              category: "agent_message",
+              summary: "rendered",
+              timestamp: DateTime.utc_now(),
+              session_id: "thread-http",
+              thread_id: "thread-http",
+              turn_id: "turn-http-7",
+              item_id: "msg-http",
+              raw: "{\"method\":\"item/agentMessage/delta\"}",
+              payload: %{
+                "method" => "item/agentMessage/delta",
+                "params" => %{
+                  "threadId" => "thread-http",
+                  "turnId" => "turn-http-7",
+                  "itemId" => "msg-http",
+                  "delta" => "rendered"
+                }
+              }
+            }
+          ],
           started_at: DateTime.utc_now()
         }
       ],
@@ -718,8 +1359,202 @@ defmodule SymphonyElixir.ExtensionsTest do
         }
       ],
       codex_totals: %{input_tokens: 4, output_tokens: 8, total_tokens: 12, seconds_running: 42.5},
-      rate_limits: %{"primary" => %{"remaining" => 11}}
+      rate_limits: %{"primary" => %{"remaining" => 11}},
+      recent_outcomes: [
+        %{
+          issue_id: "issue-done",
+          identifier: "MT-DONE",
+          url: "https://linear.app/care-core/issue/MT-DONE",
+          title: "Completed issue",
+          outcome: "completed_turn",
+          session_id: "thread-done-turn-1",
+          thread_id: "thread-done-turn-1",
+          current_turn_id: "turn-done-1",
+          worker_host: "spark",
+          workspace_path: Path.join(Config.settings!().workspace.root, "MT-DONE"),
+          last_event: :turn_completed,
+          last_message: "turn completed",
+          last_event_at: DateTime.utc_now(),
+          runtime_seconds: 12,
+          finished_at: DateTime.utc_now(),
+          tokens: %{input_tokens: 3, output_tokens: 5, total_tokens: 8},
+          recent_codex_events: [
+            %{
+              event_id: 9,
+              event: :notification,
+              method: "item/completed",
+              category: "agent_message",
+              summary: "item completed: agent message (msg-done)",
+              timestamp: DateTime.utc_now(),
+              session_id: "thread-done-turn-1",
+              thread_id: "thread-done-turn-1",
+              turn_id: "turn-done-1",
+              item_id: "msg-done",
+              raw: "{\"method\":\"item/completed\",\"type\":\"agentMessage\"}",
+              payload: %{
+                "method" => "item/completed",
+                "params" => %{
+                  "threadId" => "thread-done-turn-1",
+                  "turnId" => "turn-done-1",
+                  "item" => %{
+                    "id" => "msg-done",
+                    "type" => "agentMessage",
+                    "text" =>
+                      "Created the hello world file, posted the Linear note, and verified the artifact still exists for handoff. This final summary is intentionally long so the dashboard recent-outcomes table can show a truncated preview with an expandable full message."
+                  }
+                }
+              }
+            }
+          ]
+        }
+      ],
+      polling: %{checking?: false, next_poll_in_ms: nil, poll_interval_ms: nil}
     }
+  end
+
+  defp write_archived_run!(archive_root) do
+    run_id = "run-archive-1"
+    run_dir = Path.join([archive_root, "runs", run_id])
+    issues_dir = Path.join(archive_root, "issues")
+    File.mkdir_p!(run_dir)
+    File.mkdir_p!(issues_dir)
+
+    timestamps = [
+      "2026-04-20T22:19:39Z",
+      "2026-04-20T22:19:40Z"
+    ]
+
+    events = [
+      %{
+        "event_id" => 1,
+        "issue_identifier" => "MT-ARCHIVE",
+        "at" => Enum.at(timestamps, 0),
+        "event" => "notification",
+        "method" => "item/completed",
+        "category" => "agent_message",
+        "summary" => "item completed: agent message (msg-archive)",
+        "message" => "item completed: agent message (msg-archive)",
+        "session_id" => "thread-archive-turn-1",
+        "thread_id" => "thread-archive",
+        "turn_id" => "turn-archive-1",
+        "item_id" => "msg-archive",
+        "raw" => "{\"method\":\"item/completed\",\"type\":\"agentMessage\"}",
+        "payload" => %{
+          "method" => "item/completed",
+          "params" => %{
+            "threadId" => "thread-archive",
+            "turnId" => "turn-archive-1",
+            "item" => %{
+              "id" => "msg-archive",
+              "type" => "agentMessage",
+              "text" => "Archived assistant summary"
+            }
+          }
+        }
+      },
+      %{
+        "event_id" => 2,
+        "issue_identifier" => "MT-ARCHIVE",
+        "at" => Enum.at(timestamps, 1),
+        "event" => "notification",
+        "method" => "item/completed",
+        "category" => "command",
+        "summary" => "item completed: command execution (cmd-archive)",
+        "message" => "item completed: command execution (cmd-archive)",
+        "session_id" => "thread-archive-turn-1",
+        "thread_id" => "thread-archive",
+        "turn_id" => "turn-archive-1",
+        "item_id" => "cmd-archive",
+        "raw" => "{\"method\":\"item/completed\",\"type\":\"commandExecution\"}",
+        "payload" => %{
+          "method" => "item/completed",
+          "params" => %{
+            "threadId" => "thread-archive",
+            "turnId" => "turn-archive-1",
+            "item" => %{
+              "id" => "cmd-archive",
+              "type" => "commandExecution",
+              "command" => "git status --short",
+              "aggregatedOutput" => "M archived.txt",
+              "exitCode" => 0
+            }
+          }
+        }
+      }
+    ]
+
+    File.write!(
+      Path.join(run_dir, "events.jsonl"),
+      Enum.map_join(events, "", &(Jason.encode!(&1) <> "\n"))
+    )
+
+    File.write!(
+      Path.join(run_dir, "summary.json"),
+      Jason.encode!(
+        %{
+          run_id: run_id,
+          issue_id: "issue-archive",
+          issue_identifier: "MT-ARCHIVE",
+          issue_url: "https://linear.app/care-core/issue/MT-ARCHIVE",
+          title: "Archived issue",
+          outcome: "completed_turn",
+          session_id: "thread-archive-turn-1",
+          thread_id: "thread-archive",
+          current_turn_id: "turn-archive-1",
+          worker_host: "spark",
+          workspace_path: Path.join(Config.settings!().workspace.root, "MT-ARCHIVE"),
+          turn_count: 1,
+          started_at: "2026-04-20T22:19:21Z",
+          finished_at: "2026-04-20T22:19:39Z",
+          last_event: "turn_completed",
+          last_message: "archived turn completed",
+          runtime_seconds: 18,
+          tokens: %{input_tokens: 13, output_tokens: 21, total_tokens: 34},
+          operator_transcript: [
+            %{
+              kind: "assistant",
+              title: "Assistant",
+              body: "Archived assistant summary",
+              timestamp: Enum.at(timestamps, 0),
+              raw: "{\"method\":\"item/completed\",\"type\":\"agentMessage\"}"
+            },
+            %{
+              kind: "command",
+              title: "Command",
+              body: "git status --short",
+              timestamp: Enum.at(timestamps, 1),
+              raw: "{\"method\":\"item/completed\",\"type\":\"commandExecution\"}",
+              meta: "exit 0"
+            },
+            %{
+              kind: "command_output",
+              title: "Command output",
+              body: "M archived.txt",
+              timestamp: Enum.at(timestamps, 1),
+              raw: "{\"method\":\"item/completed\",\"type\":\"commandExecution\"}"
+            }
+          ]
+        },
+        pretty: true
+      )
+    )
+
+    File.write!(
+      Path.join(issues_dir, "MT-ARCHIVE.json"),
+      Jason.encode!(
+        %{
+          issue_identifier: "MT-ARCHIVE",
+          issue_id: "issue-archive",
+          issue_url: "https://linear.app/care-core/issue/MT-ARCHIVE",
+          title: "Archived issue",
+          outcome: "completed_turn",
+          run_id: run_id,
+          latest_session_id: "thread-archive-turn-1",
+          updated_at: "2026-04-20T22:19:39Z"
+        },
+        pretty: true
+      )
+    )
   end
 
   defp wait_for_bound_port do

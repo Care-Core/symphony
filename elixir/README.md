@@ -62,7 +62,98 @@ mise trust
 mise install
 mise exec -- mix setup
 mise exec -- mix build
-mise exec -- ./bin/symphony ./WORKFLOW.md
+mise exec -- ./bin/symphony \
+  --i-understand-that-this-will-be-running-without-the-usual-guardrails \
+  ./WORKFLOW.md
+```
+
+## Background and Boot
+
+For a one-off background process with the observability dashboard on port `4000`:
+
+```bash
+cd symphony/elixir
+export LINEAR_API_KEY=...
+mkdir -p log
+
+ESCRIPT="$(mise which escript)"
+setsid -f "$ESCRIPT" ./bin/symphony \
+  --i-understand-that-this-will-be-running-without-the-usual-guardrails \
+  --port 4000 \
+  ./WORKFLOW.md \
+  > log/symphony.out 2>&1
+
+pgrep -f 'bin/symphony .*--port 4000 ./WORKFLOW.md' | head -n 1 > log/symphony.pid
+```
+
+Check or stop that process later:
+
+```bash
+tail -f log/symphony.out
+kill "$(cat log/symphony.pid)"
+```
+
+To expose the local dashboard over Tailscale:
+
+```bash
+tailscale serve --bg --yes --http=4000 4000
+tailscale serve status
+```
+
+Tailscale prints the URL. It will usually look like
+`http://<machine-name>.<tailnet-name>.ts.net:4000/`. Disable that proxy with:
+
+```bash
+tailscale serve --http=4000 off
+```
+
+For startup on boot, prefer a user-level systemd service instead of `nohup` or `setsid`. Store
+secrets in an environment file:
+
+```bash
+mkdir -p ~/.config/symphony ~/.config/systemd/user
+{
+  printf 'LINEAR_API_KEY=%s\n' 'your-linear-token'
+  printf 'PATH=%s\n' "$PATH"
+} > ~/.config/symphony/symphony.env
+chmod 600 ~/.config/symphony/symphony.env
+```
+
+Create `~/.config/systemd/user/symphony.service`:
+
+```ini
+[Unit]
+Description=Symphony orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Developer/tools/symphony/elixir
+EnvironmentFile=%h/.config/symphony/symphony.env
+ExecStart=%h/.local/bin/mise exec -- ./bin/symphony --i-understand-that-this-will-be-running-without-the-usual-guardrails --port 4000 ./WORKFLOW.md
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+```
+
+Then enable it:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now symphony.service
+loginctl enable-linger "$USER"
+```
+
+Use these commands to inspect, stop, or disable the boot service:
+
+```bash
+systemctl --user status symphony.service
+journalctl --user -u symphony.service -f
+systemctl --user stop symphony.service
+systemctl --user disable --now symphony.service
 ```
 
 ## Configuration
@@ -127,6 +218,8 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- Hooks receive issue metadata as environment variables:
+  `SYMPHONY_ISSUE_ID`, `SYMPHONY_ISSUE_IDENTIFIER`, and `SYMPHONY_ISSUE_BRANCH_NAME`.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - `tracker.api_key` reads from `LINEAR_API_KEY` when unset or when value is `$LINEAR_API_KEY`.

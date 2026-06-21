@@ -145,6 +145,7 @@ defmodule SymphonyElixir.CLI do
 
   defp set_logs_root(logs_root) do
     Application.put_env(:symphony_elixir, :log_file, LogFile.default_log_file(logs_root))
+    Application.put_env(:symphony_elixir, :run_archive_root, logs_root)
     :ok
   end
 

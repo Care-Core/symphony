@@ -19,8 +19,30 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
       {:ok, payload} ->
         json(conn, payload)
 
-      {:error, :issue_not_found} ->
-        error_response(conn, 404, "issue_not_found", "Issue not found")
+      {:error, reason} ->
+        issue_error_response(conn, reason)
+    end
+  end
+
+  @spec run(Conn.t(), map()) :: Conn.t()
+  def run(conn, %{"issue_identifier" => issue_identifier}) do
+    case Presenter.run_payload(issue_identifier, orchestrator(), snapshot_timeout_ms()) do
+      {:ok, payload} ->
+        json(conn, payload)
+
+      {:error, reason} ->
+        issue_error_response(conn, reason)
+    end
+  end
+
+  @spec events(Conn.t(), map()) :: Conn.t()
+  def events(conn, %{"issue_identifier" => issue_identifier} = params) do
+    case Presenter.events_payload(issue_identifier, params, orchestrator(), snapshot_timeout_ms()) do
+      {:ok, payload} ->
+        json(conn, payload)
+
+      {:error, reason} ->
+        issue_error_response(conn, reason)
     end
   end
 
@@ -52,6 +74,18 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     |> put_status(status)
     |> json(%{error: %{code: code, message: message}})
   end
+
+  defp issue_error_response(conn, :issue_not_found),
+    do: error_response(conn, 404, "issue_not_found", "Issue not found")
+
+  defp issue_error_response(conn, :snapshot_timeout),
+    do: error_response(conn, 504, "snapshot_timeout", "Snapshot timed out")
+
+  defp issue_error_response(conn, :snapshot_unavailable),
+    do: error_response(conn, 503, "snapshot_unavailable", "Snapshot unavailable")
+
+  defp issue_error_response(conn, _reason),
+    do: error_response(conn, 500, "unknown_error", "Unknown error")
 
   defp orchestrator do
     Endpoint.config(:orchestrator) || SymphonyElixir.Orchestrator
