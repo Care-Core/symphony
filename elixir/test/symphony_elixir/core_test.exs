@@ -1741,8 +1741,13 @@ defmodule SymphonyElixir.CoreTest do
         "symphony-elixir-app-server-policy-overrides-#{System.unique_integer([:positive])}"
       )
 
+    linked_test_root = test_root <> "-linked"
+
     try do
-      workspace_root = Path.join(test_root, "workspaces")
+      File.mkdir_p!(test_root)
+      File.ln_s!(test_root, linked_test_root)
+
+      workspace_root = Path.join(linked_test_root, "workspaces")
       workspace = Path.join(workspace_root, "MT-99")
       codex_binary = Path.join(test_root, "fake-codex")
       trace_file = Path.join(test_root, "codex-policy-overrides.trace")
@@ -1834,9 +1839,16 @@ defmodule SymphonyElixir.CoreTest do
                end
              end)
 
+      assert {:ok, canonical_workspace} = SymphonyElixir.PathSafety.canonicalize(workspace)
+
       expected_turn_policy = %{
         "type" => "workspaceWrite",
-        "writableRoots" => [Path.expand(workspace), workspace_cache]
+        "writableRoots" =>
+          Enum.uniq([
+            Path.expand(workspace),
+            workspace_cache,
+            canonical_workspace
+          ])
       }
 
       assert Enum.any?(lines, fn line ->
@@ -1854,6 +1866,7 @@ defmodule SymphonyElixir.CoreTest do
                end
              end)
     after
+      File.rm(linked_test_root)
       File.rm_rf(test_root)
     end
   end

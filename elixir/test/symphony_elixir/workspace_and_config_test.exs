@@ -839,20 +839,25 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), codex_command: "codex app-server --model gpt-5.3-codex")
     assert Config.settings!().codex.command == "codex app-server --model gpt-5.3-codex"
 
-    explicit_root =
+    explicit_test_root =
       Path.join(
         System.tmp_dir!(),
         "symphony-elixir-explicit-sandbox-root-#{System.unique_integer([:positive])}"
       )
 
-    explicit_workspace = Path.join(explicit_root, "MT-EXPLICIT")
+    explicit_root = Path.join(explicit_test_root, "actual")
+    linked_explicit_root = Path.join(explicit_test_root, "linked")
+    File.mkdir_p!(explicit_root)
+    File.ln_s!(explicit_root, linked_explicit_root)
+
+    explicit_workspace = Path.join(linked_explicit_root, "MT-EXPLICIT")
     explicit_cache = Path.join(explicit_workspace, "cache")
     File.mkdir_p!(explicit_cache)
 
-    on_exit(fn -> File.rm_rf(explicit_root) end)
+    on_exit(fn -> File.rm_rf(explicit_test_root) end)
 
     write_workflow_file!(Workflow.workflow_file_path(),
-      workspace_root: explicit_root,
+      workspace_root: linked_explicit_root,
       codex_approval_policy: "on-request",
       codex_thread_sandbox: "workspace-write",
       codex_turn_sandbox_policy: %{
@@ -864,10 +869,11 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     config = Config.settings!()
     assert config.codex.approval_policy == "on-request"
     assert config.codex.thread_sandbox == "workspace-write"
+    assert {:ok, canonical_explicit_workspace} = SymphonyElixir.PathSafety.canonicalize(explicit_workspace)
 
     assert Config.codex_turn_sandbox_policy(explicit_workspace) == %{
              "type" => "workspaceWrite",
-             "writableRoots" => [explicit_workspace, explicit_cache]
+             "writableRoots" => Enum.uniq([explicit_workspace, explicit_cache, canonical_explicit_workspace])
            }
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_active_states: ",")
@@ -1321,6 +1327,16 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
 
       settings = Config.settings!()
+
+      assert {:ok, struct_default_policy} = Schema.resolve_runtime_turn_sandbox_policy(%Schema{})
+
+      assert {:ok, canonical_system_default} =
+               SymphonyElixir.PathSafety.canonicalize(Path.join(System.tmp_dir!(), "symphony_workspaces"))
+
+      assert struct_default_policy["writableRoots"] == [canonical_system_default]
+
+      assert {:ok, ^struct_default_policy} =
+               Schema.resolve_runtime_turn_sandbox_policy(%Schema{}, "")
 
       assert {:ok, canonical_workspace_root} =
                SymphonyElixir.PathSafety.canonicalize(workspace_root)

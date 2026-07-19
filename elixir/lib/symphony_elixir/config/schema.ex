@@ -91,7 +91,7 @@ defmodule SymphonyElixir.Config.Schema do
 
     @primary_key false
     embedded_schema do
-      field(:root, :string, default: Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      field(:root, :string)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -376,7 +376,7 @@ defmodule SymphonyElixir.Config.Schema do
 
     workspace = %{
       settings.workspace
-      | root: resolve_path_value(settings.workspace.root, Path.join(System.tmp_dir!(), "symphony_workspaces"))
+      | root: resolve_path_value(settings.workspace.root, default_workspace_root())
     }
 
     codex = %{
@@ -440,6 +440,8 @@ defmodule SymphonyElixir.Config.Schema do
       resolved -> resolved
     end
   end
+
+  defp resolve_path_value(nil, default), do: default
 
   defp resolve_path_value(value, default) when is_binary(value) do
     case normalize_path_token(value) do
@@ -527,9 +529,13 @@ defmodule SymphonyElixir.Config.Schema do
   defp default_workspace_root(workspace, _fallback) when is_binary(workspace) and workspace != "",
     do: workspace
 
+  defp default_workspace_root(nil, nil), do: default_workspace_root()
+  defp default_workspace_root("", nil), do: default_workspace_root()
   defp default_workspace_root(nil, fallback), do: fallback
   defp default_workspace_root("", fallback), do: fallback
   defp default_workspace_root(workspace, _fallback), do: workspace
+
+  defp default_workspace_root, do: Path.join(System.tmp_dir!(), "symphony_workspaces")
 
   defp expand_local_workspace_root(workspace_root)
        when is_binary(workspace_root) and workspace_root != "" do
