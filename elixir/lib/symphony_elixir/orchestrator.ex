@@ -51,6 +51,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @impl true
   def init(opts) do
+    Process.flag(:trap_exit, true)
     capability_preflight = Keyword.get(opts, :runner_capability_preflight, &RunnerCapabilities.preflight/0)
 
     case capability_preflight.() do
@@ -182,6 +183,7 @@ defmodule SymphonyElixir.Orchestrator do
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+          |> maybe_put_runtime_value(:codex_app_server_pid, runtime_info[:codex_app_server_pid])
           |> maybe_refresh_progress_for_runtime_info(runtime_info)
 
         notify_dashboard()
@@ -232,10 +234,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @impl true
   def terminate(_reason, %State{running: running}) do
-    Enum.each(running, fn {_issue_id, running_entry} ->
-      terminate_codex_process_tree(running_entry)
-    end)
-
+    terminate_codex_process_trees(Map.values(running))
     :ok
   end
 
@@ -547,23 +546,34 @@ defmodule SymphonyElixir.Orchestrator do
   defp terminate_codex_process_tree(%{worker_host: worker_host}) when is_binary(worker_host), do: :ok
 
   defp terminate_codex_process_tree(running_entry) do
-    cleanup_timeout_ms = process_cleanup_timeout_ms()
+    terminate_codex_process_trees([running_entry])
+  end
 
+  defp terminate_codex_process_trees(running_entries) do
+    os_pids = Enum.flat_map(running_entries, &local_codex_os_pid/1)
+
+    if os_pids != [] do
+      ProcessTree.terminate_os_process_trees(os_pids, process_cleanup_timeout_ms())
+    end
+
+    :ok
+  end
+
+  defp local_codex_os_pid(%{worker_host: worker_host}) when is_binary(worker_host), do: []
+
+  defp local_codex_os_pid(running_entry) do
     case Map.get(running_entry, :codex_app_server_pid) do
       os_pid when is_integer(os_pid) and os_pid > 0 ->
-        ProcessTree.terminate_os_process_tree(os_pid, cleanup_timeout_ms)
+        [os_pid]
 
       os_pid when is_binary(os_pid) ->
         case Integer.parse(os_pid) do
-          {parsed_pid, ""} when parsed_pid > 0 ->
-            ProcessTree.terminate_os_process_tree(parsed_pid, cleanup_timeout_ms)
-
-          _ ->
-            :ok
+          {parsed_pid, ""} when parsed_pid > 0 -> [parsed_pid]
+          _ -> []
         end
 
       _ ->
-        :ok
+        []
     end
   end
 

@@ -926,6 +926,10 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert :ok = Config.validate!()
     assert Config.settings!().runner.required_skills == ["code-simplifier", "security-best-practices"]
 
+    write_workflow_file!(Workflow.workflow_file_path(), runner_process_cleanup_timeout_ms: 4_001)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "runner.process_cleanup_timeout_ms"
+
     write_workflow_file!(Workflow.workflow_file_path(),
       runner_capability_preflight: true,
       runner_source_repo: Path.join(runner_root, "source"),

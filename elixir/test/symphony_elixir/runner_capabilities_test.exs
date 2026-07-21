@@ -94,12 +94,97 @@ defmodule SymphonyElixir.RunnerCapabilitiesTest do
     assert File.read!(Path.join(harness.primary_home, "auth.json")) == "test-auth\n"
   end
 
+  test "reviewer and primary Codex homes may not contain each other" do
+    harness = capability_harness()
+    nested_primary = Path.join(harness.reviewer_home, "primary")
+    File.mkdir_p!(nested_primary)
+    File.chmod!(harness.reviewer_home, 0o700)
+    File.chmod!(nested_primary, 0o700)
+    write_private_file(Path.join(nested_primary, "auth.json"), "nested-auth\n")
+
+    runner = %{
+      harness.settings.runner
+      | reviewer_codex_home: harness.reviewer_home,
+        primary_codex_home: nested_primary,
+        required_skills: []
+    }
+
+    assert {:error, {:reviewer_codex_home_not_isolated, reviewer_home}} =
+             RunnerCapabilities.prepare_context(%{harness.settings | runner: runner}, wrapper_path: harness.wrapper)
+
+    assert reviewer_home == harness.reviewer_home
+
+    nested_reviewer = Path.join(harness.primary_home, "reviewer")
+    runner = %{harness.settings.runner | reviewer_codex_home: nested_reviewer}
+
+    assert {:error, {:reviewer_codex_home_not_isolated, ^nested_reviewer}} =
+             RunnerCapabilities.prepare_context(%{harness.settings | runner: runner}, wrapper_path: harness.wrapper)
+  end
+
   test "preflight requires the app-server command to preserve its minimal wrapper environment" do
     harness = capability_harness()
     settings = %{harness.settings | codex: %{harness.settings.codex | command: "codex app-server"}}
 
     assert {:error, :codex_command_must_disable_shell_environment_inheritance} =
              RunnerCapabilities.prepare_context(settings, wrapper_path: harness.wrapper)
+  end
+
+  test "preflight validates the effective shell policy and rejects shell comments" do
+    harness = capability_harness()
+
+    conflicting_command =
+      String.replace(
+        hardened_codex_command(),
+        "app-server",
+        "--config shell_environment_policy.inherit=all app-server"
+      )
+
+    conflicting_settings = %{
+      harness.settings
+      | codex: %{harness.settings.codex | command: conflicting_command}
+    }
+
+    assert {:error, :codex_command_must_disable_shell_environment_inheritance} =
+             RunnerCapabilities.prepare_context(conflicting_settings, wrapper_path: harness.wrapper)
+
+    commented_settings = %{
+      harness.settings
+      | codex: %{harness.settings.codex | command: hardened_codex_command() <> " # app-server"}
+    }
+
+    assert {:error, :codex_command_contains_unsafe_shell_syntax} =
+             RunnerCapabilities.prepare_context(commented_settings, wrapper_path: harness.wrapper)
+  end
+
+  test "preflight requires shell variables to flow into their matching policy entries" do
+    harness = capability_harness()
+
+    command =
+      String.replace(
+        hardened_codex_command(),
+        ~S|shell_environment_policy.set.SYMPHONY_REAL_CODEX_BIN=\"${SYMPHONY_REAL_CODEX_BIN}\"|,
+        ~S|shell_environment_policy.set.SYMPHONY_REAL_CODEX_BIN=\"hardcoded\"|
+      )
+
+    settings = %{harness.settings | codex: %{harness.settings.codex | command: command}}
+
+    assert {:error, {:codex_command_invalid_shell_environment, "SYMPHONY_REAL_CODEX_BIN"}} =
+             RunnerCapabilities.prepare_context(settings, wrapper_path: harness.wrapper)
+
+    single_quoted_command =
+      String.replace(
+        hardened_codex_command(),
+        ~S|--config "shell_environment_policy.set.SYMPHONY_REAL_CODEX_BIN=\"${SYMPHONY_REAL_CODEX_BIN}\""|,
+        ~S|--config 'shell_environment_policy.set.SYMPHONY_REAL_CODEX_BIN="${SYMPHONY_REAL_CODEX_BIN}"'|
+      )
+
+    single_quoted_settings = %{
+      harness.settings
+      | codex: %{harness.settings.codex | command: single_quoted_command}
+    }
+
+    assert {:error, {:codex_command_invalid_shell_environment, "SYMPHONY_REAL_CODEX_BIN"}} =
+             RunnerCapabilities.prepare_context(single_quoted_settings, wrapper_path: harness.wrapper)
   end
 
   test "primary auth must be a private regular file" do

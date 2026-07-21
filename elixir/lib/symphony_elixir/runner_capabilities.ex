@@ -17,6 +17,7 @@ defmodule SymphonyElixir.RunnerCapabilities do
     "SYMPHONY_REVIEW_CODEX_HOME",
     "SYMPHONY_BROWSER_BACKEND_URL"
   ]
+  @unsafe_shell_syntax ~r/(?:^|\s)#|[\r\n;&|<>`]|\$\(/
 
   @type context :: %{
           browser_backend_url: String.t(),
@@ -164,33 +165,140 @@ defmodule SymphonyElixir.RunnerCapabilities do
   end
 
   defp validate_codex_shell_environment(command) when is_binary(command) do
-    missing_variables =
-      Enum.reject(@required_shell_environment_variables, fn variable ->
-        String.contains?(command, "shell_environment_policy.set.#{variable}")
-      end)
-
-    cond do
-      not String.contains?(command, "shell_environment_policy.inherit=none") ->
-        {:error, :codex_command_must_disable_shell_environment_inheritance}
-
-      not wrapper_command?(command) ->
-        {:error, :codex_command_must_use_symphony_wrapper}
-
-      missing_variables != [] ->
-        {:error, {:codex_command_missing_shell_environment, missing_variables}}
-
-      true ->
-        :ok
+    with {:ok, wrapper, args, probe_values} <- expand_codex_command(command),
+         {:ok, global_args} <- require_app_server_subcommand(args),
+         {:ok, effective_config} <- effective_codex_config(global_args),
+         :ok <- require_disabled_environment_inheritance(effective_config),
+         :ok <- require_wrapper_command(wrapper, probe_values) do
+      validate_required_shell_environment(effective_config, probe_values)
     end
   end
 
   defp validate_codex_shell_environment(_command), do: {:error, :codex_command_missing}
 
-  defp wrapper_command?(command) do
-    Regex.match?(
-      ~r/^\s*(?:exec\s+)?["']?\$(?:\{SYMPHONY_CODEX_BIN(?::-[^}]*)?\}|SYMPHONY_CODEX_BIN)(?:["']|\s)/,
-      command
-    )
+  defp expand_codex_command(command) do
+    probe_values = shell_environment_probe_values()
+
+    with :ok <- validate_shell_syntax(command),
+         {output, 0} <-
+           System.cmd(shell_executable(), ["-c", "set -- #{command}\nprintf '%s\\0' \"$@\""],
+             env: Map.to_list(probe_values),
+             stderr_to_stdout: true
+           ) do
+      case String.split(output, <<0>>, trim: true) do
+        ["exec", wrapper | args] -> {:ok, wrapper, args, probe_values}
+        [wrapper | args] -> {:ok, wrapper, args, probe_values}
+        _ -> {:error, :codex_command_missing}
+      end
+    else
+      {_output, status} when is_integer(status) -> {:error, :codex_command_invalid_shell_syntax}
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    _ -> {:error, :codex_command_invalid_shell_syntax}
+  end
+
+  defp validate_shell_syntax(command) do
+    unsupported_expansion =
+      @required_shell_environment_variables
+      |> Enum.flat_map(fn variable -> ["${#{variable}:-codex}", "${#{variable}}", "$#{variable}"] end)
+      |> Enum.reduce(command, &String.replace(&2, &1, ""))
+      |> String.contains?("$")
+
+    cond do
+      Regex.match?(@unsafe_shell_syntax, command) -> {:error, :codex_command_contains_unsafe_shell_syntax}
+      unsupported_expansion -> {:error, :codex_command_contains_unsupported_shell_expansion}
+      true -> :ok
+    end
+  end
+
+  defp shell_environment_probe_values do
+    suffix = System.unique_integer([:positive])
+    Map.new(@required_shell_environment_variables, &{&1, "__symphony_preflight_#{suffix}_#{&1}__"})
+  end
+
+  defp require_wrapper_command(wrapper, probe_values) do
+    if wrapper == Map.fetch!(probe_values, "SYMPHONY_CODEX_BIN") do
+      :ok
+    else
+      {:error, :codex_command_must_use_symphony_wrapper}
+    end
+  end
+
+  defp require_app_server_subcommand(args) do
+    if List.last(args) == "app-server" do
+      {:ok, Enum.drop(args, -1)}
+    else
+      {:error, :codex_command_must_run_app_server}
+    end
+  end
+
+  defp effective_codex_config(args), do: collect_codex_config(args, %{})
+
+  defp collect_codex_config([], config), do: {:ok, config}
+
+  defp collect_codex_config([flag, assignment | rest], config) when flag in ["--config", "-c"] do
+    with {:ok, key, value} <- split_config_assignment(assignment) do
+      collect_codex_config(rest, Map.put(config, key, value))
+    end
+  end
+
+  defp collect_codex_config(["--config=" <> assignment | rest], config) do
+    with {:ok, key, value} <- split_config_assignment(assignment) do
+      collect_codex_config(rest, Map.put(config, key, value))
+    end
+  end
+
+  defp collect_codex_config(["-c" <> assignment | rest], config) when assignment != "" do
+    with {:ok, key, value} <- split_config_assignment(assignment) do
+      collect_codex_config(rest, Map.put(config, key, value))
+    end
+  end
+
+  defp collect_codex_config([flag], _config) when flag in ["--config", "-c"] do
+    {:error, {:codex_command_config_value_missing, flag}}
+  end
+
+  defp collect_codex_config([arg | _rest], _config), do: {:error, {:codex_command_unsupported_argument, arg}}
+
+  defp split_config_assignment(assignment) do
+    case String.split(assignment, "=", parts: 2) do
+      [key, value] when key != "" -> {:ok, key, value}
+      _ -> {:error, {:codex_command_invalid_config_assignment, assignment}}
+    end
+  end
+
+  defp require_disabled_environment_inheritance(config) do
+    if Map.get(config, "shell_environment_policy.inherit") == "none" do
+      :ok
+    else
+      {:error, :codex_command_must_disable_shell_environment_inheritance}
+    end
+  end
+
+  defp validate_required_shell_environment(config, probe_values) do
+    missing_variables =
+      Enum.reject(@required_shell_environment_variables, fn variable ->
+        Map.has_key?(config, "shell_environment_policy.set.#{variable}")
+      end)
+
+    case missing_variables do
+      [] -> validate_shell_environment_values(config, probe_values)
+      variables -> {:error, {:codex_command_missing_shell_environment, variables}}
+    end
+  end
+
+  defp validate_shell_environment_values(config, probe_values) do
+    invalid_variable =
+      Enum.find(@required_shell_environment_variables, fn variable ->
+        Map.fetch!(config, "shell_environment_policy.set.#{variable}") !=
+          ~s|"#{Map.fetch!(probe_values, variable)}"|
+      end)
+
+    case invalid_variable do
+      nil -> :ok
+      variable -> {:error, {:codex_command_invalid_shell_environment, variable}}
+    end
   end
 
   defp canonical_private_source_repo(path) do
@@ -233,11 +341,21 @@ defmodule SymphonyElixir.RunnerCapabilities do
   end
 
   defp require_isolated_reviewer_home(primary_codex_home, reviewer_codex_home) do
-    if same_path?(primary_codex_home, reviewer_codex_home) do
+    if overlapping_paths?(primary_codex_home, reviewer_codex_home) do
       {:error, {:reviewer_codex_home_not_isolated, reviewer_codex_home}}
     else
       :ok
     end
+  end
+
+  defp overlapping_paths?(left, right) do
+    left_parts = Path.split(left)
+    right_parts = Path.split(right)
+
+    {shorter, longer} =
+      if length(left_parts) <= length(right_parts), do: {left_parts, right_parts}, else: {right_parts, left_parts}
+
+    Enum.take(longer, length(shorter)) == shorter
   end
 
   defp require_private_directory(path, current_uid) do

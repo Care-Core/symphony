@@ -208,8 +208,8 @@ Runner contract:
   `GET /tabs/:id/screenshot`, and always deletes the tab and canary session.
 - Local app-server commands run in their own process group. Normal shutdown, startup failure, turn
   timeout, and orchestrator stall restart terminate the recorded process tree with a bounded
-  TERM-to-KILL cleanup window controlled by `process_cleanup_timeout_ms`. The process group uses
-  Perl on macOS or `setsid` on Linux.
+  shared TERM-to-KILL cleanup window controlled by `process_cleanup_timeout_ms` (maximum 4000ms).
+  The process group uses Perl on macOS or `setsid` on Linux.
 
 Set `SYMPHONY_REAL_CODEX_BIN` directly for new installations. The legacy normalization exists so an
 older `SYMPHONY_CODEX_BIN=/custom/path/codex` configuration cannot bypass the wrapper.

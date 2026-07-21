@@ -597,7 +597,9 @@ This section is intentionally redundant so a coding agent can implement the conf
   browser backend
 - `runner.review_timeout_ms` (extension): positive integer, default `20000`
 - `runner.browser_timeout_ms` (extension): positive integer, default `15000`
-- `runner.process_cleanup_timeout_ms` (extension): positive integer, default `2000`
+- `runner.process_cleanup_timeout_ms` (extension): integer from `1` through `4000`, default `2000`;
+  all local app-server process groups share this one cleanup window so shutdown remains within the
+  worker's OTP shutdown budget
 - `server.port` (extension): integer, optional; enables the optional HTTP server, `0` may be used
   for ephemeral local bind, and CLI `--port` overrides it
 

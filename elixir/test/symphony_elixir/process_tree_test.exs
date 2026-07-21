@@ -23,6 +23,24 @@ defmodule SymphonyElixir.ProcessTreeTest do
     refute os_process_alive?(child_pid)
   end
 
+  test "multiple process groups share one bounded cleanup window" do
+    ports =
+      for _index <- 1..2 do
+        {:ok, port} =
+          ProcessTree.open_port(System.find_executable("bash"), ["-c", "trap '' TERM; sleep 60 & wait"])
+
+        port
+      end
+
+    on_exit(fn -> Enum.each(ports, &ProcessTree.terminate_port(&1, 500)) end)
+    os_pids = Enum.map(ports, fn port -> elem(:erlang.port_info(port, :os_pid), 1) end)
+    started_at = System.monotonic_time(:millisecond)
+
+    assert :ok = ProcessTree.terminate_os_process_trees(os_pids, 500)
+    assert System.monotonic_time(:millisecond) - started_at < 750
+    Enum.each(os_pids, fn os_pid -> refute os_process_alive?(os_pid) end)
+  end
+
   test "process group launcher validation fails when neither supported launcher exists" do
     assert {:error, {:process_group_launcher_not_found, ["missing-perl", "missing-setsid"]}} =
              ProcessTree.validate_launcher(perl: "missing-perl", setsid: "missing-setsid")
@@ -49,8 +67,16 @@ defmodule SymphonyElixir.ProcessTreeTest do
   test "orchestrator shutdown reaps recorded native process groups" do
     orchestrator_name = Module.concat(__MODULE__, :ShutdownCleanupOrchestrator)
 
-    assert {:ok, orchestrator} =
-             Orchestrator.start_link(name: orchestrator_name, runner_capability_preflight: fn -> :ok end)
+    assert {:ok, supervisor} =
+             Supervisor.start_link(
+               [
+                 {Orchestrator, name: orchestrator_name, runner_capability_preflight: fn -> :ok end}
+               ],
+               strategy: :one_for_one
+             )
+
+    orchestrator = Process.whereis(orchestrator_name)
+    assert is_pid(orchestrator)
 
     {:ok, codex_port} =
       ProcessTree.open_port(System.find_executable("bash"), ["-c", "trap '' TERM; sleep 60 & wait"])
@@ -68,7 +94,7 @@ defmodule SymphonyElixir.ProcessTreeTest do
       %{state | running: %{"issue-1" => running_entry}}
     end)
 
-    assert :ok = GenServer.stop(orchestrator, :normal, 2_000)
+    assert :ok = Supervisor.stop(supervisor)
     refute os_process_alive?(codex_os_pid)
   end
 

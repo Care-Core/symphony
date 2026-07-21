@@ -68,21 +68,28 @@ defmodule SymphonyElixir.ProcessTree do
   @spec terminate_os_process_tree(pos_integer(), pos_integer()) :: :ok
   def terminate_os_process_tree(os_pid, timeout_ms)
       when is_integer(os_pid) and os_pid > 0 and is_integer(timeout_ms) and timeout_ms > 0 do
-    tracked_pids = Enum.uniq([os_pid | descendant_pids(os_pid)])
+    terminate_os_process_trees([os_pid], timeout_ms)
+  end
+
+  @spec terminate_os_process_trees([pos_integer()], pos_integer()) :: :ok
+  def terminate_os_process_trees(os_pids, timeout_ms)
+      when is_list(os_pids) and is_integer(timeout_ms) and timeout_ms > 0 do
+    root_pids = os_pids |> Enum.filter(&(is_integer(&1) and &1 > 0)) |> Enum.uniq()
+    tracked_pids = root_pids |> Enum.flat_map(&[&1 | descendant_pids(&1)]) |> Enum.uniq()
     started_at_ms = System.monotonic_time(:millisecond)
     terminate_deadline_ms = started_at_ms + max(1, div(timeout_ms, 2))
     kill_deadline_ms = started_at_ms + timeout_ms
 
-    signal_process_group(os_pid, "TERM")
+    signal_process_groups(root_pids, "TERM")
     signal_pids(Enum.reverse(tracked_pids), "TERM")
-    wait_for_exit(tracked_pids, os_pid, terminate_deadline_ms)
+    wait_for_exit(tracked_pids, root_pids, terminate_deadline_ms)
 
     remaining_pids = Enum.filter(tracked_pids, &process_alive?/1)
 
-    if remaining_pids != [] or process_group_alive?(os_pid) do
-      signal_process_group(os_pid, "KILL")
+    if remaining_pids != [] or Enum.any?(root_pids, &process_group_alive?/1) do
+      signal_process_groups(root_pids, "KILL")
       signal_pids(Enum.reverse(remaining_pids), "KILL")
-      wait_for_exit(remaining_pids, os_pid, kill_deadline_ms)
+      wait_for_exit(remaining_pids, root_pids, kill_deadline_ms)
     end
 
     :ok
@@ -200,9 +207,10 @@ defmodule SymphonyElixir.ProcessTree do
     end)
   end
 
-  defp wait_for_exit(tracked_pids, process_group_id, deadline_ms) do
+  defp wait_for_exit(tracked_pids, process_group_ids, deadline_ms) do
     cond do
-      Enum.all?(tracked_pids, &(not process_alive?(&1))) and not process_group_alive?(process_group_id) ->
+      Enum.all?(tracked_pids, &(not process_alive?(&1))) and
+          Enum.all?(process_group_ids, &(not process_group_alive?(&1))) ->
         :ok
 
       System.monotonic_time(:millisecond) >= deadline_ms ->
@@ -210,8 +218,12 @@ defmodule SymphonyElixir.ProcessTree do
 
       true ->
         Process.sleep(@poll_interval_ms)
-        wait_for_exit(tracked_pids, process_group_id, deadline_ms)
+        wait_for_exit(tracked_pids, process_group_ids, deadline_ms)
     end
+  end
+
+  defp signal_process_groups(process_group_ids, signal) do
+    Enum.each(process_group_ids, &signal_process_group(&1, signal))
   end
 
   defp signal_process_group(process_group_id, signal) do

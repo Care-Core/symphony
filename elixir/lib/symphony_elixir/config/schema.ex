@@ -243,7 +243,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_inclusion(:browser_backend, ["camofox"])
       |> validate_number(:review_timeout_ms, greater_than: 0)
       |> validate_number(:browser_timeout_ms, greater_than: 0)
-      |> validate_number(:process_cleanup_timeout_ms, greater_than: 0)
+      |> validate_number(:process_cleanup_timeout_ms, greater_than: 0, less_than_or_equal_to: 4_000)
     end
   end
 
