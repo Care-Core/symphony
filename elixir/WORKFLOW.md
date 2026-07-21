@@ -30,6 +30,11 @@ agent:
   max_turns: 20
 codex:
   command: codex --config shell_environment_policy.inherit=all --config model_reasoning_effort=xhigh --model gpt-5.3-codex app-server
+  # Optional efficiency guardrails (disabled when input_token_limit and label limits are absent):
+  # input_token_limit: 200000
+  # input_token_limits_by_label:
+  #   expensive: 120000
+  # input_token_warning_ratio: 0.70
   approval_policy: never
   thread_sandbox: workspace-write
   turn_sandbox_policy:

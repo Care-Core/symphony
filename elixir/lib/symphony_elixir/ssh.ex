@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.SSH do
   @moduledoc false
 
+  alias SymphonyElixir.ProcessTree
+
   @spec run(String.t(), String.t(), keyword()) :: {:ok, {String.t(), non_neg_integer()}} | {:error, term()}
   def run(host, command, opts \\ []) when is_binary(host) and is_binary(command) do
     with {:ok, executable} <- ssh_executable() do
@@ -23,6 +25,157 @@ defmodule SymphonyElixir.SSH do
         |> maybe_put_line_option(line_bytes)
 
       {:ok, Port.open({:spawn_executable, String.to_charlist(executable)}, port_opts)}
+    end
+  end
+
+  @spec terminate_remote_process_tree(String.t(), Path.t(), pos_integer()) ::
+          :ok | {:error, term()}
+  def terminate_remote_process_tree(host, workspace, timeout_ms)
+      when is_binary(host) and is_binary(workspace) and is_integer(timeout_ms) and timeout_ms > 0 do
+    pid_file = Path.join(workspace, ".symphony-codex-app-server.pid")
+    kill_delay_seconds = max(1, div(timeout_ms, 3)) / 1_000
+    kill_check_attempts = max(1, div(timeout_ms, 75))
+
+    command = """
+    pid_file=#{shell_escape(pid_file)}
+    if [ ! -r \"$pid_file\" ]; then
+      printf 'remote PID proof file is missing or unreadable\n' >&2
+      exit 73
+    fi
+    if ! pid=$(< \"$pid_file\"); then
+      printf 'remote PID proof file is unreadable\n' >&2
+      exit 74
+    fi
+    case \"$pid\" in
+      '')
+        printf 'remote PID proof file is empty\n' >&2
+        exit 75
+        ;;
+      *[!0-9]*)
+        printf 'remote PID proof file is nonnumeric\n' >&2
+        exit 76
+        ;;
+    esac
+
+    if ! perl -e '
+      my $pid = shift;
+      my $max_pid = \"2147483647\";
+      exit 1 unless $pid =~ /\\A(?:[2-9]|[1-9][0-9]+)\\z/;
+      exit 1 if length($pid) > length($max_pid);
+      exit 1 if length($pid) == length($max_pid) && $pid gt $max_pid;
+    ' -- \"$pid\"; then
+      printf 'remote PID proof file is outside the safe process-group range\n' >&2
+      exit 77
+    fi
+
+    probe_process_group() {
+      perl -MPOSIX -MErrno=ESRCH -e '
+        my $pid = shift;
+        exit 0 if POSIX::kill(-$pid, 0);
+        exit 1 if $! == ESRCH;
+        my $errno = 0 + $!;
+        print STDERR \"remote process-group liveness probe failed: errno=$errno ($!)\\n\";
+        exit 2;
+      ' -- \"$pid\"
+    }
+
+    probe_process_group
+    probe_status=$?
+    case \"$probe_status\" in
+      0)
+        kill -TERM -- \"-$pid\" 2>/dev/null || {
+          probe_process_group
+          probe_status=$?
+          case \"$probe_status\" in
+            0) exit 70 ;;
+            1) ;;
+            *) exit 78 ;;
+          esac
+        }
+        ;;
+      1)
+        ;;
+      *)
+        exit 78
+        ;;
+    esac
+    if [ \"$probe_status\" -eq 0 ]; then
+      sleep #{kill_delay_seconds}
+    fi
+
+    probe_process_group
+    probe_status=$?
+    case \"$probe_status\" in
+      0)
+        kill -KILL -- \"-$pid\" 2>/dev/null || {
+          probe_process_group
+          probe_status=$?
+          case \"$probe_status\" in
+            0) exit 71 ;;
+            1) ;;
+            *) exit 78 ;;
+          esac
+        }
+        ;;
+      1)
+        ;;
+      *)
+        exit 78
+        ;;
+    esac
+
+    kill_check=0
+    while [ \"$kill_check\" -lt #{kill_check_attempts} ]; do
+      probe_process_group
+      probe_status=$?
+      case \"$probe_status\" in
+        0)
+          sleep 0.025
+          kill_check=$((kill_check + 1))
+          ;;
+        1)
+          break
+          ;;
+        *)
+          exit 78
+          ;;
+      esac
+    done
+
+    probe_process_group
+    probe_status=$?
+    case \"$probe_status\" in
+      0)
+        exit 72
+        ;;
+      1)
+        rm -f \"$pid_file\"
+        ;;
+      *)
+        exit 78
+        ;;
+    esac
+    """
+
+    with {:ok, executable} <- ssh_executable(),
+         {:ok, result} <-
+           ProcessTree.run(executable, ssh_args(host, command),
+             timeout_ms: timeout_ms,
+             max_output_bytes: 64_000
+           ) do
+      case result do
+        %{status: 0} ->
+          :ok
+
+        %{status: status, output: output} ->
+          {:error, {:remote_process_cleanup_failed, host, status, output}}
+      end
+    else
+      {:error, {:timeout, ^timeout_ms, output}} ->
+        {:error, {:remote_process_cleanup_timeout, host, timeout_ms, output}}
+
+      {:error, reason} ->
+        {:error, {:remote_process_cleanup_start_failed, host, reason}}
     end
   end
 

@@ -115,6 +115,9 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          codex_input_token_limit: nil,
+          codex_input_token_limits_by_label: %{},
+          codex_input_token_warning_ratio: 0.70,
           runner_capability_preflight: false,
           runner_source_repo: nil,
           runner_reviewer_codex_home: nil,
@@ -164,6 +167,9 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    codex_input_token_limit = Keyword.get(config, :codex_input_token_limit)
+    codex_input_token_limits_by_label = Keyword.get(config, :codex_input_token_limits_by_label)
+    codex_input_token_warning_ratio = Keyword.get(config, :codex_input_token_warning_ratio)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -206,6 +212,9 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
+        "  input_token_limit: #{yaml_value(codex_input_token_limit)}",
+        "  input_token_limits_by_label: #{yaml_value(codex_input_token_limits_by_label)}",
+        "  input_token_warning_ratio: #{yaml_value(codex_input_token_warning_ratio)}",
         runner_yaml(config),
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
@@ -223,6 +232,7 @@ defmodule SymphonyElixir.TestSupport do
   end
 
   defp yaml_value(value) when is_integer(value), do: to_string(value)
+  defp yaml_value(value) when is_float(value), do: Float.to_string(value)
   defp yaml_value(true), do: "true"
   defp yaml_value(false), do: "false"
   defp yaml_value(nil), do: "null"

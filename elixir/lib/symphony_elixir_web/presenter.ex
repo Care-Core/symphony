@@ -15,10 +15,12 @@ defmodule SymphonyElixirWeb.Presenter do
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
-            retrying: length(snapshot.retrying)
+            retrying: length(snapshot.retrying),
+            held: length(Map.get(snapshot, :held, []))
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
+          held: Enum.map(Map.get(snapshot, :held, []), &held_entry_payload/1),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }
@@ -37,11 +39,12 @@ defmodule SymphonyElixirWeb.Presenter do
       %{} = snapshot ->
         running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
         retry = Enum.find(snapshot.retrying, &(&1.identifier == issue_identifier))
+        hold = Enum.find(Map.get(snapshot, :held, []), &(&1.identifier == issue_identifier))
 
-        if is_nil(running) and is_nil(retry) do
+        if is_nil(running) and is_nil(retry) and is_nil(hold) do
           {:error, :issue_not_found}
         else
-          {:ok, issue_payload_body(issue_identifier, running, retry)}
+          {:ok, issue_payload_body(issue_identifier, running, retry, hold)}
         end
 
       _ ->
@@ -60,14 +63,34 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp issue_payload_body(issue_identifier, running, retry) do
+  @spec stop_payload(String.t(), GenServer.name()) ::
+          {:ok, map()}
+          | {:error, :issue_not_found | :unavailable | :cleanup_failed | :hold_state_unavailable}
+  def stop_payload(issue_identifier, orchestrator) do
+    case Orchestrator.stop_issue(issue_identifier, orchestrator) do
+      {:ok, hold} -> {:ok, control_payload(hold, false)}
+      error -> error
+    end
+  end
+
+  @spec resume_payload(String.t(), GenServer.name()) ::
+          {:ok, map()}
+          | {:error, :issue_not_found | :unavailable | :cleanup_failed | :hold_state_unavailable}
+  def resume_payload(issue_identifier, orchestrator) do
+    case Orchestrator.resume_issue(issue_identifier, orchestrator) do
+      {:ok, result} -> {:ok, control_payload(result, true)}
+      error -> error
+    end
+  end
+
+  defp issue_payload_body(issue_identifier, running, retry, hold) do
     %{
       issue_identifier: issue_identifier,
-      issue_id: issue_id_from_entries(running, retry),
-      status: issue_status(running, retry),
+      issue_id: issue_id_from_entries(running, retry, hold),
+      status: issue_status(running, retry, hold),
       workspace: %{
-        path: workspace_path(issue_identifier, running, retry),
-        host: workspace_host(running, retry)
+        path: workspace_path(issue_identifier, running, retry, hold),
+        host: workspace_host(running, retry, hold)
       },
       attempts: %{
         restart_count: restart_count(retry),
@@ -75,6 +98,7 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       running: running && running_issue_payload(running),
       retry: retry && retry_issue_payload(retry),
+      hold: hold && held_entry_payload(hold),
       logs: %{
         codex_session_logs: []
       },
@@ -84,16 +108,17 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  defp issue_id_from_entries(running, retry),
-    do: (running && running.issue_id) || (retry && retry.issue_id)
+  defp issue_id_from_entries(running, retry, hold),
+    do: (running && running.issue_id) || (retry && retry.issue_id) || (hold && hold.issue_id)
 
   defp restart_count(retry), do: max(retry_attempt(retry) - 1, 0)
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
 
-  defp issue_status(_running, nil), do: "running"
-  defp issue_status(nil, _retry), do: "retrying"
-  defp issue_status(_running, _retry), do: "running"
+  defp issue_status(_running, _retry, hold) when not is_nil(hold), do: "held"
+  defp issue_status(_running, nil, nil), do: "running"
+  defp issue_status(nil, _retry, nil), do: "retrying"
+  defp issue_status(_running, _retry, nil), do: "running"
 
   defp running_entry_payload(entry) do
     %{
@@ -115,7 +140,8 @@ defmodule SymphonyElixirWeb.Presenter do
         input_tokens: entry.codex_input_tokens,
         output_tokens: entry.codex_output_tokens,
         total_tokens: entry.codex_total_tokens
-      }
+      },
+      input_token_budget: input_token_budget(entry)
     }
   end
 
@@ -128,6 +154,21 @@ defmodule SymphonyElixirWeb.Presenter do
       error: entry.error,
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path)
+    }
+  end
+
+  defp held_entry_payload(entry) do
+    %{
+      issue_id: entry.issue_id,
+      issue_identifier: entry.identifier,
+      reason: entry.reason,
+      limit: entry.limit,
+      observed_tokens: entry.observed_tokens,
+      issue_state: entry.issue_state,
+      worker_host: Map.get(entry, :worker_host),
+      workspace_path: Map.get(entry, :workspace_path),
+      cleanup_pending: Map.get(entry, :cleanup_pending, false),
+      held_at: iso8601(Map.get(entry, :held_at))
     }
   end
 
@@ -149,7 +190,8 @@ defmodule SymphonyElixirWeb.Presenter do
         input_tokens: running.codex_input_tokens,
         output_tokens: running.codex_output_tokens,
         total_tokens: running.codex_total_tokens
-      }
+      },
+      input_token_budget: input_token_budget(running)
     }
   end
 
@@ -163,14 +205,35 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  defp workspace_path(issue_identifier, running, retry) do
+  defp workspace_path(issue_identifier, running, retry, hold) do
     (running && Map.get(running, :workspace_path)) ||
       (retry && Map.get(retry, :workspace_path)) ||
+      (hold && Map.get(hold, :workspace_path)) ||
       Path.join(Config.settings!().workspace.root, issue_identifier)
   end
 
-  defp workspace_host(running, retry) do
-    (running && Map.get(running, :worker_host)) || (retry && Map.get(retry, :worker_host))
+  defp workspace_host(running, retry, hold) do
+    (running && Map.get(running, :worker_host)) ||
+      (retry && Map.get(retry, :worker_host)) ||
+      (hold && Map.get(hold, :worker_host))
+  end
+
+  defp input_token_budget(entry) do
+    %{
+      limit: Map.get(entry, :input_token_limit),
+      observed_tokens: Map.get(entry, :codex_input_tokens, 0),
+      warning_ratio: Map.get(entry, :input_token_warning_ratio),
+      warning_status: Map.get(entry, :input_token_warning_status)
+    }
+  end
+
+  defp control_payload(result, resumed) do
+    %{
+      issue_id: result.issue_id,
+      issue_identifier: result.identifier,
+      status: if(resumed, do: "resumed", else: "held"),
+      hold: if(resumed, do: nil, else: held_entry_payload(result))
+    }
   end
 
   defp recent_events_payload(running) do

@@ -34,6 +34,10 @@ help with the setup:
 > Set up Symphony for my repository based on
 > https://github.com/openai/symphony/blob/main/elixir/README.md
 
+The reference implementation supports optional deterministic per-run input-token budgets, durable
+holds that preserve issue workspaces across restarts, bounded local and SSH cleanup, and localhost
+stop/resume controls for operating live runs.
+
 ---
 
 ## License
