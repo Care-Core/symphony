@@ -7,11 +7,12 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, ProcessTree, RunnerCapabilities, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @default_process_cleanup_timeout_ms 2_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -49,7 +50,17 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
+    Process.flag(:trap_exit, true)
+    capability_preflight = Keyword.get(opts, :runner_capability_preflight, &RunnerCapabilities.preflight/0)
+
+    case capability_preflight.() do
+      :ok -> initialize_state()
+      {:error, reason} -> {:stop, {:runner_capability_preflight_failed, reason}}
+    end
+  end
+
+  defp initialize_state do
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
 
@@ -65,9 +76,7 @@ defmodule SymphonyElixir.Orchestrator do
     }
 
     run_terminal_workspace_cleanup()
-    state = schedule_tick(state, 0)
-
-    {:ok, state}
+    {:ok, schedule_tick(state, 0)}
   end
 
   @impl true
@@ -174,6 +183,7 @@ defmodule SymphonyElixir.Orchestrator do
           running_entry
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
+          |> maybe_put_runtime_value(:codex_app_server_pid, runtime_info[:codex_app_server_pid])
           |> maybe_refresh_progress_for_runtime_info(runtime_info)
 
         notify_dashboard()
@@ -220,6 +230,12 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
+  end
+
+  @impl true
+  def terminate(_reason, %State{running: running}) do
+    terminate_codex_process_trees(Map.values(running))
+    :ok
   end
 
   defp maybe_dispatch(%State{} = state) do
@@ -434,6 +450,8 @@ defmodule SymphonyElixir.Orchestrator do
           cleanup_issue_workspace(identifier, worker_host)
         end
 
+        terminate_codex_process_tree(running_entry)
+
         if is_pid(pid) do
           terminate_task(pid)
         end
@@ -524,6 +542,53 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp terminate_task(_pid), do: :ok
+
+  defp terminate_codex_process_tree(%{worker_host: worker_host}) when is_binary(worker_host), do: :ok
+
+  defp terminate_codex_process_tree(running_entry) do
+    terminate_codex_process_trees([running_entry])
+  end
+
+  defp terminate_codex_process_trees(running_entries) do
+    os_pids = Enum.flat_map(running_entries, &local_codex_os_pid/1)
+
+    if os_pids != [] do
+      ProcessTree.terminate_os_process_trees(os_pids, process_cleanup_timeout_ms())
+    end
+
+    :ok
+  end
+
+  defp local_codex_os_pid(%{worker_host: worker_host}) when is_binary(worker_host), do: []
+
+  defp local_codex_os_pid(running_entry) do
+    case Map.get(running_entry, :codex_app_server_pid) do
+      os_pid when is_integer(os_pid) and os_pid > 0 ->
+        [os_pid]
+
+      os_pid when is_binary(os_pid) ->
+        case Integer.parse(os_pid) do
+          {parsed_pid, ""} when parsed_pid > 0 -> [parsed_pid]
+          _ -> []
+        end
+
+      _ ->
+        []
+    end
+  end
+
+  defp process_cleanup_timeout_ms do
+    case Config.settings() do
+      {:ok, %{runner: %{process_cleanup_timeout_ms: timeout_ms}}}
+      when is_integer(timeout_ms) and timeout_ms > 0 ->
+        timeout_ms
+
+      _ ->
+        @default_process_cleanup_timeout_ms
+    end
+  rescue
+    _ -> @default_process_cleanup_timeout_ms
+  end
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()

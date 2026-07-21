@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, ProcessTree, SSH}
 
   @initialize_id 1
   @thread_start_id 2
@@ -44,7 +44,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port_metadata(port, worker_host)
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
+      with :ok <- notify_session_started(opts, metadata),
+           {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
            {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
         {:ok,
          %{
@@ -60,11 +61,24 @@ defmodule SymphonyElixir.Codex.AppServer do
          }}
       else
         {:error, reason} ->
-          stop_port(port)
+          stop_port(port, worker_host)
           {:error, reason}
       end
     end
   end
+
+  defp notify_session_started(opts, metadata) do
+    case Keyword.get(opts, :on_start) do
+      callback when is_function(callback, 1) -> normalize_session_start_callback(callback.(metadata))
+      _ -> :ok
+    end
+  rescue
+    error -> {:error, {:session_start_callback_failed, error}}
+  end
+
+  defp normalize_session_start_callback(:ok), do: :ok
+  defp normalize_session_start_callback({:error, _reason} = error), do: error
+  defp normalize_session_start_callback(result), do: {:error, {:session_start_callback_invalid_result, result}}
 
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run_turn(
@@ -140,8 +154,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   @spec stop_session(session()) :: :ok
-  def stop_session(%{port: port}) when is_port(port) do
-    stop_port(port)
+  def stop_session(%{port: port, worker_host: worker_host}) when is_port(port) do
+    stop_port(port, worker_host)
   end
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
@@ -192,20 +206,12 @@ defmodule SymphonyElixir.Codex.AppServer do
     if is_nil(executable) do
       {:error, :bash_not_found}
     else
-      port =
-        Port.open(
-          {:spawn_executable, String.to_charlist(executable)},
-          [
-            :binary,
-            :exit_status,
-            :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(Config.settings!().codex.command)],
-            cd: String.to_charlist(workspace),
-            line: @port_line_bytes
-          ]
-        )
-
-      {:ok, port}
+      ProcessTree.open_port(
+        executable,
+        ["-lc", Config.settings!().codex.command],
+        cd: workspace,
+        line: @port_line_bytes
+      )
     end
   end
 
@@ -1081,7 +1087,15 @@ defmodule SymphonyElixir.Codex.AppServer do
     "issue_id=#{issue_id} issue_identifier=#{identifier}"
   end
 
-  defp stop_port(port) when is_port(port) do
+  defp stop_port(port, nil) when is_port(port) do
+    ProcessTree.terminate_port(port, Config.settings!().runner.process_cleanup_timeout_ms)
+  end
+
+  defp stop_port(port, worker_host) when is_port(port) and is_binary(worker_host) do
+    close_port(port)
+  end
+
+  defp close_port(port) when is_port(port) do
     case :erlang.port_info(port) do
       :undefined ->
         :ok

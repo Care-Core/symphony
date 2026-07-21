@@ -190,20 +190,71 @@ defmodule SymphonyElixir.Config do
   end
 
   defp validate_semantics(settings) do
+    with :ok <- validate_tracker_semantics(settings.tracker),
+         do: validate_runner_semantics(settings.runner, settings.worker)
+  end
+
+  defp validate_tracker_semantics(tracker) do
     cond do
-      is_nil(settings.tracker.kind) ->
+      is_nil(tracker.kind) ->
         {:error, :missing_tracker_kind}
 
-      settings.tracker.kind not in ["linear", "memory"] ->
-        {:error, {:unsupported_tracker_kind, settings.tracker.kind}}
+      tracker.kind not in ["linear", "memory"] ->
+        {:error, {:unsupported_tracker_kind, tracker.kind}}
 
-      settings.tracker.kind == "linear" and not is_binary(settings.tracker.api_key) ->
+      tracker.kind == "linear" and not is_binary(tracker.api_key) ->
         {:error, :missing_linear_api_token}
 
       true ->
         :ok
     end
   end
+
+  defp validate_runner_semantics(%{capability_preflight: false}, _worker), do: :ok
+
+  defp validate_runner_semantics(runner, worker) do
+    cond do
+      worker.ssh_hosts != [] ->
+        {:error, :runner_capability_preflight_requires_local_worker}
+
+      not absolute_path?(runner.source_repo) ->
+        {:error, :missing_runner_source_repo}
+
+      not absolute_path?(runner.reviewer_codex_home) ->
+        {:error, :missing_runner_reviewer_codex_home}
+
+      not absolute_path?(runner.primary_codex_home) ->
+        {:error, :missing_runner_primary_codex_home}
+
+      not absolute_path?(runner.sandbox_codex_bin) ->
+        {:error, :missing_runner_sandbox_codex_bin}
+
+      runner.browser_backend != "camofox" ->
+        {:error, :missing_runner_browser_backend}
+
+      not valid_http_url?(runner.browser_backend_url) ->
+        {:error, :missing_runner_browser_backend_url}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp absolute_path?(path) when is_binary(path), do: Path.type(path) == :absolute
+  defp absolute_path?(_path), do: false
+
+  defp valid_http_url?(url) when is_binary(url) do
+    case URI.parse(url) do
+      %URI{scheme: scheme, host: host}
+      when scheme in ["http", "https"] and host in ["localhost", "127.0.0.1", "::1"] ->
+        true
+
+      _ ->
+        false
+    end
+  end
+
+  defp valid_http_url?(_url), do: false
 
   defp format_config_error(reason) do
     case reason do
