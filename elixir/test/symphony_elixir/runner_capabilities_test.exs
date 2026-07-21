@@ -7,6 +7,7 @@ defmodule SymphonyElixir.RunnerCapabilitiesTest do
   alias SymphonyElixir.RunnerCapabilities
 
   @runtime_env_names [
+    "CODEX_HOME",
     "SYMPHONY_CODEX_BIN",
     "SYMPHONY_REAL_CODEX_BIN",
     "SYMPHONY_REVIEW_CODEX_HOME",
@@ -53,6 +54,7 @@ defmodule SymphonyElixir.RunnerCapabilitiesTest do
     assert System.get_env("SYMPHONY_REAL_CODEX_BIN") == harness.real_codex
     assert System.get_env("SYMPHONY_REVIEW_CODEX_HOME") == harness.reviewer_home
     assert System.get_env("SYMPHONY_BROWSER_BACKEND_URL") == "http://127.0.0.1:9377"
+    assert System.get_env("CODEX_HOME") == harness.primary_home
 
     reviewer_auth = Path.join(harness.reviewer_home, "auth.json")
     assert File.read!(reviewer_auth) == "test-auth\n"
@@ -78,6 +80,26 @@ defmodule SymphonyElixir.RunnerCapabilitiesTest do
 
     assert {:error, {:unexpected_mode, _path, 0o755, 0o700}} =
              RunnerCapabilities.prepare_context(harness.settings, wrapper_path: harness.wrapper)
+  end
+
+  test "reviewer home must remain isolated from the primary Codex home" do
+    harness = capability_harness()
+    runner = %{harness.settings.runner | reviewer_codex_home: harness.primary_home}
+    settings = %{harness.settings | runner: runner}
+
+    assert {:error, {:reviewer_codex_home_not_isolated, reviewer_home}} =
+             RunnerCapabilities.prepare_context(settings, wrapper_path: harness.wrapper)
+
+    assert reviewer_home == harness.primary_home
+    assert File.read!(Path.join(harness.primary_home, "auth.json")) == "test-auth\n"
+  end
+
+  test "preflight requires the app-server command to preserve its minimal wrapper environment" do
+    harness = capability_harness()
+    settings = %{harness.settings | codex: %{harness.settings.codex | command: "codex app-server"}}
+
+    assert {:error, :codex_command_must_disable_shell_environment_inheritance} =
+             RunnerCapabilities.prepare_context(settings, wrapper_path: harness.wrapper)
   end
 
   test "primary auth must be a private regular file" do
@@ -132,8 +154,14 @@ defmodule SymphonyElixir.RunnerCapabilitiesTest do
     assert Enum.any?(args, &String.contains?(&1, "network = {enabled = false}"))
     assert Enum.any?(args, &String.contains?(&1, harness.source_repo))
     assert Enum.any?(args, &String.starts_with?(&1, "HOME=#{harness.reviewer_home}"))
+    assert Enum.member?(args, "SYMPHONY_CODEX_BIN=#{harness.wrapper}")
+    assert Enum.member?(args, "SYMPHONY_BROWSER_BACKEND_URL=http://127.0.0.1:9377")
     refute Enum.any?(args, &String.contains?(&1, "LINEAR_API_KEY"))
-    assert Enum.take(args, -4) == [harness.wrapper, "review", "--commit", "HEAD"]
+
+    assert [shell, "-c", ~S|exec "$SYMPHONY_CODEX_BIN" "$@"|, "symphony-canary", "review", "--commit", "HEAD"] =
+             Enum.take(args, -7)
+
+    assert Path.basename(shell) == "sh"
   end
 
   test "review canary fails closed when the nested session does not initialize" do
@@ -260,6 +288,7 @@ defmodule SymphonyElixir.RunnerCapabilitiesTest do
       Schema.parse(%{
         tracker: %{kind: "memory"},
         workspace: %{root: Path.join(root, "workspaces")},
+        codex: %{command: hardened_codex_command()},
         runner: %{
           capability_preflight: true,
           source_repo: source_repo,
@@ -301,4 +330,17 @@ defmodule SymphonyElixir.RunnerCapabilitiesTest do
 
   defp file_mode(path), do: File.stat!(path).mode &&& 0o777
   defp png_fixture, do: <<0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, "test">>
+
+  defp hardened_codex_command do
+    [
+      ~S|"${SYMPHONY_CODEX_BIN:-codex}"|,
+      "--config shell_environment_policy.inherit=none",
+      ~S|--config "shell_environment_policy.set.SYMPHONY_CODEX_BIN=\"${SYMPHONY_CODEX_BIN:-codex}\""|,
+      ~S|--config "shell_environment_policy.set.SYMPHONY_REAL_CODEX_BIN=\"${SYMPHONY_REAL_CODEX_BIN}\""|,
+      ~S|--config "shell_environment_policy.set.SYMPHONY_REVIEW_CODEX_HOME=\"${SYMPHONY_REVIEW_CODEX_HOME}\""|,
+      ~S|--config "shell_environment_policy.set.SYMPHONY_BROWSER_BACKEND_URL=\"${SYMPHONY_BROWSER_BACKEND_URL}\""|,
+      "app-server"
+    ]
+    |> Enum.join(" ")
+  end
 end

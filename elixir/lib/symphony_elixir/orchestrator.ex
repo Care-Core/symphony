@@ -12,6 +12,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @default_process_cleanup_timeout_ms 2_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -227,6 +228,15 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
+  end
+
+  @impl true
+  def terminate(_reason, %State{running: running}) do
+    Enum.each(running, fn {_issue_id, running_entry} ->
+      terminate_codex_process_tree(running_entry)
+    end)
+
+    :ok
   end
 
   defp maybe_dispatch(%State{} = state) do
@@ -537,7 +547,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp terminate_codex_process_tree(%{worker_host: worker_host}) when is_binary(worker_host), do: :ok
 
   defp terminate_codex_process_tree(running_entry) do
-    cleanup_timeout_ms = Config.settings!().runner.process_cleanup_timeout_ms
+    cleanup_timeout_ms = process_cleanup_timeout_ms()
 
     case Map.get(running_entry, :codex_app_server_pid) do
       os_pid when is_integer(os_pid) and os_pid > 0 ->
@@ -555,6 +565,19 @@ defmodule SymphonyElixir.Orchestrator do
       _ ->
         :ok
     end
+  end
+
+  defp process_cleanup_timeout_ms do
+    case Config.settings() do
+      {:ok, %{runner: %{process_cleanup_timeout_ms: timeout_ms}}}
+      when is_integer(timeout_ms) and timeout_ms > 0 ->
+        timeout_ms
+
+      _ ->
+        @default_process_cleanup_timeout_ms
+    end
+  rescue
+    _ -> @default_process_cleanup_timeout_ms
   end
 
   defp choose_issues(issues, state) do

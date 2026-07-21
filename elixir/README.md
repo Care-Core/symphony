@@ -47,6 +47,8 @@ Symphony stops the active agent for that issue and cleans up matching workspaces
 ## Prerequisites
 
 We recommend using [mise](https://mise.jdx.dev/) to manage Elixir/Erlang versions.
+Local process-tree cleanup also requires a process-group launcher: Perl on macOS or `setsid` on
+Linux. The hardened runner profile validates this before issue polling or claims.
 
 ```bash
 mise install
@@ -162,7 +164,12 @@ and a loopback Camofox browser backend actually work from the configured source 
 ```yaml
 codex:
   command: >-
-    "${SYMPHONY_CODEX_BIN:-codex}" --config shell_environment_policy.inherit=none app-server
+    "${SYMPHONY_CODEX_BIN:-codex}" --config shell_environment_policy.inherit=none
+    --config "shell_environment_policy.set.SYMPHONY_CODEX_BIN=\"${SYMPHONY_CODEX_BIN:-codex}\""
+    --config "shell_environment_policy.set.SYMPHONY_REAL_CODEX_BIN=\"${SYMPHONY_REAL_CODEX_BIN}\""
+    --config "shell_environment_policy.set.SYMPHONY_REVIEW_CODEX_HOME=\"${SYMPHONY_REVIEW_CODEX_HOME}\""
+    --config "shell_environment_policy.set.SYMPHONY_BROWSER_BACKEND_URL=\"${SYMPHONY_BROWSER_BACKEND_URL}\""
+    app-server
 runner:
   capability_preflight: true
   source_repo: $CARECORE_SOURCE_REPO
@@ -187,19 +194,22 @@ Runner contract:
   canary runs with that repository as its working directory.
 - `reviewer_codex_home` must be absolute and its canonical parent must already be owned by the
   current user with mode `700`. Symphony creates or validates the reviewer home and its `tmp`
-  directory at mode `700`.
+  directory at mode `700`, and rejects a reviewer home that resolves to the primary Codex home.
 - The primary `auth.json` must be an owner-only regular file at mode `600` or `400`. Reviewer auth
   symlinks are rejected. Authentication is copied through a mode-`600` temporary file and atomic
   rename; credential contents are never logged.
 - Any pre-existing custom `SYMPHONY_CODEX_BIN` is treated as the real binary for compatibility,
   saved as `SYMPHONY_REAL_CODEX_BIN`, and replaced with Symphony's isolation wrapper. App-server
-  keeps the primary Codex home; nested `review`/`exec` commands use the private reviewer home.
+  uses the configured primary Codex home; nested `review`/`exec` commands use the private reviewer
+  home. With shell inheritance disabled, all four `shell_environment_policy.set` entries shown
+  above are required so nested shells keep using the wrapper and explicit browser backend.
 - `browser_backend: camofox` is explicit and accepts loopback HTTP(S) URLs only. The preflight
   requires `GET /health`, creates a tab with `POST /tabs`, requires a PNG from
   `GET /tabs/:id/screenshot`, and always deletes the tab and canary session.
 - Local app-server commands run in their own process group. Normal shutdown, startup failure, turn
   timeout, and orchestrator stall restart terminate the recorded process tree with a bounded
-  TERM-to-KILL cleanup window controlled by `process_cleanup_timeout_ms`.
+  TERM-to-KILL cleanup window controlled by `process_cleanup_timeout_ms`. The process group uses
+  Perl on macOS or `setsid` on Linux.
 
 Set `SYMPHONY_REAL_CODEX_BIN` directly for new installations. The legacy normalization exists so an
 older `SYMPHONY_CODEX_BIN=/custom/path/codex` configuration cannot bypass the wrapper.

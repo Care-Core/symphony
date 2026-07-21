@@ -959,15 +959,18 @@ Optional local runner capability preflight extension:
   service startup.
 - Normalize a legacy/custom `SYMPHONY_CODEX_BIN` into `SYMPHONY_REAL_CODEX_BIN`, then place an
   isolation wrapper at `SYMPHONY_CODEX_BIN`. The wrapper preserves primary Codex state for
-  `app-server` and uses a separate reviewer home for nested Codex commands.
+  `app-server` and uses a separate reviewer home for nested Codex commands. When the app-server
+  disables shell-environment inheritance, its explicit shell policy must preserve the wrapper,
+  real-binary, reviewer-home, and browser-backend variables for nested commands.
 - Require the reviewer home path to be absolute, canonicalize and validate its parent before any
-  write, require owner-only mode `700`, reject reviewer auth symlinks, and require primary auth to
-  be a private regular file. Copy auth through a mode-`600` temporary file and atomic rename without
-  logging credential contents.
+  write, require owner-only mode `700`, reject a reviewer home equal to the primary home, reject
+  reviewer auth symlinks, and require primary auth to be a private regular file. Copy auth through
+  a mode-`600` temporary file and atomic rename without logging credential contents.
 - Exercise a bounded nested review canary from `runner.source_repo` with only the minimum non-secret
   environment required by the wrapper.
 - Require an explicit headless browser backend. The current Camofox contract is loopback-only and
   checks health, real tab creation, PNG screenshot capture, and tab/session cleanup.
+- Require a native process-group launcher before polling: Perl on macOS or `setsid` on Linux.
 - This extension is local-worker-only until equivalent SSH-host capability negotiation exists.
 
 ### 10.2 Session Startup Handshake

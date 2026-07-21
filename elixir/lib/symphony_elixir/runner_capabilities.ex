@@ -11,6 +11,12 @@ defmodule SymphonyElixir.RunnerCapabilities do
     "failed to initialize in-process app-server client",
     "Operation not permitted"
   ]
+  @required_shell_environment_variables [
+    "SYMPHONY_CODEX_BIN",
+    "SYMPHONY_REAL_CODEX_BIN",
+    "SYMPHONY_REVIEW_CODEX_HOME",
+    "SYMPHONY_BROWSER_BACKEND_URL"
+  ]
 
   @type context :: %{
           browser_backend_url: String.t(),
@@ -45,6 +51,8 @@ defmodule SymphonyElixir.RunnerCapabilities do
     wrapper_path = Keyword.get_lazy(opts, :wrapper_path, &default_wrapper_path/0)
 
     with :ok <- validate_local_runner(settings),
+         :ok <- validate_codex_shell_environment(settings.codex.command),
+         :ok <- ProcessTree.validate_launcher(),
          {:ok, source_repo} <- canonical_private_source_repo(settings.runner.source_repo),
          {:ok, wrapper_codex_bin} <- require_executable(wrapper_path, :runner_wrapper),
          {:ok, real_codex_bin} <- resolve_real_codex(wrapper_codex_bin),
@@ -93,7 +101,9 @@ defmodule SymphonyElixir.RunnerCapabilities do
         "--",
         env_executable(),
         "-i"
-      ] ++ review_environment(context) ++ [context.wrapper_codex_bin, "review", "--commit", "HEAD"]
+      ] ++
+        review_environment(context) ++
+        [shell_executable(), "-c", ~S|exec "$SYMPHONY_CODEX_BIN" "$@"|, "symphony-canary", "review", "--commit", "HEAD"]
 
     case command_runner.(runner.sandbox_codex_bin, args,
            cd: context.source_repo,
@@ -153,6 +163,36 @@ defmodule SymphonyElixir.RunnerCapabilities do
     end
   end
 
+  defp validate_codex_shell_environment(command) when is_binary(command) do
+    missing_variables =
+      Enum.reject(@required_shell_environment_variables, fn variable ->
+        String.contains?(command, "shell_environment_policy.set.#{variable}")
+      end)
+
+    cond do
+      not String.contains?(command, "shell_environment_policy.inherit=none") ->
+        {:error, :codex_command_must_disable_shell_environment_inheritance}
+
+      not wrapper_command?(command) ->
+        {:error, :codex_command_must_use_symphony_wrapper}
+
+      missing_variables != [] ->
+        {:error, {:codex_command_missing_shell_environment, missing_variables}}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_codex_shell_environment(_command), do: {:error, :codex_command_missing}
+
+  defp wrapper_command?(command) do
+    Regex.match?(
+      ~r/^\s*(?:exec\s+)?["']?\$(?:\{SYMPHONY_CODEX_BIN(?::-[^}]*)?\}|SYMPHONY_CODEX_BIN)(?:["']|\s)/,
+      command
+    )
+  end
+
   defp canonical_private_source_repo(path) do
     with {:ok, canonical_path} <- canonical_directory(path, :source_repo),
          true <- File.exists?(Path.join(canonical_path, ".git")) or {:error, {:source_repo_not_git, canonical_path}} do
@@ -181,6 +221,7 @@ defmodule SymphonyElixir.RunnerCapabilities do
          {:ok, canonical_parent} <- PathSafety.canonicalize(parent),
          :ok <- require_private_directory(canonical_parent, current_uid),
          canonical_reviewer_home = Path.join(canonical_parent, reviewer_home_name),
+         :ok <- require_isolated_reviewer_home(primary_codex_home, canonical_reviewer_home),
          :ok <- ensure_private_directory(canonical_reviewer_home, current_uid),
          :ok <- ensure_private_directory(Path.join(canonical_reviewer_home, "tmp"), current_uid),
          :ok <- reject_auth_symlink(Path.join(canonical_reviewer_home, "auth.json")),
@@ -188,6 +229,14 @@ defmodule SymphonyElixir.RunnerCapabilities do
          :ok <- require_private_file(primary_auth, current_uid),
          :ok <- atomic_copy_auth(primary_auth, canonical_reviewer_home, current_uid) do
       {:ok, canonical_reviewer_home}
+    end
+  end
+
+  defp require_isolated_reviewer_home(primary_codex_home, reviewer_codex_home) do
+    if same_path?(primary_codex_home, reviewer_codex_home) do
+      {:error, {:reviewer_codex_home_not_isolated, reviewer_codex_home}}
+    else
+      :ok
     end
   end
 
@@ -525,6 +574,7 @@ defmodule SymphonyElixir.RunnerCapabilities do
   end
 
   defp install_runtime_environment(context) do
+    System.put_env("CODEX_HOME", context.primary_codex_home)
     System.put_env("SYMPHONY_REAL_CODEX_BIN", context.real_codex_bin)
     System.put_env("SYMPHONY_CODEX_BIN", context.wrapper_codex_bin)
     System.put_env("SYMPHONY_REVIEW_CODEX_HOME", context.reviewer_codex_home)
@@ -569,8 +619,10 @@ defmodule SymphonyElixir.RunnerCapabilities do
       "HOME=#{context.reviewer_codex_home}",
       "TMPDIR=#{Path.join(context.reviewer_codex_home, "tmp")}",
       "LANG=#{System.get_env("LANG") || "en_US.UTF-8"}",
+      "SYMPHONY_CODEX_BIN=#{context.wrapper_codex_bin}",
       "SYMPHONY_REAL_CODEX_BIN=#{context.real_codex_bin}",
-      "SYMPHONY_REVIEW_CODEX_HOME=#{context.reviewer_codex_home}"
+      "SYMPHONY_REVIEW_CODEX_HOME=#{context.reviewer_codex_home}",
+      "SYMPHONY_BROWSER_BACKEND_URL=#{context.browser_backend_url}"
     ]
   end
 
@@ -618,7 +670,7 @@ defmodule SymphonyElixir.RunnerCapabilities do
 
   defp capture_browser_screenshot(context, request, user_id, tab_id) do
     query = URI.encode_query(%{"userId" => user_id})
-    path = "/tabs/#{URI.encode(tab_id)}/screenshot?#{query}"
+    path = "/tabs/#{encode_path_segment(tab_id)}/screenshot?#{query}"
 
     case request.(browser_request(context, :get, path)) do
       {:ok, %{status: status, body: <<@png_signature, _rest::binary>>}} when status in 200..299 ->
@@ -639,7 +691,7 @@ defmodule SymphonyElixir.RunnerCapabilities do
     query = URI.encode_query(%{"userId" => user_id})
 
     if is_binary(tab_id) do
-      safe_browser_request(request, browser_request(context, :delete, "/tabs/#{URI.encode(tab_id)}?#{query}"))
+      safe_browser_request(request, browser_request(context, :delete, "/tabs/#{encode_path_segment(tab_id)}?#{query}"))
     end
 
     safe_browser_request(request, browser_request(context, :delete, "/sessions/#{URI.encode(user_id)}"))
@@ -672,6 +724,12 @@ defmodule SymphonyElixir.RunnerCapabilities do
   defp env_executable do
     System.find_executable("env") || "/usr/bin/env"
   end
+
+  defp shell_executable do
+    System.find_executable("sh") || "/bin/sh"
+  end
+
+  defp encode_path_segment(value), do: URI.encode(value, &URI.char_unreserved?/1)
 
   defp default_wrapper_path do
     Application.app_dir(:symphony_elixir, "priv/codex-runner-wrapper.sh")

@@ -6,9 +6,18 @@ defmodule SymphonyElixir.ProcessTree do
 
   @type command_result :: %{status: non_neg_integer(), output: binary()}
 
+  @doc false
+  @spec validate_launcher(keyword()) :: :ok | {:error, term()}
+  def validate_launcher(opts \\ []) do
+    case process_group_launcher(opts) do
+      {:ok, _executable, _prefix_args} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
   @spec open_port(Path.t(), [String.t()], keyword()) :: {:ok, port()} | {:error, term()}
   def open_port(executable, args, opts \\ []) when is_binary(executable) and is_list(args) do
-    with {:ok, perl} <- find_executable(Keyword.get(opts, :perl, "perl")),
+    with {:ok, launcher, prefix_args} <- process_group_launcher(opts),
          true <- File.regular?(executable) or {:error, {:command_not_found, executable}} do
       port_options =
         [
@@ -17,7 +26,7 @@ defmodule SymphonyElixir.ProcessTree do
           :stderr_to_stdout,
           args:
             Enum.map(
-              ["-MPOSIX", "-e", @process_group_exec, executable | args],
+              prefix_args ++ [executable | args],
               &String.to_charlist/1
             )
         ]
@@ -26,7 +35,7 @@ defmodule SymphonyElixir.ProcessTree do
 
       {:ok,
        Port.open(
-         {:spawn_executable, String.to_charlist(perl)},
+         {:spawn_executable, String.to_charlist(launcher)},
          port_options
        )}
     end
@@ -122,6 +131,22 @@ defmodule SymphonyElixir.ProcessTree do
     case System.find_executable(executable) do
       nil -> {:error, {:command_not_found, executable}}
       path -> {:ok, path}
+    end
+  end
+
+  defp process_group_launcher(opts) do
+    perl = Keyword.get(opts, :perl, "perl")
+    setsid = Keyword.get(opts, :setsid, "setsid")
+
+    case find_executable(perl) do
+      {:ok, executable} ->
+        {:ok, executable, ["-MPOSIX", "-e", @process_group_exec]}
+
+      {:error, _reason} ->
+        case find_executable(setsid) do
+          {:ok, executable} -> {:ok, executable, []}
+          {:error, _reason} -> {:error, {:process_group_launcher_not_found, [perl, setsid]}}
+        end
     end
   end
 
