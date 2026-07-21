@@ -151,6 +151,7 @@ defmodule SymphonyElixir.AppServerTest do
       count=0
 
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf 'JSON:%s\\n' "$line" >> "$trace_file"; printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
 
@@ -159,12 +160,12 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1001"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1001"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1001"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1001"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;
@@ -224,8 +225,24 @@ defmodule SymphonyElixir.AppServerTest do
                    |> String.trim_leading("JSON:")
                    |> Jason.decode!()
                    |> then(fn payload ->
+                     payload["method"] == "thread/name/set" &&
+                       get_in(payload, ["params", "threadId"]) == "thread-1001" &&
+                       get_in(payload, ["params", "name"]) == "MT-1001 work"
+                   end)
+                 else
+                   false
+                 end
+               end)
+
+        assert Enum.any?(lines, fn line ->
+                 if String.starts_with?(line, "JSON:") do
+                   line
+                   |> String.trim_leading("JSON:")
+                   |> Jason.decode!()
+                   |> then(fn payload ->
                      payload["method"] == "turn/start" &&
-                       get_in(payload, ["params", "sandboxPolicy"]) == expected_policy
+                       get_in(payload, ["params", "sandboxPolicy"]) == expected_policy &&
+                       not Map.has_key?(payload["params"], "title")
                    end)
                  else
                    false
@@ -267,6 +284,7 @@ defmodule SymphonyElixir.AppServerTest do
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-input.trace}"
       count=0
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         printf 'JSON:%s\\n' \"$line\" >> \"$trace_file\"
 
@@ -275,12 +293,12 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{\"id\":1,\"result\":{}}'
             ;;
           2)
-            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-88\"}}}'
             ;;
           3)
-            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
+            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-88\"}}}'
             ;;
           4)
+            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
             printf '%s\\n' '{\"method\":\"turn/input_required\",\"id\":\"resp-1\",\"params\":{\"requiresInput\":true,\"reason\":\"blocked\"}}'
             ;;
           *)
@@ -332,7 +350,8 @@ defmodule SymphonyElixir.AppServerTest do
       File.write!(codex_binary, """
       #!/bin/sh
       count=0
-      while IFS= read -r _line; do
+      while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"error":{"code":-32601,"message":"Method not found"}}'; continue ;; esac
         count=$((count + 1))
 
         case "$count" in
@@ -340,9 +359,11 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-89"}}}'
             ;;
           3)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-89"}}}'
+            ;;
+          4)
             printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-89"}}}'
             printf '%s\\n' '{"id":99,"method":"item/commandExecution/requestApproval","params":{"command":"gh pr view","cwd":"/tmp","reason":"need approval"}}'
             ;;
@@ -409,6 +430,7 @@ defmodule SymphonyElixir.AppServerTest do
       trace_file="${SYMP_TEST_CODex_TRACE:-/tmp/codex-auto-approve.trace}"
       count=0
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         printf 'JSON:%s\\n' \"$line\" >> \"$trace_file\"
 
@@ -546,6 +568,7 @@ defmodule SymphonyElixir.AppServerTest do
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-tool-user-input-auto-approve.trace}"
       count=0
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         printf 'JSON:%s\\n' \"$line\" >> \"$trace_file\"
 
@@ -645,6 +668,7 @@ defmodule SymphonyElixir.AppServerTest do
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-mcp-elicitation-auto-approve.trace}"
       count=0
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
 
@@ -728,7 +752,8 @@ defmodule SymphonyElixir.AppServerTest do
       File.write!(codex_binary, """
       #!/bin/sh
       count=0
-      while IFS= read -r _line; do
+      while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
 
         case "$count" in
@@ -818,6 +843,7 @@ defmodule SymphonyElixir.AppServerTest do
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-mcp-elicitation-decline.trace}"
       count=0
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
 
@@ -924,6 +950,7 @@ defmodule SymphonyElixir.AppServerTest do
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-tool-user-input-options.trace}"
       count=0
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         printf 'JSON:%s\\n' \"$line\" >> \"$trace_file\"
 
@@ -1024,6 +1051,7 @@ defmodule SymphonyElixir.AppServerTest do
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-tool-call.trace}"
       count=0
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         printf 'JSON:%s\\n' \"$line\" >> \"$trace_file\"
 
@@ -1125,6 +1153,7 @@ defmodule SymphonyElixir.AppServerTest do
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-supported-tool-call.trace}"
       count=0
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         printf 'JSON:%s\\n' \"$line\" >> \"$trace_file\"
 
@@ -1247,6 +1276,7 @@ defmodule SymphonyElixir.AppServerTest do
       trace_file="${SYMP_TEST_CODEx_TRACE:-/tmp/codex-tool-call-failed.trace}"
       count=0
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         printf 'JSON:%s\\n' \"$line\" >> \"$trace_file\"
 
@@ -1340,6 +1370,7 @@ defmodule SymphonyElixir.AppServerTest do
       #!/bin/sh
       count=0
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
 
         case "$count" in
@@ -1348,12 +1379,12 @@ defmodule SymphonyElixir.AppServerTest do
             printf '{"id":1,"result":{},"padding":"%s"}\\n' "$padding"
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-91"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-91"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-91"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-91"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;
@@ -1404,6 +1435,7 @@ defmodule SymphonyElixir.AppServerTest do
       #!/bin/sh
       count=0
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
 
         case "$count" in
@@ -1411,12 +1443,12 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-92"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-92"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-92"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-92"}}}'
             printf '%s\\n' 'warning: this is stderr noise' >&2
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
@@ -1479,6 +1511,7 @@ defmodule SymphonyElixir.AppServerTest do
       #!/bin/sh
       count=0
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
 
         case "$count" in
@@ -1486,12 +1519,12 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-93"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-93"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-93"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-93"}}}'
             printf '%s\\n' '{"method":"turn/completed"'
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
@@ -1564,6 +1597,7 @@ defmodule SymphonyElixir.AppServerTest do
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
 
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
 
@@ -1572,12 +1606,12 @@ defmodule SymphonyElixir.AppServerTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-remote"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-remote"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-remote"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-remote"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;

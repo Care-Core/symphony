@@ -1058,6 +1058,7 @@ defmodule SymphonyElixir.CoreTest do
       #!/bin/sh
       count=0
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         case "$count" in
           1)
@@ -1143,18 +1144,19 @@ defmodule SymphonyElixir.CoreTest do
         #!/bin/sh
         count=0
         while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
           count=$((count + 1))
           case "$count" in
             1)
               printf '%s\\n' '{\"id\":1,\"result\":{}}'
               ;;
             2)
-              printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-live\"}}}'
               ;;
             3)
-              printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-live\"}}}'
+              printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-live\"}}}'
               ;;
             4)
+              printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-live\"}}}'
               printf '%s\\n' '{\"method\":\"turn/completed\"}'
               ;;
             *)
@@ -1304,6 +1306,7 @@ defmodule SymphonyElixir.CoreTest do
       count=0
 
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
         case "$count" in
@@ -1434,6 +1437,7 @@ defmodule SymphonyElixir.CoreTest do
       count=0
 
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
         case "$count" in
@@ -1536,6 +1540,7 @@ defmodule SymphonyElixir.CoreTest do
       printf 'CWD:%s\\n' \"$PWD\" >> \"$trace_file\"
 
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         printf 'JSON:%s\\n' \"$line\" >> \"$trace_file\"
         case \"$count\" in
@@ -1543,12 +1548,12 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{\"id\":1,\"result\":{}}'
             ;;
           2)
-            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-77\"}}}'
             ;;
           3)
-            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-77\"}}}'
+            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-77\"}}}'
             ;;
           4)
+            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-77\"}}}'
             printf '%s\\n' '{\"method\":\"turn/completed\"}'
             exit 0
             ;;
@@ -1681,18 +1686,19 @@ defmodule SymphonyElixir.CoreTest do
       printf 'ARGV:%s\\n' \"$*\" >> \"$trace_file\"
 
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         case \"$count\" in
           1)
             printf '%s\\n' '{\"id\":1,\"result\":{}}'
             ;;
           2)
-            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-88\"}}}'
             ;;
           3)
-            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
+            printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-88\"}}}'
             ;;
           4)
+            printf '%s\\n' '{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-88\"}}}'
             printf '%s\\n' '{\"method\":\"turn/completed\"}'
             exit 0
             ;;
@@ -1770,6 +1776,7 @@ defmodule SymphonyElixir.CoreTest do
       count=0
 
       while IFS= read -r line; do
+        case "$line" in *'"method":"thread/name/set"'*) printf '%s\\n' '{"id":4,"result":{}}'; continue ;; esac
         count=$((count + 1))
         printf 'JSON:%s\\n' "$line" >> "$trace_file"
 
@@ -1778,12 +1785,12 @@ defmodule SymphonyElixir.CoreTest do
             printf '%s\\n' '{"id":1,"result":{}}'
             ;;
           2)
-            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-99"}}}'
             ;;
           3)
-            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-99"}}}'
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-99"}}}'
             ;;
           4)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-99"}}}'
             printf '%s\\n' '{"method":"turn/completed"}'
             exit 0
             ;;

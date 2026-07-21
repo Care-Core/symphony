@@ -989,7 +989,8 @@ semantics):
 {"id":1,"method":"initialize","params":{"clientInfo":{"name":"symphony","version":"1.0"},"capabilities":{}}}
 {"method":"initialized","params":{}}
 {"id":2,"method":"thread/start","params":{"approvalPolicy":"<implementation-defined>","sandbox":"<implementation-defined>","cwd":"/abs/workspace"}}
-{"id":3,"method":"turn/start","params":{"threadId":"<thread-id>","input":[{"type":"text","text":"<rendered prompt-or-continuation-guidance>"}],"cwd":"/abs/workspace","title":"ABC-123: Example","approvalPolicy":"<implementation-defined>","sandboxPolicy":{"type":"<implementation-defined>"}}}
+{"id":4,"method":"thread/name/set","params":{"threadId":"<thread-id>","name":"ABC-123 work"}}
+{"id":3,"method":"turn/start","params":{"threadId":"<thread-id>","input":[{"type":"text","text":"<rendered prompt-or-continuation-guidance>"}],"cwd":"/abs/workspace","approvalPolicy":"<implementation-defined>","sandboxPolicy":{"type":"<implementation-defined>"}}}
 ```
 
 1. `initialize` request
@@ -1007,13 +1008,18 @@ semantics):
      - `cwd` = absolute workspace path
      - If optional client-side tools are implemented, include their advertised tool specs using the
        protocol mechanism supported by the targeted Codex app-server version.
-4. `turn/start` request
+4. `thread/name/set` request
+   - Params include:
+     - `threadId`
+     - `name` = `<issue.identifier> work`
+   - Naming is best-effort. Log a warning and continue when the installed app-server does not
+     support explicit thread naming or the naming request otherwise fails.
+5. `turn/start` request
    - Params include:
      - `threadId`
      - `input` = single text item containing rendered prompt for the first turn, or continuation
        guidance for later turns on the same thread
      - `cwd`
-     - `title` = `<issue.identifier>: <issue.title>`
      - `approvalPolicy` = implementation-defined turn approval policy value
      - `sandboxPolicy` = implementation-defined object-form sandbox policy payload when required by
        the targeted app-server version

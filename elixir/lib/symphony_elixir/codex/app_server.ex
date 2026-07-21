@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @thread_name_set_id 4
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
@@ -27,7 +28,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   @spec run(Path.t(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run(workspace, prompt, issue, opts \\ []) do
-    with {:ok, session} <- start_session(workspace, opts) do
+    with {:ok, session} <- start_session(workspace, Keyword.put(opts, :issue, issue)) do
       try do
         run_turn(session, prompt, issue, opts)
       after
@@ -46,7 +47,8 @@ defmodule SymphonyElixir.Codex.AppServer do
 
       with :ok <- notify_session_started(opts, metadata),
            {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
-           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
+           {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies),
+           :ok <- set_thread_name(port, thread_id, Keyword.get(opts, :issue)) do
         {:ok,
          %{
            port: port,
@@ -102,7 +104,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments)
       end)
 
-    case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+    case start_turn(port, thread_id, prompt, workspace, approval_policy, turn_sandbox_policy) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
@@ -307,7 +309,32 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
+  defp set_thread_name(_port, _thread_id, nil), do: :ok
+
+  defp set_thread_name(port, thread_id, issue) do
+    thread_name = "#{issue.identifier} work"
+
+    send_message(port, %{
+      "method" => "thread/name/set",
+      "id" => @thread_name_set_id,
+      "params" => %{
+        "threadId" => thread_id,
+        "name" => thread_name
+      }
+    })
+
+    case await_response(port, @thread_name_set_id) do
+      {:ok, _} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Unable to set Codex thread name for #{issue_context(issue)} thread_id=#{thread_id}: #{inspect(reason)}")
+
+        :ok
+    end
+  end
+
+  defp start_turn(port, thread_id, prompt, workspace, approval_policy, turn_sandbox_policy) do
     send_message(port, %{
       "method" => "turn/start",
       "id" => @turn_start_id,
@@ -320,7 +347,6 @@ defmodule SymphonyElixir.Codex.AppServer do
           }
         ],
         "cwd" => workspace,
-        "title" => "#{issue.identifier}: #{issue.title}",
         "approvalPolicy" => approval_policy,
         "sandboxPolicy" => turn_sandbox_policy
       }

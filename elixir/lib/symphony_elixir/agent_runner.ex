@@ -90,7 +90,12 @@ defmodule SymphonyElixir.AgentRunner do
 
     on_start = &send_codex_runtime_info(codex_update_recipient, issue, &1)
 
-    with {:ok, session} <- AppServer.start_session(workspace, worker_host: worker_host, on_start: on_start) do
+    with {:ok, session} <-
+           AppServer.start_session(workspace,
+             worker_host: worker_host,
+             on_start: on_start,
+             issue: issue
+           ) do
       try do
         do_run_codex_turns(session, workspace, issue, codex_update_recipient, opts, issue_state_fetcher, 1, max_turns)
       after
