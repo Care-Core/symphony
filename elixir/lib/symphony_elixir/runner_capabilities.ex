@@ -17,6 +17,30 @@ defmodule SymphonyElixir.RunnerCapabilities do
     "SYMPHONY_REVIEW_CODEX_HOME",
     "SYMPHONY_BROWSER_BACKEND_URL"
   ]
+  @codex_flags_with_value [
+    "--enable",
+    "--disable",
+    "--model",
+    "-m",
+    "--local-provider",
+    "--profile",
+    "-p",
+    "--sandbox",
+    "-s",
+    "--cd",
+    "-C",
+    "--add-dir",
+    "--ask-for-approval",
+    "-a"
+  ]
+  @codex_boolean_flags [
+    "--strict-config",
+    "--oss",
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--dangerously-bypass-hook-trust",
+    "--search",
+    "--no-alt-screen"
+  ]
   @unsafe_shell_syntax ~r/(?:^|\s)#|[\r\n;&|<>`]|\$\(/
 
   @type context :: %{
@@ -259,7 +283,28 @@ defmodule SymphonyElixir.RunnerCapabilities do
     {:error, {:codex_command_config_value_missing, flag}}
   end
 
-  defp collect_codex_config([arg | _rest], _config), do: {:error, {:codex_command_unsupported_argument, arg}}
+  defp collect_codex_config([flag, _value | rest], config) when flag in @codex_flags_with_value do
+    collect_codex_config(rest, config)
+  end
+
+  defp collect_codex_config([flag | rest], config) when flag in @codex_boolean_flags do
+    collect_codex_config(rest, config)
+  end
+
+  defp collect_codex_config([arg | rest], config) do
+    if supported_codex_flag_with_inline_value?(arg) do
+      collect_codex_config(rest, config)
+    else
+      {:error, {:codex_command_unsupported_argument, arg}}
+    end
+  end
+
+  defp supported_codex_flag_with_inline_value?(arg) do
+    Enum.any?(@codex_flags_with_value, fn
+      "--" <> _rest = flag -> String.starts_with?(arg, flag <> "=")
+      "-" <> _rest = flag -> String.starts_with?(arg, flag) and byte_size(arg) > byte_size(flag)
+    end)
+  end
 
   defp split_config_assignment(assignment) do
     case String.split(assignment, "=", parts: 2) do
@@ -349,13 +394,26 @@ defmodule SymphonyElixir.RunnerCapabilities do
   end
 
   defp overlapping_paths?(left, right) do
-    left_parts = Path.split(left)
-    right_parts = Path.split(right)
+    left_parts = normalized_path_parts(left)
+    right_parts = normalized_path_parts(right)
 
     {shorter, longer} =
       if length(left_parts) <= length(right_parts), do: {left_parts, right_parts}, else: {right_parts, left_parts}
 
     Enum.take(longer, length(shorter)) == shorter
+  end
+
+  defp normalized_path_parts(path) do
+    path
+    |> Path.split()
+    |> Enum.map(&normalize_path_component/1)
+  end
+
+  defp normalize_path_component(component) do
+    case :os.type() do
+      {:unix, :darwin} -> component |> String.normalize(:nfd) |> String.downcase()
+      _ -> component
+    end
   end
 
   defp require_private_directory(path, current_uid) do

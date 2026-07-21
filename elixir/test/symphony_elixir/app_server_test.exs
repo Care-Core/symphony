@@ -1,6 +1,50 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  test "app server publishes its local PID before protocol initialization completes" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-start-metadata-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-START")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+      File.write!(codex_binary, "#!/bin/sh\nsleep 60\n")
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_read_timeout_ms: 150,
+        runner_process_cleanup_timeout_ms: 150
+      )
+
+      test_pid = self()
+
+      startup =
+        Task.async(fn ->
+          AppServer.start_session(workspace,
+            on_start: fn metadata ->
+              send(test_pid, {:app_server_started_before_init, metadata})
+              :ok
+            end
+          )
+        end)
+
+      assert_receive {:app_server_started_before_init, %{codex_app_server_pid: app_server_pid}}, 500
+      assert {pid, ""} = Integer.parse(app_server_pid)
+      assert pid > 0
+      assert Task.yield(startup, 0) == nil
+      assert {:error, :response_timeout} = Task.await(startup, 2_000)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(

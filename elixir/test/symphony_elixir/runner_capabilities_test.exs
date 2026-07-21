@@ -121,6 +121,18 @@ defmodule SymphonyElixir.RunnerCapabilitiesTest do
              RunnerCapabilities.prepare_context(%{harness.settings | runner: runner}, wrapper_path: harness.wrapper)
   end
 
+  test "reviewer and primary path overlap honors macOS case-insensitive semantics" do
+    if :os.type() == {:unix, :darwin} do
+      harness = capability_harness()
+      case_variant_primary = String.upcase(harness.primary_home)
+      nested_reviewer = Path.join(case_variant_primary, "reviewer")
+      runner = %{harness.settings.runner | reviewer_codex_home: nested_reviewer}
+
+      assert {:error, {:reviewer_codex_home_not_isolated, ^nested_reviewer}} =
+               RunnerCapabilities.prepare_context(%{harness.settings | runner: runner}, wrapper_path: harness.wrapper)
+    end
+  end
+
   test "preflight requires the app-server command to preserve its minimal wrapper environment" do
     harness = capability_harness()
     settings = %{harness.settings | codex: %{harness.settings.codex | command: "codex app-server"}}
@@ -154,6 +166,16 @@ defmodule SymphonyElixir.RunnerCapabilitiesTest do
 
     assert {:error, :codex_command_contains_unsafe_shell_syntax} =
              RunnerCapabilities.prepare_context(commented_settings, wrapper_path: harness.wrapper)
+
+    flagged_command =
+      String.replace(
+        hardened_codex_command(),
+        " --config shell_environment_policy.inherit=none",
+        " --model gpt-5.3-codex --strict-config --profile=unattended --config shell_environment_policy.inherit=none"
+      )
+
+    flagged_settings = %{harness.settings | codex: %{harness.settings.codex | command: flagged_command}}
+    assert {:ok, _context} = RunnerCapabilities.prepare_context(flagged_settings, wrapper_path: harness.wrapper)
   end
 
   test "preflight requires shell variables to flow into their matching policy entries" do

@@ -44,7 +44,8 @@ defmodule SymphonyElixir.Codex.AppServer do
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port_metadata(port, worker_host)
 
-      with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
+      with :ok <- notify_session_started(opts, metadata),
+           {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
            {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
         {:ok,
          %{
@@ -65,6 +66,19 @@ defmodule SymphonyElixir.Codex.AppServer do
       end
     end
   end
+
+  defp notify_session_started(opts, metadata) do
+    case Keyword.get(opts, :on_start) do
+      callback when is_function(callback, 1) -> normalize_session_start_callback(callback.(metadata))
+      _ -> :ok
+    end
+  rescue
+    error -> {:error, {:session_start_callback_failed, error}}
+  end
+
+  defp normalize_session_start_callback(:ok), do: :ok
+  defp normalize_session_start_callback({:error, _reason} = error), do: error
+  defp normalize_session_start_callback(result), do: {:error, {:session_start_callback_invalid_result, result}}
 
   @spec run_turn(session(), String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def run_turn(

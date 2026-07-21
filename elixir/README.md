@@ -194,7 +194,8 @@ Runner contract:
   canary runs with that repository as its working directory.
 - `reviewer_codex_home` must be absolute and its canonical parent must already be owned by the
   current user with mode `700`. Symphony creates or validates the reviewer home and its `tmp`
-  directory at mode `700`, and rejects a reviewer home that resolves to the primary Codex home.
+  directory at mode `700`, and rejects reviewer/primary homes that overlap after macOS-aware path
+  normalization.
 - The primary `auth.json` must be an owner-only regular file at mode `600` or `400`. Reviewer auth
   symlinks are rejected. Authentication is copied through a mode-`600` temporary file and atomic
   rename; credential contents are never logged.
