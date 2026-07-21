@@ -7,7 +7,7 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, ProcessTree, RunnerCapabilities, StatusDashboard, Tracker, Workspace}
   alias SymphonyElixir.Linear.Issue
 
   @continuation_retry_delay_ms 1_000
@@ -49,7 +49,16 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @impl true
-  def init(_opts) do
+  def init(opts) do
+    capability_preflight = Keyword.get(opts, :runner_capability_preflight, &RunnerCapabilities.preflight/0)
+
+    case capability_preflight.() do
+      :ok -> initialize_state()
+      {:error, reason} -> {:stop, {:runner_capability_preflight_failed, reason}}
+    end
+  end
+
+  defp initialize_state do
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
 
@@ -65,9 +74,7 @@ defmodule SymphonyElixir.Orchestrator do
     }
 
     run_terminal_workspace_cleanup()
-    state = schedule_tick(state, 0)
-
-    {:ok, state}
+    {:ok, schedule_tick(state, 0)}
   end
 
   @impl true
@@ -434,6 +441,8 @@ defmodule SymphonyElixir.Orchestrator do
           cleanup_issue_workspace(identifier, worker_host)
         end
 
+        terminate_codex_process_tree(running_entry)
+
         if is_pid(pid) do
           terminate_task(pid)
         end
@@ -524,6 +533,29 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp terminate_task(_pid), do: :ok
+
+  defp terminate_codex_process_tree(%{worker_host: worker_host}) when is_binary(worker_host), do: :ok
+
+  defp terminate_codex_process_tree(running_entry) do
+    cleanup_timeout_ms = Config.settings!().runner.process_cleanup_timeout_ms
+
+    case Map.get(running_entry, :codex_app_server_pid) do
+      os_pid when is_integer(os_pid) and os_pid > 0 ->
+        ProcessTree.terminate_os_process_tree(os_pid, cleanup_timeout_ms)
+
+      os_pid when is_binary(os_pid) ->
+        case Integer.parse(os_pid) do
+          {parsed_pid, ""} when parsed_pid > 0 ->
+            ProcessTree.terminate_os_process_tree(parsed_pid, cleanup_timeout_ms)
+
+          _ ->
+            :ok
+        end
+
+      _ ->
+        :ok
+    end
+  end
 
   defp choose_issues(issues, state) do
     active_states = active_state_set()

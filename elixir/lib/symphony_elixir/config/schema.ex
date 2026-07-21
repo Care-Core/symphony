@@ -200,6 +200,53 @@ defmodule SymphonyElixir.Config.Schema do
     end
   end
 
+  defmodule Runner do
+    @moduledoc false
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @primary_key false
+    embedded_schema do
+      field(:capability_preflight, :boolean, default: false)
+      field(:source_repo, :string)
+      field(:reviewer_codex_home, :string, default: "$SYMPHONY_REVIEW_CODEX_HOME")
+      field(:primary_codex_home, :string, default: "$CODEX_HOME")
+      field(:required_skills, {:array, :string}, default: [])
+      field(:sandbox_codex_bin, :string, default: "/Applications/ChatGPT.app/Contents/Resources/codex")
+      field(:browser_backend, :string)
+      field(:browser_backend_url, :string, default: "$SYMPHONY_BROWSER_BACKEND_URL")
+      field(:review_timeout_ms, :integer, default: 20_000)
+      field(:browser_timeout_ms, :integer, default: 15_000)
+      field(:process_cleanup_timeout_ms, :integer, default: 2_000)
+    end
+
+    @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(schema, attrs) do
+      schema
+      |> cast(
+        attrs,
+        [
+          :capability_preflight,
+          :source_repo,
+          :reviewer_codex_home,
+          :primary_codex_home,
+          :required_skills,
+          :sandbox_codex_bin,
+          :browser_backend,
+          :browser_backend_url,
+          :review_timeout_ms,
+          :browser_timeout_ms,
+          :process_cleanup_timeout_ms
+        ],
+        empty_values: []
+      )
+      |> validate_inclusion(:browser_backend, ["camofox"])
+      |> validate_number(:review_timeout_ms, greater_than: 0)
+      |> validate_number(:browser_timeout_ms, greater_than: 0)
+      |> validate_number(:process_cleanup_timeout_ms, greater_than: 0)
+    end
+  end
+
   defmodule Hooks do
     @moduledoc false
     use Ecto.Schema
@@ -269,6 +316,7 @@ defmodule SymphonyElixir.Config.Schema do
     embeds_one(:worker, Worker, on_replace: :update, defaults_to_struct: true)
     embeds_one(:agent, Agent, on_replace: :update, defaults_to_struct: true)
     embeds_one(:codex, Codex, on_replace: :update, defaults_to_struct: true)
+    embeds_one(:runner, Runner, on_replace: :update, defaults_to_struct: true)
     embeds_one(:hooks, Hooks, on_replace: :update, defaults_to_struct: true)
     embeds_one(:observability, Observability, on_replace: :update, defaults_to_struct: true)
     embeds_one(:server, Server, on_replace: :update, defaults_to_struct: true)
@@ -361,6 +409,7 @@ defmodule SymphonyElixir.Config.Schema do
     |> cast_embed(:worker, with: &Worker.changeset/2)
     |> cast_embed(:agent, with: &Agent.changeset/2)
     |> cast_embed(:codex, with: &Codex.changeset/2)
+    |> cast_embed(:runner, with: &Runner.changeset/2)
     |> cast_embed(:hooks, with: &Hooks.changeset/2)
     |> cast_embed(:observability, with: &Observability.changeset/2)
     |> cast_embed(:server, with: &Server.changeset/2)
@@ -385,7 +434,17 @@ defmodule SymphonyElixir.Config.Schema do
         turn_sandbox_policy: normalize_optional_map(settings.codex.turn_sandbox_policy)
     }
 
-    %{settings | tracker: tracker, workspace: workspace, codex: codex}
+    runner = %{
+      settings.runner
+      | source_repo: resolve_path_value(settings.runner.source_repo, nil),
+        reviewer_codex_home: resolve_path_value(settings.runner.reviewer_codex_home, nil),
+        primary_codex_home: resolve_path_value(settings.runner.primary_codex_home, default_codex_home()),
+        sandbox_codex_bin: resolve_path_value(settings.runner.sandbox_codex_bin, nil),
+        browser_backend_url: resolve_optional_env_value(settings.runner.browser_backend_url),
+        required_skills: normalize_required_skills(settings.runner.required_skills)
+    }
+
+    %{settings | tracker: tracker, workspace: workspace, codex: codex, runner: runner}
   end
 
   defp normalize_keys(value) when is_map(value) do
@@ -417,6 +476,13 @@ defmodule SymphonyElixir.Config.Schema do
   defp normalize_optional_map(nil), do: nil
   defp normalize_optional_map(value) when is_map(value), do: normalize_keys(value)
 
+  defp normalize_required_skills(skills) when is_list(skills) do
+    skills
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
   defp normalize_key(value) when is_atom(value), do: Atom.to_string(value)
   defp normalize_key(value), do: to_string(value)
 
@@ -438,6 +504,13 @@ defmodule SymphonyElixir.Config.Schema do
     case resolve_env_value(value, fallback) do
       resolved when is_binary(resolved) -> normalize_secret_value(resolved)
       resolved -> resolved
+    end
+  end
+
+  defp resolve_optional_env_value(value) when is_binary(value) do
+    case resolve_env_value(value, nil) do
+      resolved when is_binary(resolved) -> normalize_secret_value(resolved)
+      _ -> nil
     end
   end
 
@@ -536,6 +609,8 @@ defmodule SymphonyElixir.Config.Schema do
   defp default_workspace_root(workspace, _fallback), do: workspace
 
   defp default_workspace_root, do: Path.join(System.tmp_dir!(), "symphony_workspaces")
+
+  defp default_codex_home, do: Path.expand("~/.codex")
 
   defp expand_local_workspace_root(workspace_root)
        when is_binary(workspace_root) and workspace_root != "" do

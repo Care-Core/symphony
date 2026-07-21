@@ -835,6 +835,9 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.codex.turn_timeout_ms == 3_600_000
     assert config.codex.read_timeout_ms == 5_000
     assert config.codex.stall_timeout_ms == 300_000
+    assert config.runner.capability_preflight == false
+    assert config.runner.required_skills == []
+    assert config.runner.process_cleanup_timeout_ms == 2_000
 
     write_workflow_file!(Workflow.workflow_file_path(), codex_command: "codex app-server --model gpt-5.3-codex")
     assert Config.settings!().codex.command == "codex app-server --model gpt-5.3-codex"
@@ -899,6 +902,45 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     write_workflow_file!(Workflow.workflow_file_path(), codex_stall_timeout_ms: "bad")
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.stall_timeout_ms"
+
+    runner_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-runner-config-#{System.unique_integer([:positive])}"
+      )
+
+    File.mkdir_p!(runner_root)
+    on_exit(fn -> File.rm_rf(runner_root) end)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      runner_capability_preflight: true,
+      runner_source_repo: Path.join(runner_root, "source"),
+      runner_reviewer_codex_home: Path.join(runner_root, "reviewer"),
+      runner_primary_codex_home: Path.join(runner_root, "primary"),
+      runner_required_skills: [" code-simplifier ", "code-simplifier", "security-best-practices"],
+      runner_sandbox_codex_bin: "/Applications/ChatGPT.app/Contents/Resources/codex",
+      runner_browser_backend: "camofox",
+      runner_browser_backend_url: "http://127.0.0.1:9377"
+    )
+
+    assert :ok = Config.validate!()
+    assert Config.settings!().runner.required_skills == ["code-simplifier", "security-best-practices"]
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      runner_capability_preflight: true,
+      runner_source_repo: Path.join(runner_root, "source"),
+      runner_reviewer_codex_home: Path.join(runner_root, "reviewer"),
+      runner_primary_codex_home: Path.join(runner_root, "primary"),
+      runner_sandbox_codex_bin: "/Applications/ChatGPT.app/Contents/Resources/codex",
+      runner_browser_backend: "camofox",
+      runner_browser_backend_url: "https://browser.example.com"
+    )
+
+    assert {:error, :missing_runner_browser_backend_url} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(), runner_browser_backend: "playwright")
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "runner.browser_backend"
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_active_states: %{todo: true},

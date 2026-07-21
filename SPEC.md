@@ -579,6 +579,25 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
+- `runner.capability_preflight` (extension): boolean, default `false`; when enabled, startup must
+  complete the local runner capability contract before polling or claims
+- `runner.source_repo` (extension): absolute path or `$VAR`; working directory for the review
+  capability canary
+- `runner.reviewer_codex_home` (extension): absolute path or `$VAR`; private writable state for
+  nested Codex review/exec processes
+- `runner.primary_codex_home` (extension): absolute path or `$VAR`; defaults to `CODEX_HOME` or
+  `~/.codex`
+- `runner.required_skills` (extension): list of skill directory names copied into the private
+  reviewer home after rejecting symlinks
+- `runner.sandbox_codex_bin` (extension): absolute executable used to exercise the local runner
+  sandbox during preflight
+- `runner.browser_backend` (extension): explicit backend contract; the current implementation
+  supports `camofox`
+- `runner.browser_backend_url` (extension): loopback HTTP(S) base URL or `$VAR` for the headless
+  browser backend
+- `runner.review_timeout_ms` (extension): positive integer, default `20000`
+- `runner.browser_timeout_ms` (extension): positive integer, default `15000`
+- `runner.process_cleanup_timeout_ms` (extension): positive integer, default `2000`
 - `server.port` (extension): integer, optional; enables the optional HTTP server, `0` may be used
   for ephemeral local bind, and CLI `--port` overrides it
 
@@ -929,6 +948,27 @@ Notes:
 Recommended additional process settings:
 
 - Max line size: 10 MB (for safe buffering)
+- For unattended local runners, launch the app-server in a dedicated native process group and keep
+  its OS PID in orchestration state. Normal stop, startup failure, turn timeout, cancellation, and
+  stall restart should terminate the complete recorded process tree with a bounded TERM-to-KILL
+  window so nested review processes cannot leak.
+
+Optional local runner capability preflight extension:
+
+- Run before tracker polling, terminal-workspace cleanup, or issue claims. Any failed check aborts
+  service startup.
+- Normalize a legacy/custom `SYMPHONY_CODEX_BIN` into `SYMPHONY_REAL_CODEX_BIN`, then place an
+  isolation wrapper at `SYMPHONY_CODEX_BIN`. The wrapper preserves primary Codex state for
+  `app-server` and uses a separate reviewer home for nested Codex commands.
+- Require the reviewer home path to be absolute, canonicalize and validate its parent before any
+  write, require owner-only mode `700`, reject reviewer auth symlinks, and require primary auth to
+  be a private regular file. Copy auth through a mode-`600` temporary file and atomic rename without
+  logging credential contents.
+- Exercise a bounded nested review canary from `runner.source_repo` with only the minimum non-secret
+  environment required by the wrapper.
+- Require an explicit headless browser backend. The current Camofox contract is loopback-only and
+  checks health, real tab creation, PNG screenshot capture, and tab/session cleanup.
+- This extension is local-worker-only until equivalent SSH-host capability negotiation exists.
 
 ### 10.2 Session Startup Handshake
 
@@ -2104,6 +2144,8 @@ Use the same validation profiles as Section 17:
   exposes the baseline endpoints/error semantics in Section 13.7 if shipped.
 - Optional `linear_graphql` client-side tool extension exposes raw Linear GraphQL access through the
   app-server session using configured Symphony auth.
+- Optional fail-closed local runner capability preflight validates nested review, private reviewer
+  state, process-tree cleanup, and an explicit headless browser backend before any issue claim.
 - TODO: Persist retry queue and session metadata across process restarts.
 - TODO: Make observability settings configurable in workflow front matter without prescribing UI
   implementation details.

@@ -998,6 +998,18 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
         end
       end)
 
+    {:ok, codex_port} =
+      SymphonyElixir.ProcessTree.open_port(
+        System.find_executable("bash"),
+        ["-c", "trap '' TERM; sleep 60 & wait"]
+      )
+
+    {:os_pid, codex_os_pid} = :erlang.port_info(codex_port, :os_pid)
+
+    on_exit(fn ->
+      SymphonyElixir.ProcessTree.terminate_port(codex_port, 500)
+    end)
+
     stale_activity_at = DateTime.add(DateTime.utc_now(), -5, :second)
     initial_state = :sys.get_state(pid)
 
@@ -1010,6 +1022,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
       last_codex_message: nil,
       last_codex_timestamp: stale_activity_at,
       last_codex_event: :notification,
+      codex_app_server_pid: Integer.to_string(codex_os_pid),
       started_at: stale_activity_at
     }
 
@@ -1024,6 +1037,7 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     state = :sys.get_state(pid)
 
     refute Process.alive?(worker_pid)
+    refute os_process_alive?(codex_os_pid)
     refute Map.has_key?(state.running, issue_id)
 
     assert %{
@@ -1037,6 +1051,13 @@ defmodule SymphonyElixir.OrchestratorStatusTest do
     remaining_ms = due_at_ms - System.monotonic_time(:millisecond)
     assert remaining_ms >= 9_500
     assert remaining_ms <= 10_500
+  end
+
+  defp os_process_alive?(pid) do
+    {_output, status} =
+      System.cmd(System.find_executable("kill"), ["-0", Integer.to_string(pid)], stderr_to_stdout: true)
+
+    status == 0
   end
 
   test "status dashboard renders offline marker to terminal" do

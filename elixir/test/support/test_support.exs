@@ -115,6 +115,17 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          runner_capability_preflight: false,
+          runner_source_repo: nil,
+          runner_reviewer_codex_home: nil,
+          runner_primary_codex_home: nil,
+          runner_required_skills: [],
+          runner_sandbox_codex_bin: nil,
+          runner_browser_backend: nil,
+          runner_browser_backend_url: nil,
+          runner_review_timeout_ms: 20_000,
+          runner_browser_timeout_ms: 15_000,
+          runner_process_cleanup_timeout_ms: 2_000,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -195,6 +206,7 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
+        runner_yaml(config),
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),
@@ -256,6 +268,30 @@ defmodule SymphonyElixir.TestSupport do
     ]
     |> Enum.reject(&(&1 in [nil, false]))
     |> Enum.join("\n")
+  end
+
+  defp runner_yaml(config) do
+    fields = [
+      {:runner_capability_preflight, "capability_preflight"},
+      {:runner_source_repo, "source_repo"},
+      {:runner_reviewer_codex_home, "reviewer_codex_home"},
+      {:runner_primary_codex_home, "primary_codex_home"},
+      {:runner_required_skills, "required_skills"},
+      {:runner_sandbox_codex_bin, "sandbox_codex_bin"},
+      {:runner_browser_backend, "browser_backend"},
+      {:runner_browser_backend_url, "browser_backend_url"},
+      {:runner_review_timeout_ms, "review_timeout_ms"},
+      {:runner_browser_timeout_ms, "browser_timeout_ms"},
+      {:runner_process_cleanup_timeout_ms, "process_cleanup_timeout_ms"}
+    ]
+
+    ["runner:" | Enum.map(fields, &runner_yaml_entry(config, &1))]
+    |> Enum.join("\n")
+  end
+
+  defp runner_yaml_entry(config, {key, name}) do
+    value = Keyword.get(config, key)
+    "  #{name}: #{yaml_value(value)}"
   end
 
   defp observability_yaml(enabled, refresh_ms, render_interval_ms) do

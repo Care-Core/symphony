@@ -34,6 +34,9 @@ codex:
   thread_sandbox: workspace-write
   turn_sandbox_policy:
     type: workspaceWrite
+runner:
+  capability_preflight: false
+  process_cleanup_timeout_ms: 2000
 ---
 
 You are working on a Linear ticket `{{ issue.identifier }}`
