@@ -175,6 +175,9 @@ defmodule SymphonyElixir.Config.Schema do
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
+      field(:input_token_limit, :integer)
+      field(:input_token_limits_by_label, :map, default: %{})
+      field(:input_token_warning_ratio, :float, default: 0.70)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -189,14 +192,65 @@ defmodule SymphonyElixir.Config.Schema do
           :turn_sandbox_policy,
           :turn_timeout_ms,
           :read_timeout_ms,
-          :stall_timeout_ms
+          :stall_timeout_ms,
+          :input_token_limit,
+          :input_token_limits_by_label,
+          :input_token_warning_ratio
         ],
         empty_values: []
       )
+      |> validate_command_not_empty()
       |> validate_required([:command])
       |> validate_number(:turn_timeout_ms, greater_than: 0)
       |> validate_number(:read_timeout_ms, greater_than: 0)
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
+      |> validate_number(:input_token_limit, greater_than: 0)
+      |> validate_number(:input_token_warning_ratio, greater_than: 0, less_than: 1)
+      |> update_change(:input_token_limits_by_label, &normalize_label_limits/1)
+      |> validate_label_limits(:input_token_limits_by_label)
+    end
+
+    defp validate_command_not_empty(changeset) do
+      validate_change(changeset, :command, fn
+        :command, "" -> [command: {"can't be blank", validation: :required}]
+        :command, _command -> []
+      end)
+    end
+
+    defp normalize_label_limits(nil), do: %{}
+
+    defp normalize_label_limits(limits) when is_map(limits) do
+      Enum.reduce(limits, %{}, fn {label, limit}, acc ->
+        Map.update(acc, normalize_label(label), limit, fn existing_limit ->
+          smallest_valid_limit(existing_limit, limit)
+        end)
+      end)
+    end
+
+    defp smallest_valid_limit(left, right)
+         when is_integer(left) and left > 0 and is_integer(right) and right > 0,
+         do: min(left, right)
+
+    defp smallest_valid_limit(left, _right) when not is_integer(left) or left <= 0, do: left
+    defp smallest_valid_limit(_left, right), do: right
+
+    defp validate_label_limits(changeset, field) do
+      validate_change(changeset, field, fn ^field, limits ->
+        Enum.flat_map(limits, fn {label, limit} ->
+          cond do
+            label == "" -> [{field, "labels must not be blank"}]
+            not is_integer(limit) or limit <= 0 -> [{field, "limits must be positive integers"}]
+            true -> []
+          end
+        end)
+      end)
+    end
+
+    defp normalize_label(label) do
+      label
+      |> to_string()
+      |> String.trim()
+      |> String.downcase()
     end
   end
 

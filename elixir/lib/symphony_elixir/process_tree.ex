@@ -2,6 +2,7 @@ defmodule SymphonyElixir.ProcessTree do
   @moduledoc false
 
   @process_group_exec ~S|POSIX::setpgid(0, 0) == 0 or die "setpgid failed: $!\n"; exec @ARGV; die "exec failed: $!\n";|
+  @probe_exec ~S|my $target = shift; exit 0 if kill 0, $target; exit 1 if $!{ESRCH}; my $errno = 0 + $!; print STDERR "process liveness probe failed: errno=$errno ($!)\n"; exit 2;|
   @poll_interval_ms 25
 
   @type command_result :: %{status: non_neg_integer(), output: binary()}
@@ -55,44 +56,58 @@ defmodule SymphonyElixir.ProcessTree do
     end
   end
 
-  @spec terminate_port(port(), pos_integer()) :: :ok
+  @spec terminate_port(port(), pos_integer()) :: :ok | {:error, term()}
   def terminate_port(port, timeout_ms) when is_port(port) and is_integer(timeout_ms) and timeout_ms > 0 do
-    case port_os_pid(port) do
-      {:ok, os_pid} -> terminate_os_process_tree(os_pid, timeout_ms)
-      :error -> :ok
-    end
+    cleanup_result =
+      case port_os_pid(port) do
+        {:ok, os_pid} -> terminate_os_process_tree(os_pid, timeout_ms)
+        :error -> :ok
+      end
 
     close_port(port)
+    cleanup_result
   end
 
-  @spec terminate_os_process_tree(pos_integer(), pos_integer()) :: :ok
+  @spec terminate_os_process_tree(pos_integer(), pos_integer()) :: :ok | {:error, term()}
   def terminate_os_process_tree(os_pid, timeout_ms)
       when is_integer(os_pid) and os_pid > 0 and is_integer(timeout_ms) and timeout_ms > 0 do
     terminate_os_process_trees([os_pid], timeout_ms)
   end
 
-  @spec terminate_os_process_trees([pos_integer()], pos_integer()) :: :ok
+  @spec terminate_os_process_trees([pos_integer()], pos_integer()) :: :ok | {:error, term()}
   def terminate_os_process_trees(os_pids, timeout_ms)
       when is_list(os_pids) and is_integer(timeout_ms) and timeout_ms > 0 do
+    terminate_os_process_trees(os_pids, timeout_ms, [])
+  end
+
+  @doc false
+  @spec terminate_os_process_trees_for_test([pos_integer()], pos_integer(), keyword()) ::
+          :ok | {:error, term()}
+  def terminate_os_process_trees_for_test(os_pids, timeout_ms, opts)
+      when is_list(os_pids) and is_integer(timeout_ms) and timeout_ms > 0 and is_list(opts) do
+    terminate_os_process_trees(os_pids, timeout_ms, opts)
+  end
+
+  defp terminate_os_process_trees(os_pids, timeout_ms, opts) do
+    descendant_fetcher = Keyword.get(opts, :descendant_fetcher, &descendant_pids/1)
+    probe = Keyword.get(opts, :probe, &probe_target/1)
+    signaler = Keyword.get(opts, :signaler, &run_kill/2)
     root_pids = os_pids |> Enum.filter(&(is_integer(&1) and &1 > 0)) |> Enum.uniq()
-    tracked_pids = root_pids |> Enum.flat_map(&[&1 | descendant_pids(&1)]) |> Enum.uniq()
+    tracked_pids = root_pids |> Enum.flat_map(&[&1 | descendant_fetcher.(&1)]) |> Enum.uniq()
     started_at_ms = System.monotonic_time(:millisecond)
     terminate_deadline_ms = started_at_ms + max(1, div(timeout_ms, 2))
     kill_deadline_ms = started_at_ms + timeout_ms
 
-    signal_process_groups(root_pids, "TERM")
-    signal_pids(Enum.reverse(tracked_pids), "TERM")
-    wait_for_exit(tracked_pids, root_pids, terminate_deadline_ms)
+    signal_process_groups(root_pids, "TERM", signaler)
+    signal_pids(Enum.reverse(tracked_pids), "TERM", signaler)
 
-    remaining_pids = Enum.filter(tracked_pids, &process_alive?/1)
-
-    if remaining_pids != [] or Enum.any?(root_pids, &process_group_alive?/1) do
-      signal_process_groups(root_pids, "KILL")
-      signal_pids(Enum.reverse(remaining_pids), "KILL")
-      wait_for_exit(remaining_pids, root_pids, kill_deadline_ms)
+    unless wait_for_exit(tracked_pids, root_pids, terminate_deadline_ms, probe) == :ok do
+      signal_process_groups(root_pids, "KILL", signaler)
+      signal_pids(Enum.reverse(tracked_pids), "KILL", signaler)
+      wait_for_exit(tracked_pids, root_pids, kill_deadline_ms, probe)
     end
 
-    :ok
+    verify_processes_absent(tracked_pids, root_pids, probe)
   end
 
   defp collect(port, deadline_ms, timeout_ms, max_output_bytes, output) do
@@ -207,43 +222,78 @@ defmodule SymphonyElixir.ProcessTree do
     end)
   end
 
-  defp wait_for_exit(tracked_pids, process_group_ids, deadline_ms) do
-    cond do
-      Enum.all?(tracked_pids, &(not process_alive?(&1))) and
-          Enum.all?(process_group_ids, &(not process_group_alive?(&1))) ->
+  defp wait_for_exit(tracked_pids, process_group_ids, deadline_ms, probe) do
+    case verify_processes_absent(tracked_pids, process_group_ids, probe) do
+      :ok ->
         :ok
 
-      System.monotonic_time(:millisecond) >= deadline_ms ->
-        :timeout
+      {:error, {:process_tree_cleanup_unconfirmed, _details}} ->
+        if System.monotonic_time(:millisecond) >= deadline_ms do
+          :timeout
+        else
+          Process.sleep(@poll_interval_ms)
+          wait_for_exit(tracked_pids, process_group_ids, deadline_ms, probe)
+        end
 
-      true ->
-        Process.sleep(@poll_interval_ms)
-        wait_for_exit(tracked_pids, process_group_ids, deadline_ms)
+      {:error, _reason} = error ->
+        error
     end
   end
 
-  defp signal_process_groups(process_group_ids, signal) do
-    Enum.each(process_group_ids, &signal_process_group(&1, signal))
+  defp verify_processes_absent(tracked_pids, process_group_ids, probe) do
+    with {:ok, alive_pids} <- alive_targets(tracked_pids, probe),
+         {:ok, alive_process_groups} <- alive_targets(Enum.map(process_group_ids, &(-&1)), probe) do
+      case {alive_pids, alive_process_groups} do
+        {[], []} ->
+          :ok
+
+        _ ->
+          {:error,
+           {:process_tree_cleanup_unconfirmed,
+            %{
+              alive_pids: alive_pids,
+              alive_process_groups: Enum.map(alive_process_groups, &abs/1)
+            }}}
+      end
+    end
   end
 
-  defp signal_process_group(process_group_id, signal) do
-    run_kill(signal, -process_group_id)
+  defp alive_targets(targets, probe) do
+    Enum.reduce_while(targets, {:ok, []}, fn target, {:ok, alive} ->
+      case probe.(target) do
+        :alive -> {:cont, {:ok, [target | alive]}}
+        :absent -> {:cont, {:ok, alive}}
+        {:error, reason} -> {:halt, {:error, {:process_tree_probe_failed, target, reason}}}
+      end
+    end)
+    |> case do
+      {:ok, alive} -> {:ok, Enum.reverse(alive)}
+      {:error, _reason} = error -> error
+    end
   end
 
-  defp signal_pids(pids, signal) do
-    Enum.each(pids, &run_kill(signal, &1))
+  defp signal_process_groups(process_group_ids, signal, signaler) do
+    Enum.each(process_group_ids, &signaler.(signal, -&1))
   end
 
-  defp process_group_alive?(process_group_id), do: kill_check(-process_group_id)
-  defp process_alive?(pid), do: kill_check(pid)
+  defp signal_pids(pids, signal, signaler) do
+    Enum.each(pids, &signaler.(signal, &1))
+  end
 
-  defp kill_check(target) do
-    case System.find_executable("kill") do
-      nil -> false
-      kill -> elem(System.cmd(kill, ["-0", Integer.to_string(target)], stderr_to_stdout: true), 1) == 0
+  defp probe_target(target) do
+    case System.find_executable("perl") do
+      nil ->
+        {:error, :probe_unavailable}
+
+      perl ->
+        case System.cmd(perl, ["-MErrno=ESRCH", "-e", @probe_exec, "--", Integer.to_string(target)], stderr_to_stdout: true) do
+          {_output, 0} -> :alive
+          {_output, 1} -> :absent
+          {output, status} -> {:error, {:probe_failed, status, output}}
+        end
     end
   rescue
-    _ -> false
+    error -> {:error, {:probe_exception, error}}
   end
 
   defp run_kill(signal, target) do

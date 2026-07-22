@@ -9,6 +9,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @token_warning_steer_id "symphony-token-budget-warning"
+  @turn_interrupt_id "symphony-turn-interrupt"
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @non_interactive_tool_input_answer "This is a non-interactive session. Operator input is unavailable."
@@ -44,7 +46,7 @@ defmodule SymphonyElixir.Codex.AppServer do
          {:ok, port} <- start_port(expanded_workspace, worker_host) do
       metadata = port_metadata(port, worker_host)
 
-      with :ok <- notify_session_started(opts, metadata),
+      with :ok <- notify_session_started(opts, Map.put(metadata, :codex_app_server_port, port)),
            {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
            {:ok, thread_id} <- do_start_session(port, expanded_workspace, session_policies) do
         {:ok,
@@ -158,6 +160,30 @@ defmodule SymphonyElixir.Codex.AppServer do
     stop_port(port, worker_host)
   end
 
+  @spec steer_turn(port(), String.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def steer_turn(port, thread_id, turn_id, instruction)
+      when is_port(port) and is_binary(thread_id) and is_binary(turn_id) and is_binary(instruction) do
+    safe_send_message(port, %{
+      "method" => "turn/steer",
+      "id" => @token_warning_steer_id,
+      "params" => %{
+        "threadId" => thread_id,
+        "turnId" => turn_id,
+        "input" => [%{"type" => "text", "text" => instruction}]
+      }
+    })
+  end
+
+  @spec interrupt_turn(port(), String.t(), String.t()) :: :ok | {:error, term()}
+  def interrupt_turn(port, thread_id, turn_id)
+      when is_port(port) and is_binary(thread_id) and is_binary(turn_id) do
+    safe_send_message(port, %{
+      "method" => "turn/interrupt",
+      "id" => @turn_interrupt_id,
+      "params" => %{"threadId" => thread_id, "turnId" => turn_id}
+    })
+  end
+
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
     expanded_workspace = Path.expand(workspace)
     expanded_root = Path.expand(Config.settings!().workspace.root)
@@ -223,9 +249,14 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp remote_launch_command(workspace) when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
-      "exec #{Config.settings!().codex.command}"
+      "printf '%s\\n' \"$$\" > .symphony-codex-app-server.pid",
+      "exec perl -MPOSIX -e #{shell_escape(remote_process_group_exec())} -- bash -lc #{shell_escape(Config.settings!().codex.command)}"
     ]
     |> Enum.join(" && ")
+  end
+
+  defp remote_process_group_exec do
+    "POSIX::setpgid(0, 0) == 0 or die \"setpgid failed: $!\\n\"; exec @ARGV; die \"exec failed: $!\\n\";"
   end
 
   defp port_metadata(port, worker_host) when is_port(port) do
@@ -371,11 +402,85 @@ defmodule SymphonyElixir.Codex.AppServer do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
-      {:ok, %{"method" => "turn/completed"} = payload} ->
+      {:ok, payload} ->
+        handle_decoded_incoming(
+          port,
+          on_message,
+          payload,
+          payload_string,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests
+        )
+
+      {:error, _reason} ->
+        handle_malformed_incoming(
+          port,
+          on_message,
+          payload_string,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests
+        )
+    end
+  end
+
+  defp handle_decoded_incoming(
+         port,
+         on_message,
+         payload,
+         payload_string,
+         timeout_ms,
+         tool_executor,
+         auto_approve_requests
+       ) do
+    case token_warning_steer_response(payload) do
+      {:ok, event, details} ->
+        emit_turn_event(on_message, event, payload, payload_string, port, details)
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+
+      :not_steer_response ->
+        handle_decoded_turn_message(
+          port,
+          on_message,
+          payload,
+          payload_string,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests
+        )
+    end
+  end
+
+  defp token_warning_steer_response(%{
+         "id" => @token_warning_steer_id,
+         "result" => result
+       }),
+       do: {:ok, :token_budget_warning_delivered, result}
+
+  defp token_warning_steer_response(%{
+         "id" => @token_warning_steer_id,
+         "error" => error
+       }),
+       do: {:ok, :token_budget_warning_unsupported, error}
+
+  defp token_warning_steer_response(_payload), do: :not_steer_response
+
+  defp handle_decoded_turn_message(
+         port,
+         on_message,
+         payload,
+         payload_string,
+         timeout_ms,
+         tool_executor,
+         auto_approve_requests
+       ) do
+    case payload do
+      %{"method" => "turn/completed"} ->
         emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
         {:ok, :turn_completed}
 
-      {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
+      %{"method" => "turn/failed", "params" => _} ->
         emit_turn_event(
           on_message,
           :turn_failed,
@@ -387,7 +492,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
         {:error, {:turn_failed, Map.get(payload, "params")}}
 
-      {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
+      %{"method" => "turn/cancelled", "params" => _} ->
         emit_turn_event(
           on_message,
           :turn_cancelled,
@@ -399,8 +504,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
         {:error, {:turn_cancelled, Map.get(payload, "params")}}
 
-      {:ok, %{"method" => method} = payload}
-      when is_binary(method) ->
+      %{"method" => method} when is_binary(method) ->
         handle_turn_method(
           port,
           on_message,
@@ -412,7 +516,7 @@ defmodule SymphonyElixir.Codex.AppServer do
           auto_approve_requests
         )
 
-      {:ok, payload} ->
+      _ ->
         emit_message(
           on_message,
           :other_message,
@@ -424,24 +528,32 @@ defmodule SymphonyElixir.Codex.AppServer do
         )
 
         receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
-
-      {:error, _reason} ->
-        log_non_json_stream_line(payload_string, "turn stream")
-
-        if protocol_message_candidate?(payload_string) do
-          emit_message(
-            on_message,
-            :malformed,
-            %{
-              payload: payload_string,
-              raw: payload_string
-            },
-            metadata_from_message(port, %{raw: payload_string})
-          )
-        end
-
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
     end
+  end
+
+  defp handle_malformed_incoming(
+         port,
+         on_message,
+         payload_string,
+         timeout_ms,
+         tool_executor,
+         auto_approve_requests
+       ) do
+    log_non_json_stream_line(payload_string, "turn stream")
+
+    if protocol_message_candidate?(payload_string) do
+      emit_message(
+        on_message,
+        :malformed,
+        %{
+          payload: payload_string,
+          raw: payload_string
+        },
+        metadata_from_message(port, %{raw: payload_string})
+      )
+    end
+
+    receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
   end
 
   defp emit_turn_event(on_message, event, payload, payload_string, port, payload_details) do
@@ -1162,6 +1274,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp send_message(port, message) do
     line = Jason.encode!(message) <> "\n"
     Port.command(port, line)
+  end
+
+  defp safe_send_message(port, message) do
+    send_message(port, message)
+    :ok
+  rescue
+    error in ArgumentError -> {:error, {:port_unavailable, error.message}}
   end
 
   defp needs_input?(method, payload)

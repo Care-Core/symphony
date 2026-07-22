@@ -41,6 +41,26 @@ defmodule SymphonyElixir.ProcessTreeTest do
     Enum.each(os_pids, fn os_pid -> refute os_process_alive?(os_pid) end)
   end
 
+  test "cleanup fails closed when tracked processes or root groups survive" do
+    assert {:error, {:process_tree_cleanup_unconfirmed, %{alive_pids: [1_234, 5_678], alive_process_groups: [1_234]}}} =
+             ProcessTree.terminate_os_process_trees_for_test([1_234], 1,
+               descendant_fetcher: fn 1_234 -> [5_678] end,
+               probe: fn _target -> :alive end,
+               signaler: fn _signal, _target -> :ok end
+             )
+  end
+
+  test "cleanup fails closed when liveness probing is unavailable or denied" do
+    for reason <- [:probe_unavailable, :eperm] do
+      assert {:error, {:process_tree_probe_failed, 1_234, ^reason}} =
+               ProcessTree.terminate_os_process_trees_for_test([1_234], 1,
+                 descendant_fetcher: fn _root_pid -> [] end,
+                 probe: fn _target -> {:error, reason} end,
+                 signaler: fn _signal, _target -> :ok end
+               )
+    end
+  end
+
   test "process group launcher validation fails when neither supported launcher exists" do
     assert {:error, {:process_group_launcher_not_found, ["missing-perl", "missing-setsid"]}} =
              ProcessTree.validate_launcher(perl: "missing-perl", setsid: "missing-setsid")

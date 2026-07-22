@@ -7,8 +7,10 @@ defmodule SymphonyElixir.Orchestrator do
   require Logger
   import Bitwise, only: [<<<: 2]
 
-  alias SymphonyElixir.{AgentRunner, Config, ProcessTree, RunnerCapabilities, StatusDashboard, Tracker, Workspace}
+  alias SymphonyElixir.{AgentRunner, Config, HoldStore, ProcessTree, RunnerCapabilities}
+  alias SymphonyElixir.Codex.AppServer
   alias SymphonyElixir.Linear.Issue
+  alias SymphonyElixir.{SSH, StatusDashboard, Tracker, Workspace}
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
@@ -38,6 +40,7 @@ defmodule SymphonyElixir.Orchestrator do
       completed: MapSet.new(),
       claimed: MapSet.new(),
       retry_attempts: %{},
+      holds: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -64,19 +67,32 @@ defmodule SymphonyElixir.Orchestrator do
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
 
-    state = %State{
-      poll_interval_ms: config.polling.interval_ms,
-      max_concurrent_agents: config.agent.max_concurrent_agents,
-      next_poll_due_at_ms: now_ms,
-      poll_check_in_progress: false,
-      tick_timer_ref: nil,
-      tick_token: nil,
-      codex_totals: @empty_codex_totals,
-      codex_rate_limits: nil
-    }
+    case HoldStore.load(config.workspace.root) do
+      {:ok, holds} ->
+        state = %State{
+          poll_interval_ms: config.polling.interval_ms,
+          max_concurrent_agents: config.agent.max_concurrent_agents,
+          next_poll_due_at_ms: now_ms,
+          poll_check_in_progress: false,
+          tick_timer_ref: nil,
+          tick_token: nil,
+          holds: holds,
+          claimed: holds |> Map.keys() |> MapSet.new(),
+          codex_totals: @empty_codex_totals,
+          codex_rate_limits: nil
+        }
 
-    run_terminal_workspace_cleanup()
-    {:ok, schedule_tick(state, 0)}
+        if map_size(holds) > 0 do
+          Logger.info("Restored durable issue holds count=#{map_size(holds)}")
+        end
+
+        run_terminal_workspace_cleanup(holds)
+        {:ok, schedule_tick(state, 0)}
+
+      {:error, reason} ->
+        Logger.error("Failed to restore durable issue holds: #{inspect(reason)}")
+        {:stop, {:hold_state_load_failed, reason}}
+    end
   end
 
   @impl true
@@ -184,6 +200,7 @@ defmodule SymphonyElixir.Orchestrator do
           |> maybe_put_runtime_value(:worker_host, runtime_info[:worker_host])
           |> maybe_put_runtime_value(:workspace_path, runtime_info[:workspace_path])
           |> maybe_put_runtime_value(:codex_app_server_pid, runtime_info[:codex_app_server_pid])
+          |> maybe_put_runtime_value(:codex_app_server_port, runtime_info[:codex_app_server_port])
           |> maybe_refresh_progress_for_runtime_info(runtime_info)
 
         notify_dashboard()
@@ -207,8 +224,17 @@ defmodule SymphonyElixir.Orchestrator do
           |> apply_codex_token_delta(token_delta)
           |> apply_codex_rate_limits(update)
 
+        state = %{state | running: Map.put(running, issue_id, updated_running_entry)}
+
+        state =
+          if token_count_update?(update) do
+            enforce_input_token_budget(state, issue_id)
+          else
+            state
+          end
+
         notify_dashboard()
-        {:noreply, %{state | running: Map.put(running, issue_id, updated_running_entry)}}
+        {:noreply, state}
     end
   end
 
@@ -239,7 +265,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp maybe_dispatch(%State{} = state) do
-    state = reconcile_running_issues(state)
+    state = state |> reconcile_running_issues() |> reconcile_held_issues()
 
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
@@ -312,6 +338,64 @@ defmodule SymphonyElixir.Orchestrator do
           state
       end
     end
+  end
+
+  defp reconcile_held_issues(%State{holds: holds} = state) when map_size(holds) == 0, do: state
+
+  defp reconcile_held_issues(%State{holds: holds} = state) do
+    issue_ids = Map.keys(holds)
+
+    case Tracker.fetch_issue_states_by_ids(issue_ids) do
+      {:ok, issues} ->
+        visible = Map.new(issues, &{&1.id, &1})
+
+        Enum.reduce(issue_ids, state, fn issue_id, state_acc ->
+          reconcile_held_issue(state_acc, issue_id, Map.get(visible, issue_id))
+        end)
+
+      {:error, reason} ->
+        Logger.debug("Failed to refresh held issue states: #{inspect(reason)}; keeping holds")
+        state
+    end
+  end
+
+  defp reconcile_held_issue(state, issue_id, %Issue{} = issue) do
+    hold = Map.fetch!(state.holds, issue_id)
+
+    cond do
+      Map.get(hold, :cleanup_pending, false) ->
+        Logger.debug("Held issue cleanup is still pending; keeping hold issue_id=#{issue_id}")
+        state
+
+      Map.has_key?(state.running, issue_id) ->
+        Logger.debug("Held issue cleanup is still pending; keeping hold issue_id=#{issue_id}")
+        state
+
+      not is_binary(issue.state) ->
+        Logger.debug("Held issue returned without a verifiable tracker state; keeping hold issue_id=#{issue_id}")
+        state
+
+      not is_binary(hold.issue_state) ->
+        updated_hold = %{hold | issue_state: issue.state}
+        persist_updated_hold(state, issue_id, updated_hold)
+
+      normalize_issue_state(issue.state) == normalize_issue_state(hold.issue_state) ->
+        state
+
+      true ->
+        Logger.info("Issue state changed while held: #{issue_context(issue)} old_state=#{inspect(hold.issue_state)} new_state=#{inspect(issue.state)}; releasing hold")
+
+        if terminal_issue_state?(issue.state, terminal_state_set()) do
+          cleanup_issue_workspace(issue.identifier, Map.get(hold, :worker_host))
+        end
+
+        release_issue_hold(state, issue_id)
+    end
+  end
+
+  defp reconcile_held_issue(state, issue_id, nil) do
+    Logger.debug("Held issue is not currently visible; keeping hold until a tracker state is verified issue_id=#{issue_id}")
+    state
   end
 
   @doc false
@@ -438,37 +522,268 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp terminate_running_issue(%State{} = state, issue_id, cleanup_workspace) do
+    case terminate_running_issue_with_result(state, issue_id, cleanup_workspace) do
+      {:ok, updated_state} ->
+        updated_state
+
+      {:error, reason, unchanged_state} ->
+        Logger.error("Failed to terminate active issue process tree issue_id=#{issue_id} reason=#{inspect(reason)}")
+        unchanged_state
+    end
+  end
+
+  defp terminate_running_issue_with_result(%State{} = state, issue_id, cleanup_workspace) do
     case Map.get(state.running, issue_id) do
       nil ->
-        release_issue_claim(state, issue_id)
+        {:ok, release_issue_claim(state, issue_id)}
 
       %{pid: pid, ref: ref, identifier: identifier} = running_entry ->
-        state = record_session_completion_totals(state, running_entry)
-        worker_host = Map.get(running_entry, :worker_host)
+        case terminate_codex_process_tree(running_entry) do
+          :ok ->
+            {:ok,
+             finalize_running_issue_termination(
+               state,
+               issue_id,
+               running_entry,
+               identifier,
+               pid,
+               ref,
+               cleanup_workspace
+             )}
 
-        if cleanup_workspace do
-          cleanup_issue_workspace(identifier, worker_host)
+          {:error, reason} ->
+            {:error, reason, state}
         end
-
-        terminate_codex_process_tree(running_entry)
-
-        if is_pid(pid) do
-          terminate_task(pid)
-        end
-
-        if is_reference(ref) do
-          Process.demonitor(ref, [:flush])
-        end
-
-        %{
-          state
-          | running: Map.delete(state.running, issue_id),
-            claimed: MapSet.delete(state.claimed, issue_id),
-            retry_attempts: Map.delete(state.retry_attempts, issue_id)
-        }
 
       _ ->
-        release_issue_claim(state, issue_id)
+        {:ok, release_issue_claim(state, issue_id)}
+    end
+  end
+
+  defp finalize_running_issue_termination(
+         state,
+         issue_id,
+         running_entry,
+         identifier,
+         pid,
+         ref,
+         cleanup_workspace
+       ) do
+    state = record_session_completion_totals(state, running_entry)
+    worker_host = Map.get(running_entry, :worker_host)
+
+    if cleanup_workspace, do: cleanup_issue_workspace(identifier, worker_host)
+    if is_pid(pid), do: terminate_task(pid)
+    if is_reference(ref), do: Process.demonitor(ref, [:flush])
+
+    %{
+      state
+      | running: Map.delete(state.running, issue_id),
+        claimed: MapSet.delete(state.claimed, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+  end
+
+  defp enforce_input_token_budget(%State{} = state, issue_id) do
+    case Map.get(state.running, issue_id) do
+      %{input_token_limit: limit, codex_input_tokens: observed} = running_entry
+      when is_integer(limit) and limit > 0 and is_integer(observed) and observed >= limit ->
+        enforce_input_token_hard_limit(state, issue_id, running_entry, limit, observed)
+
+      %{input_token_limit: limit, codex_input_tokens: observed} = running_entry
+      when is_integer(limit) and limit > 0 and is_integer(observed) ->
+        maybe_warn_input_token_budget(state, issue_id, running_entry, limit, observed)
+
+      _ ->
+        state
+    end
+  end
+
+  defp enforce_input_token_hard_limit(state, issue_id, running_entry, limit, observed) do
+    case hold_running_issue(state, issue_id, running_entry, "input_token_limit", limit, observed) do
+      {:ok, updated_state, _hold} -> updated_state
+      {:error, updated_state, _reason} -> updated_state
+    end
+  end
+
+  defp token_count_update?(%{payload: payload}) when is_map(payload) do
+    method = Map.get(payload, "method") || Map.get(payload, :method)
+
+    method in [
+      "codex/event/token_count",
+      "thread/tokenUsage/updated",
+      :token_count,
+      :thread_token_usage_updated
+    ]
+  end
+
+  defp token_count_update?(%{event: :token_count}), do: true
+  defp token_count_update?(_update), do: false
+
+  defp maybe_warn_input_token_budget(state, issue_id, running_entry, limit, observed) do
+    warning_ratio = Map.get(running_entry, :input_token_warning_ratio, 0.70)
+    warning_threshold = ceil(limit * warning_ratio)
+
+    if observed >= warning_threshold and Map.get(running_entry, :input_token_warning_sent, false) == false do
+      warning_status = steer_token_budget_warning(running_entry)
+
+      updated_entry =
+        running_entry
+        |> Map.put(:input_token_warning_sent, true)
+        |> Map.put(:input_token_warning_status, warning_status)
+
+      Logger.warning(
+        "Input-token warning threshold reached: issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} observed_tokens=#{observed} limit=#{limit} warning_ratio=#{warning_ratio} steering_status=#{warning_status}"
+      )
+
+      %{state | running: Map.put(state.running, issue_id, updated_entry)}
+    else
+      state
+    end
+  end
+
+  defp steer_token_budget_warning(running_entry) do
+    with port when is_port(port) <- Map.get(running_entry, :codex_app_server_port),
+         thread_id when is_binary(thread_id) <- Map.get(running_entry, :thread_id),
+         turn_id when is_binary(turn_id) <- Map.get(running_entry, :turn_id),
+         :ok <- AppServer.steer_turn(port, thread_id, turn_id, token_budget_warning_instruction()) do
+      "requested"
+    else
+      _ -> "unsupported"
+    end
+  end
+
+  defp token_budget_warning_instruction do
+    "Checkpoint now: update the workpad with completed work, remaining tasks, and validation status; then finish the highest-priority remaining scope concisely."
+  end
+
+  defp hold_running_issue(state, issue_id, running_entry, reason, limit, observed) do
+    hold = %{
+      issue_id: issue_id,
+      identifier: running_entry.identifier,
+      reason: reason,
+      limit: limit,
+      observed_tokens: observed,
+      issue_state: running_entry.issue.state,
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      codex_app_server_pid: durable_local_codex_os_pid(running_entry),
+      cleanup_pending: true,
+      held_at: DateTime.utc_now()
+    }
+
+    held_state = %{
+      state
+      | holds: Map.put(state.holds, issue_id, hold),
+        claimed: MapSet.put(state.claimed, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+
+    case persist_hold_state(held_state) do
+      :ok ->
+        maybe_interrupt_turn(running_entry)
+
+        held_state
+        |> terminate_running_issue_with_result(issue_id, false)
+        |> finish_running_hold_cleanup(held_state, issue_id, hold)
+
+      {:error, persist_reason} ->
+        Logger.error("Refusing to stop issue because durable hold persistence failed: issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} reason=#{inspect(persist_reason)}")
+
+        {:error, state, :hold_state_unavailable}
+    end
+  end
+
+  defp finish_running_hold_cleanup({:ok, terminated_state}, _held_state, issue_id, hold) do
+    cleanup_pending_state = %{
+      terminated_state
+      | claimed: MapSet.put(terminated_state.claimed, issue_id),
+        retry_attempts: Map.delete(terminated_state.retry_attempts, issue_id)
+    }
+
+    case mark_hold_cleanup_complete(cleanup_pending_state, issue_id, hold) do
+      {:ok, cleaned_state, cleaned_hold} ->
+        Logger.warning(
+          "Issue placed on durable internal hold: issue_id=#{issue_id} issue_identifier=#{hold.identifier} reason=#{hold.reason} observed_tokens=#{hold.observed_tokens} limit=#{inspect(hold.limit)}"
+        )
+
+        {:ok, cleaned_state, cleaned_hold}
+
+      {:error, safe_state, :hold_state_unavailable} ->
+        Logger.error("Issue cleanup completed but durable cleanup confirmation failed: issue_id=#{issue_id} issue_identifier=#{hold.identifier}; keeping cleanup pending")
+
+        {:error, safe_state, :hold_state_unavailable}
+    end
+  end
+
+  defp finish_running_hold_cleanup(
+         {:error, cleanup_reason, _unchanged_state},
+         held_state,
+         issue_id,
+         hold
+       ) do
+    Logger.error("Issue is durably held but process cleanup failed: issue_id=#{issue_id} issue_identifier=#{hold.identifier} reason=#{inspect(cleanup_reason)}")
+
+    {:error, held_state, :cleanup_failed}
+  end
+
+  defp maybe_interrupt_turn(running_entry) do
+    with port when is_port(port) <- Map.get(running_entry, :codex_app_server_port),
+         thread_id when is_binary(thread_id) <- Map.get(running_entry, :thread_id),
+         turn_id when is_binary(turn_id) <- Map.get(running_entry, :turn_id) do
+      AppServer.interrupt_turn(port, thread_id, turn_id)
+    else
+      _ -> :ok
+    end
+  end
+
+  defp release_issue_hold(%State{} = state, issue_id) do
+    candidate_state = %{
+      state
+      | holds: Map.delete(state.holds, issue_id),
+        claimed: MapSet.delete(state.claimed, issue_id)
+    }
+
+    case persist_hold_state(candidate_state) do
+      :ok ->
+        candidate_state
+
+      {:error, reason} ->
+        Logger.error("Failed to persist hold release issue_id=#{issue_id} reason=#{inspect(reason)}; keeping hold")
+        state
+    end
+  end
+
+  defp persist_updated_hold(%State{} = state, issue_id, updated_hold) do
+    candidate_state = %{state | holds: Map.put(state.holds, issue_id, updated_hold)}
+
+    case persist_hold_state(candidate_state) do
+      :ok ->
+        candidate_state
+
+      {:error, reason} ->
+        Logger.error("Failed to persist held issue tracker state issue_id=#{issue_id} reason=#{inspect(reason)}; keeping prior hold state")
+
+        state
+    end
+  end
+
+  defp persist_hold_state(%State{} = state) do
+    HoldStore.persist(Config.settings!().workspace.root, state.holds)
+  end
+
+  defp mark_hold_cleanup_complete(%State{} = state, issue_id, hold) do
+    cleaned_hold = Map.put(hold, :cleanup_pending, false)
+    candidate_state = %{state | holds: Map.put(state.holds, issue_id, cleaned_hold)}
+
+    case persist_hold_state(candidate_state) do
+      :ok ->
+        {:ok, candidate_state, cleaned_hold}
+
+      {:error, reason} ->
+        Logger.error("Failed to persist completed hold cleanup issue_id=#{issue_id} reason=#{inspect(reason)}; keeping cleanup pending")
+
+        {:error, state, :hold_state_unavailable}
     end
   end
 
@@ -502,12 +817,18 @@ defmodule SymphonyElixir.Orchestrator do
 
       next_attempt = next_retry_attempt_from_running(running_entry)
 
-      state
-      |> terminate_running_issue(issue_id, false)
-      |> schedule_issue_retry(issue_id, next_attempt, %{
-        identifier: identifier,
-        error: "stalled for #{elapsed_ms}ms without codex activity"
-      })
+      case terminate_running_issue_with_result(state, issue_id, false) do
+        {:ok, terminated_state} ->
+          schedule_issue_retry(terminated_state, issue_id, next_attempt, %{
+            identifier: identifier,
+            error: "stalled for #{elapsed_ms}ms without codex activity"
+          })
+
+        {:error, reason, unchanged_state} ->
+          Logger.error("Failed to clean up stalled issue process tree issue_id=#{issue_id} issue_identifier=#{identifier} reason=#{inspect(reason)}; keeping running state without retry")
+
+          unchanged_state
+      end
     else
       state
     end
@@ -543,20 +864,60 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp terminate_task(_pid), do: :ok
 
-  defp terminate_codex_process_tree(%{worker_host: worker_host}) when is_binary(worker_host), do: :ok
+  defp terminate_codex_process_tree(%{worker_host: worker_host, workspace_path: workspace_path})
+       when is_binary(worker_host) and is_binary(workspace_path) do
+    SSH.terminate_remote_process_tree(worker_host, workspace_path, process_cleanup_timeout_ms())
+  end
+
+  defp terminate_codex_process_tree(%{worker_host: worker_host}) when is_binary(worker_host) do
+    {:error, {:remote_process_cleanup_unavailable, worker_host, :missing_workspace_path}}
+  end
 
   defp terminate_codex_process_tree(running_entry) do
     terminate_codex_process_trees([running_entry])
   end
 
   defp terminate_codex_process_trees(running_entries) do
+    remote_results =
+      Enum.flat_map(running_entries, fn
+        %{worker_host: worker_host, workspace_path: workspace_path}
+        when is_binary(worker_host) and is_binary(workspace_path) ->
+          result =
+            SSH.terminate_remote_process_tree(
+              worker_host,
+              workspace_path,
+              process_cleanup_timeout_ms()
+            )
+
+          if match?({:error, _reason}, result) do
+            {:error, reason} = result
+            Logger.error("Remote process cleanup failed worker_host=#{worker_host} reason=#{inspect(reason)}")
+          end
+
+          [result]
+
+        _ ->
+          []
+      end)
+
     os_pids = Enum.flat_map(running_entries, &local_codex_os_pid/1)
 
-    if os_pids != [] do
-      ProcessTree.terminate_os_process_trees(os_pids, process_cleanup_timeout_ms())
-    end
+    local_results =
+      if os_pids == [] do
+        []
+      else
+        [ProcessTree.terminate_os_process_trees(os_pids, process_cleanup_timeout_ms())]
+      end
 
-    :ok
+    cleanup_results(remote_results ++ local_results)
+  end
+
+  defp cleanup_results(results) do
+    case Enum.filter(results, &match?({:error, _reason}, &1)) do
+      [] -> :ok
+      [{:error, reason}] -> {:error, reason}
+      errors -> {:error, {:process_tree_cleanup_failed, Enum.map(errors, &elem(&1, 1))}}
+    end
   end
 
   defp local_codex_os_pid(%{worker_host: worker_host}) when is_binary(worker_host), do: []
@@ -574,6 +935,13 @@ defmodule SymphonyElixir.Orchestrator do
 
       _ ->
         []
+    end
+  end
+
+  defp durable_local_codex_os_pid(running_entry) do
+    case local_codex_os_pid(running_entry) do
+      [os_pid | _] -> os_pid
+      [] -> nil
     end
   end
 
@@ -627,7 +995,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp should_dispatch_issue?(
          %Issue{} = issue,
-         %State{running: running, claimed: claimed} = state,
+         %State{running: running, claimed: claimed, holds: holds} = state,
          active_states,
          terminal_states
        ) do
@@ -635,6 +1003,7 @@ defmodule SymphonyElixir.Orchestrator do
       !todo_issue_blocked_by_non_terminal?(issue, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
       !Map.has_key?(running, issue.id) and
+      !Map.has_key?(holds, issue.id) and
       available_slots(state) > 0 and
       state_slots_available?(issue, running) and
       worker_slots_available?(state)
@@ -717,6 +1086,8 @@ defmodule SymphonyElixir.Orchestrator do
     String.downcase(String.trim(state_name))
   end
 
+  defp normalize_issue_state(_state_name), do: ""
+
   defp terminal_state_set do
     Config.settings!().tracker.terminal_states
     |> Enum.map(&normalize_issue_state/1)
@@ -792,12 +1163,19 @@ defmodule SymphonyElixir.Orchestrator do
             progress_detail: initial_progress.detail,
             progress_updated_at: started_at,
             codex_app_server_pid: nil,
+            codex_app_server_port: nil,
+            thread_id: nil,
+            turn_id: nil,
             codex_input_tokens: 0,
             codex_output_tokens: 0,
             codex_total_tokens: 0,
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
+            input_token_limit: Config.input_token_limit_for_issue(claimed_issue),
+            input_token_warning_ratio: Config.settings!().codex.input_token_warning_ratio,
+            input_token_warning_sent: false,
+            input_token_warning_status: nil,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: started_at
@@ -852,6 +1230,14 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
+    if Map.has_key?(state.holds, issue_id) do
+      state
+    else
+      do_schedule_issue_retry(state, issue_id, attempt, metadata)
+    end
+  end
+
+  defp do_schedule_issue_retry(%State{} = state, issue_id, attempt, metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
     delay_ms = retry_delay(next_attempt, metadata)
@@ -907,6 +1293,14 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
+    if Map.has_key?(state.holds, issue_id) do
+      {:noreply, state}
+    else
+      do_handle_retry_issue(state, issue_id, attempt, metadata)
+    end
+  end
+
+  defp do_handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
     case Tracker.fetch_candidate_issues() do
       {:ok, issues} ->
         issues
@@ -959,22 +1353,30 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp cleanup_issue_workspace(_identifier, _worker_host), do: :ok
 
-  defp run_terminal_workspace_cleanup do
+  defp run_terminal_workspace_cleanup(holds) when is_map(holds) do
+    held_identifiers =
+      holds
+      |> Map.values()
+      |> Enum.map(&Map.get(&1, :identifier))
+      |> MapSet.new()
+
     case Tracker.fetch_issues_by_states(Config.settings!().tracker.terminal_states) do
       {:ok, issues} ->
-        issues
-        |> Enum.each(fn
-          %Issue{identifier: identifier} when is_binary(identifier) ->
-            cleanup_issue_workspace(identifier)
-
-          _ ->
-            :ok
-        end)
+        Enum.each(issues, &cleanup_terminal_issue_workspace(&1, held_identifiers))
 
       {:error, reason} ->
         Logger.warning("Skipping startup terminal workspace cleanup; failed to fetch terminal issues: #{inspect(reason)}")
     end
   end
+
+  defp cleanup_terminal_issue_workspace(%Issue{identifier: identifier}, held_identifiers)
+       when is_binary(identifier) do
+    unless MapSet.member?(held_identifiers, identifier) do
+      cleanup_issue_workspace(identifier)
+    end
+  end
+
+  defp cleanup_terminal_issue_workspace(_issue, _held_identifiers), do: :ok
 
   defp notify_dashboard do
     StatusDashboard.notify_update()
@@ -1122,6 +1524,97 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
+  defp call_control(server, message) do
+    GenServer.call(server, message, 15_000)
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
+
+  defp find_known_issue_id(%State{} = state, issue_identifier) do
+    find_issue_id_by_identifier(state.running, issue_identifier) ||
+      find_issue_id_by_identifier(state.retry_attempts, issue_identifier) ||
+      find_issue_id_by_identifier(state.holds, issue_identifier)
+  end
+
+  defp find_hold_by_identifier(holds, issue_identifier) do
+    Enum.find(holds, fn {_issue_id, hold} ->
+      same_identifier?(Map.get(hold, :identifier), issue_identifier)
+    end)
+  end
+
+  defp find_issue_id_by_identifier(entries, issue_identifier) do
+    Enum.find_value(entries, fn {issue_id, entry} ->
+      if same_identifier?(Map.get(entry, :identifier), issue_identifier), do: issue_id
+    end)
+  end
+
+  defp same_identifier?(left, right) when is_binary(left) and is_binary(right) do
+    String.downcase(left) == String.downcase(right)
+  end
+
+  defp same_identifier?(_left, _right), do: false
+
+  defp stop_known_issue(%State{} = state, issue_id) do
+    cond do
+      running_entry = Map.get(state.running, issue_id) ->
+        observed = Map.get(running_entry, :codex_input_tokens, 0)
+        hold_running_issue(state, issue_id, running_entry, "manual_stop", nil, observed)
+
+      retry_entry = Map.get(state.retry_attempts, issue_id) ->
+        stop_retrying_issue(state, issue_id, retry_entry)
+
+      match?(%{cleanup_pending: true}, Map.get(state.holds, issue_id)) ->
+        {:error, state, :cleanup_failed}
+
+      hold = Map.get(state.holds, issue_id) ->
+        {:ok, state, hold}
+    end
+  end
+
+  defp stop_retrying_issue(state, issue_id, retry_entry) do
+    hold = %{
+      issue_id: issue_id,
+      identifier: retry_entry.identifier,
+      reason: "manual_stop",
+      limit: nil,
+      observed_tokens: 0,
+      issue_state: held_issue_state(issue_id),
+      worker_host: Map.get(retry_entry, :worker_host),
+      workspace_path: Map.get(retry_entry, :workspace_path),
+      codex_app_server_pid: nil,
+      cleanup_pending: false,
+      held_at: DateTime.utc_now()
+    }
+
+    held_state = %{
+      state
+      | holds: Map.put(state.holds, issue_id, hold),
+        claimed: MapSet.put(state.claimed, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+
+    case persist_hold_state(held_state) do
+      :ok ->
+        if is_reference(Map.get(retry_entry, :timer_ref)) do
+          Process.cancel_timer(retry_entry.timer_ref)
+        end
+
+        {:ok, held_state, hold}
+
+      {:error, reason} ->
+        Logger.error("Failed to persist retry hold issue_id=#{issue_id} issue_identifier=#{retry_entry.identifier} reason=#{inspect(reason)}")
+
+        {:error, state, :hold_state_unavailable}
+    end
+  end
+
+  defp held_issue_state(issue_id) do
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
+      {:ok, [%Issue{state: state} | _]} -> state
+      _ -> nil
+    end
+  end
+
   defp find_issue_id_for_ref(running, ref) do
     running
     |> Enum.find_value(fn {issue_id, %{ref: running_ref}} ->
@@ -1153,11 +1646,29 @@ defmodule SymphonyElixir.Orchestrator do
 
   @spec request_refresh(GenServer.server()) :: map() | :unavailable
   def request_refresh(server) do
-    if Process.whereis(server) do
-      GenServer.call(server, :request_refresh)
-    else
-      :unavailable
-    end
+    GenServer.call(server, :request_refresh)
+  catch
+    :exit, _ -> :unavailable
+  end
+
+  @spec stop_issue(String.t()) ::
+          {:ok, map()} | {:error, :issue_not_found | :unavailable | :cleanup_failed | :hold_state_unavailable}
+  def stop_issue(issue_identifier), do: stop_issue(issue_identifier, __MODULE__)
+
+  @spec stop_issue(String.t(), GenServer.server()) ::
+          {:ok, map()} | {:error, :issue_not_found | :unavailable | :cleanup_failed | :hold_state_unavailable}
+  def stop_issue(issue_identifier, server) when is_binary(issue_identifier) do
+    call_control(server, {:stop_issue, issue_identifier})
+  end
+
+  @spec resume_issue(String.t()) ::
+          {:ok, map()} | {:error, :issue_not_found | :unavailable | :cleanup_failed | :hold_state_unavailable}
+  def resume_issue(issue_identifier), do: resume_issue(issue_identifier, __MODULE__)
+
+  @spec resume_issue(String.t(), GenServer.server()) ::
+          {:ok, map()} | {:error, :issue_not_found | :unavailable | :cleanup_failed | :hold_state_unavailable}
+  def resume_issue(issue_identifier, server) when is_binary(issue_identifier) do
+    call_control(server, {:resume_issue, issue_identifier})
   end
 
   @spec snapshot() :: map() | :timeout | :unavailable
@@ -1165,16 +1676,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   @spec snapshot(GenServer.server(), timeout()) :: map() | :timeout | :unavailable
   def snapshot(server, timeout) do
-    if Process.whereis(server) do
-      try do
-        GenServer.call(server, :snapshot, timeout)
-      catch
-        :exit, {:timeout, _} -> :timeout
-        :exit, _ -> :unavailable
-      end
-    else
-      :unavailable
-    end
+    GenServer.call(server, :snapshot, timeout)
+  catch
+    :exit, {:timeout, _} -> :timeout
+    :exit, _ -> :unavailable
   end
 
   @impl true
@@ -1200,12 +1705,32 @@ defmodule SymphonyElixir.Orchestrator do
           codex_input_tokens: metadata.codex_input_tokens,
           codex_output_tokens: metadata.codex_output_tokens,
           codex_total_tokens: metadata.codex_total_tokens,
+          input_token_limit: Map.get(metadata, :input_token_limit),
+          input_token_warning_ratio: Map.get(metadata, :input_token_warning_ratio),
+          input_token_warning_status: Map.get(metadata, :input_token_warning_status),
           turn_count: Map.get(metadata, :turn_count, 0),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
           last_codex_message: metadata.last_codex_message,
           last_codex_event: metadata.last_codex_event,
           runtime_seconds: running_seconds(metadata.started_at, now)
+        }
+      end)
+
+    held =
+      state.holds
+      |> Enum.map(fn {_issue_id, hold} ->
+        %{
+          issue_id: hold.issue_id,
+          identifier: hold.identifier,
+          reason: hold.reason,
+          limit: hold.limit,
+          observed_tokens: hold.observed_tokens,
+          issue_state: hold.issue_state,
+          worker_host: Map.get(hold, :worker_host),
+          workspace_path: Map.get(hold, :workspace_path),
+          cleanup_pending: Map.get(hold, :cleanup_pending, false),
+          held_at: hold.held_at
         }
       end)
 
@@ -1227,6 +1752,7 @@ defmodule SymphonyElixir.Orchestrator do
      %{
        running: running,
        retrying: retrying,
+       held: held,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1252,6 +1778,68 @@ defmodule SymphonyElixir.Orchestrator do
      }, state}
   end
 
+  def handle_call({:stop_issue, issue_identifier}, _from, state) do
+    case find_known_issue_id(state, issue_identifier) do
+      nil ->
+        {:reply, {:error, :issue_not_found}, state}
+
+      issue_id ->
+        case stop_known_issue(state, issue_id) do
+          {:ok, updated_state, hold} -> {:reply, {:ok, hold}, updated_state}
+          {:error, updated_state, reason} -> {:reply, {:error, reason}, updated_state}
+        end
+    end
+  end
+
+  def handle_call({:resume_issue, issue_identifier}, _from, state) do
+    case find_hold_by_identifier(state.holds, issue_identifier) do
+      nil ->
+        {:reply, {:error, :issue_not_found}, state}
+
+      {issue_id, hold} ->
+        resume_held_issue(state, issue_id, hold)
+    end
+  end
+
+  defp resume_held_issue(%State{running: running} = state, issue_id, _hold)
+       when is_map_key(running, issue_id) do
+    {:reply, {:error, :cleanup_failed}, state}
+  end
+
+  defp resume_held_issue(state, issue_id, %{cleanup_pending: true} = hold) do
+    case terminate_codex_process_tree(hold) do
+      :ok ->
+        case mark_hold_cleanup_complete(state, issue_id, hold) do
+          {:ok, cleaned_state, cleaned_hold} -> resume_cleaned_hold(cleaned_state, issue_id, cleaned_hold)
+          {:error, safe_state, reason} -> {:reply, {:error, reason}, safe_state}
+        end
+
+      {:error, reason} ->
+        Logger.error("Failed to complete pending hold cleanup issue_id=#{issue_id} reason=#{inspect(reason)}; keeping hold")
+        {:reply, {:error, :cleanup_failed}, state}
+    end
+  end
+
+  defp resume_held_issue(state, issue_id, hold) do
+    resume_cleaned_hold(state, issue_id, hold)
+  end
+
+  defp resume_cleaned_hold(state, issue_id, hold) do
+    state
+    |> release_issue_hold(issue_id)
+    |> finish_hold_resume(issue_id, hold)
+  end
+
+  defp finish_hold_resume(%State{holds: holds} = state, issue_id, _hold)
+       when is_map_key(holds, issue_id) do
+    {:reply, {:error, :hold_state_unavailable}, state}
+  end
+
+  defp finish_hold_resume(state, issue_id, hold) do
+    updated_state = schedule_tick(state, 0)
+    {:reply, {:ok, %{issue_id: issue_id, identifier: hold.identifier, resumed: true}}, updated_state}
+  end
+
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do
     token_delta = extract_token_delta(running_entry, update)
     summarized_update = summarize_codex_update(update)
@@ -1270,6 +1858,8 @@ defmodule SymphonyElixir.Orchestrator do
         last_codex_timestamp: timestamp,
         last_codex_message: summarized_update,
         session_id: session_id_for_update(running_entry.session_id, update),
+        thread_id: runtime_id_for_update(Map.get(running_entry, :thread_id), update, :thread_id),
+        turn_id: runtime_id_for_update(Map.get(running_entry, :turn_id), update, :turn_id),
         last_codex_event: event,
         progress_phase: Map.get(progress_update || %{}, :phase, Map.get(running_entry, :progress_phase)),
         progress_detail: Map.get(progress_update || %{}, :detail, Map.get(running_entry, :progress_detail)),
@@ -1281,6 +1871,7 @@ defmodule SymphonyElixir.Orchestrator do
         codex_last_reported_input_tokens: max(last_reported_input, token_delta.input_reported),
         codex_last_reported_output_tokens: max(last_reported_output, token_delta.output_reported),
         codex_last_reported_total_tokens: max(last_reported_total, token_delta.total_reported),
+        input_token_warning_status: warning_status_for_update(Map.get(running_entry, :input_token_warning_status), event),
         turn_count: turn_count_for_update(turn_count, running_entry.session_id, update)
       }),
       token_delta
@@ -1304,6 +1895,17 @@ defmodule SymphonyElixir.Orchestrator do
     do: session_id
 
   defp session_id_for_update(existing, _update), do: existing
+
+  defp runtime_id_for_update(existing, update, key) do
+    case Map.get(update, key) do
+      value when is_binary(value) -> value
+      _ -> existing
+    end
+  end
+
+  defp warning_status_for_update(_existing, :token_budget_warning_delivered), do: "delivered"
+  defp warning_status_for_update(_existing, :token_budget_warning_unsupported), do: "unsupported"
+  defp warning_status_for_update(existing, _event), do: existing
 
   defp turn_count_for_update(existing_count, existing_session_id, %{
          event: :session_started,

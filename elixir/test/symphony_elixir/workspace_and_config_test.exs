@@ -1116,6 +1116,48 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
            ]
   end
 
+  test "codex schema normalizes and validates input token budgets" do
+    valid_changeset =
+      Codex.changeset(%Codex{}, %{
+        input_token_limit: 1_000,
+        input_token_warning_ratio: 0.8,
+        input_token_limits_by_label: %{" Backend " => 800, "backend" => 500, :urgent => 250}
+      })
+
+    assert valid_changeset.valid?
+
+    assert Changeset.apply_changes(valid_changeset).input_token_limits_by_label == %{
+             "backend" => 500,
+             "urgent" => 250
+           }
+
+    nil_label_limits =
+      %Codex{}
+      |> Codex.changeset(%{input_token_limits_by_label: nil})
+      |> Changeset.apply_changes()
+      |> Map.fetch!(:input_token_limits_by_label)
+
+    assert nil_label_limits == %{}
+
+    invalid_changeset =
+      Codex.changeset(%Codex{}, %{
+        input_token_limits_by_label: %{" " => 1, " backend" => 0, "backend" => -1}
+      })
+
+    refute invalid_changeset.valid?
+
+    assert invalid_changeset.errors == [
+             input_token_limits_by_label: {"labels must not be blank", []},
+             input_token_limits_by_label: {"limits must be positive integers", []}
+           ]
+
+    right_invalid_changeset =
+      Codex.changeset(%Codex{}, %{input_token_limits_by_label: %{" backend" => 1, "backend" => -1}})
+
+    refute right_invalid_changeset.valid?
+    assert right_invalid_changeset.errors == [input_token_limits_by_label: {"limits must be positive integers", []}]
+  end
+
   test "schema parse normalizes policy keys and env-backed fallbacks" do
     missing_workspace_env = "SYMP_MISSING_WORKSPACE_#{System.unique_integer([:positive])}"
     empty_secret_env = "SYMP_EMPTY_SECRET_#{System.unique_integer([:positive])}"

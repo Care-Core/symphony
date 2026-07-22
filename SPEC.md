@@ -250,7 +250,8 @@ Fields:
 
 #### 4.1.8 Orchestrator Runtime State
 
-Single authoritative in-memory state owned by the orchestrator.
+Single authoritative runtime state owned by the orchestrator. Holds are additionally persisted so
+they remain authoritative across process restarts.
 
 Fields:
 
@@ -259,6 +260,11 @@ Fields:
 - `running` (map `issue_id -> running entry`)
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
+- `holds` (map `issue_id -> HoldEntry`)
+  - Hold entries include identifier, reason, effective limit (nullable for manual stops), observed
+    input tokens, tracker state at hold time, workspace/worker metadata, and hold timestamp.
+  - The map is restored from an atomically replaced owner-only file under the configured workspace
+    root. Corrupt, insecure, or unreadable hold state aborts startup rather than dropping holds.
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
 - `codex_totals` (aggregate tokens + runtime seconds)
 - `codex_rate_limits` (latest rate-limit snapshot from agent events)
@@ -429,6 +435,17 @@ fields locally if they want stricter startup checks.
   - Default: `codex app-server`
   - The runtime launches this command via `bash -lc` in the workspace directory.
   - The launched process must speak a compatible app-server protocol over stdio.
+- `input_token_limit` (positive integer, optional)
+  - Default: absent (budget enforcement disabled unless a label limit applies).
+  - Sets the default cumulative input-token limit for one worker run, including continuation turns
+    on the same app-server thread.
+- `input_token_limits_by_label` (map `label_name -> positive integer`)
+  - Default: empty map.
+  - Label keys are trimmed and lowercased. Issue labels are matched case-insensitively.
+  - The effective limit is the smallest positive value among the default and every matching label.
+- `input_token_warning_ratio` (number greater than `0` and less than `1`)
+  - Default: `0.70`.
+  - The warning threshold is the ceiling of `effective_limit * ratio`.
 - `approval_policy` (Codex `AskForApproval` value)
   - Default: implementation-defined.
 - `thread_sandbox` (Codex `SandboxMode` value)
@@ -579,6 +596,10 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `codex.turn_timeout_ms`: integer, default `3600000`
 - `codex.read_timeout_ms`: integer, default `5000`
 - `codex.stall_timeout_ms`: integer, default `300000`
+- `codex.input_token_limit`: positive integer, optional; absent means disabled
+- `codex.input_token_limits_by_label`: map of label names to positive integers, default `{}`;
+  labels are matched case-insensitively and the smallest applicable limit wins
+- `codex.input_token_warning_ratio`: number greater than `0` and less than `1`, default `0.70`
 - `runner.capability_preflight` (extension): boolean, default `false`; when enabled, startup must
   complete the local runner capability contract before polling or claims
 - `runner.source_repo` (extension): absolute path or `$VAR`; working directory for the review
@@ -598,8 +619,9 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `runner.review_timeout_ms` (extension): positive integer, default `20000`
 - `runner.browser_timeout_ms` (extension): positive integer, default `15000`
 - `runner.process_cleanup_timeout_ms` (extension): integer from `1` through `4000`, default `2000`;
-  all local app-server process groups share this one cleanup window so shutdown remains within the
-  worker's OTP shutdown budget
+  local app-server process groups and remote SSH cleanup use this deadline so shutdown remains
+  bounded within the worker's OTP shutdown budget. An SSH subprocess is terminated at expiry, and
+  timeout or non-zero cleanup results are surfaced as failures.
 - `server.port` (extension): integer, optional; enables the optional HTTP server, `0` may be used
   for ephemeral local bind, and CLI `--port` overrides it
 
@@ -622,6 +644,13 @@ claim state.
 
 3. `Running`
    - Worker task exists and the issue is tracked in `running` map.
+
+4. `Held`
+   - A manual stop or input-token hard limit has stopped the worker without deleting its workspace.
+   - Held issues are excluded from dispatch and retry scheduling.
+   - A tracker state change may release a hold only when cleanup is not pending. A
+     `cleanup_pending` hold survives tracker changes and explicit resume releases it only after
+     cleanup is confirmed from stored process proof.
 
 4. `RetryQueued`
    - Worker is not running, but a retry timer exists in `retry_attempts`.
@@ -1079,6 +1108,32 @@ Important emitted events may include:
 - `other_message`
 - `malformed`
 
+### 10.4.1 Input-Token Budget Control
+
+When an effective limit is configured for a run, the orchestrator uses cumulative input-token
+counts from legacy `codex/event/token_count` events and modern `thread/tokenUsage/updated`
+notifications as the authoritative measurement.
+
+- On the first event at or above the warning threshold but below the hard limit, send one concise
+  checkpoint instruction to the live turn with the app-server `turn/steer` method.
+- Record warning delivery as requested until the protocol responds. A successful response may be
+  recorded as delivered. A missing live turn/control channel, rejected method, or incompatible
+  app-server must be recorded as unsupported; implementations must not report successful steering
+  without protocol evidence.
+- On an event at the exact hard limit or above, interrupt/cancel the live turn, terminate its
+  app-server process tree with the normal bounded cleanup mechanism, preserve its workspace, and
+  create a durable internal hold before cleanup begins. A remote cleanup timeout or failure must
+  return an error while preserving the real durable hold with `cleanup_pending: true`.
+- Manual and token-budget stops must not mutate the issue tracker and must not run workspace-removal
+  hooks. Existing terminal-state cleanup behavior remains unchanged.
+- A held issue cannot be dispatched or retried. Persist holds atomically in private storage under
+  the configured workspace root and restore them before polling or startup workspace cleanup.
+  A hold whose cleanup is complete may be released after a fetched tracker state verifiably differs
+  from the stored state or after an authenticated local resume request. A `cleanup_pending` hold
+  survives tracker changes; explicit resume must retry cleanup from stored local or remote process
+  proof and release the hold only after cleanup is confirmed. Missing/unreadable tracker results
+  keep every hold.
+
 ### 10.5 Approval, Tool Calls, and User Input Policy
 
 Approval, sandbox, and user-input behavior is implementation-defined.
@@ -1455,7 +1510,8 @@ Minimum endpoints:
       "generated_at": "2026-02-24T20:15:30Z",
       "counts": {
         "running": 2,
-        "retrying": 1
+        "retrying": 1,
+        "held": 1
       },
       "running": [
         {
@@ -1482,6 +1538,16 @@ Minimum endpoints:
           "attempt": 3,
           "due_at": "2026-02-24T20:16:00Z",
           "error": "no available orchestrator slots"
+        }
+      ],
+      "held": [
+        {
+          "issue_id": "ghi789",
+          "issue_identifier": "MT-651",
+          "reason": "input_token_limit",
+          "limit": 120000,
+          "observed_tokens": 120000,
+          "issue_state": "In Progress"
         }
       ],
       "codex_totals": {
@@ -1526,6 +1592,7 @@ Minimum endpoints:
         }
       },
       "retry": null,
+      "hold": null,
       "logs": {
         "codex_session_logs": [
           {
@@ -1565,11 +1632,33 @@ Minimum endpoints:
     }
     ```
 
+- `POST /api/v1/<issue_identifier>/stop`
+  - Loopback callers only, with `X-Symphony-Control-Token` matching a non-empty env-backed control
+    secret. Stop a known running issue or queued retry and place it on an internal
+    manual hold without deleting its workspace or mutating the tracker.
+  - A running stop must not respond until the issue has left the `running` map and its process tree
+    has been confirmed stopped within the configured bounded cleanup window. A remote cleanup
+    timeout or failure returns `503 cleanup_failed` while preserving the durable hold with
+    `cleanup_pending: true`.
+  - Return `404 issue_not_found` when the identifier is absent from running, retry, and hold state.
+
+- `POST /api/v1/<issue_identifier>/resume`
+  - Loopback callers only, with `X-Symphony-Control-Token` matching a non-empty env-backed control
+    secret. For a `cleanup_pending` hold, retry cleanup from stored process proof and clear the hold
+    only after cleanup is confirmed; then queue an immediate poll.
+  - Return `404 issue_not_found` when the identifier is not currently held.
+
+Control endpoint requests received from a non-loopback peer must be rejected. The implementation
+must require a non-empty environment-backed control secret for loopback control requests; missing
+configuration should fail closed. These endpoints must not be treated as remotely safe merely because
+other observability routes are exposed.
+
 API design notes:
 
 - The JSON shapes above are the recommended baseline for interoperability and debugging ergonomics.
 - Implementations may add fields, but should avoid breaking existing fields within a version.
-- Endpoints should be read-only except for operational triggers like `/refresh`.
+- Endpoints should be read-only except for operational triggers like `/refresh`, `/stop`, and
+  `/resume`.
 - Unsupported methods on defined routes should return `405 Method Not Allowed`.
 - API errors should use a JSON envelope such as `{"error":{"code":"...","message":"..."}}`.
 - If the dashboard is a client-side app, it should consume this API rather than duplicating state
@@ -1653,6 +1742,9 @@ Operators can control behavior by:
 - Changing issue states in the tracker:
   - terminal state -> running session is stopped and workspace cleaned when reconciled
   - non-active state -> running session is stopped without cleanup
+- Calling the loopback-only stop/resume endpoints when the optional HTTP extension is enabled.
+  Manual stop preserves the workspace and creates an internal hold. A cleanup-pending hold survives
+  tracker changes; resume confirms cleanup from stored process proof before clearing it.
 - Restarting the service for process recovery or deployment (not as the normal path for applying
   workflow config changes).
 
@@ -2048,6 +2140,13 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Retry backoff cap uses configured `agent.max_retry_backoff_ms`
 - Retry queue entries include attempt, due time, identifier, and error
 - Stall detection kills stalled sessions and schedules retry
+- Input-token warning threshold crossing sends at most one checkpoint steer request per run
+- Exact input-token limit crossing interrupts the run, terminates its process tree, preserves its
+  workspace, and creates a hold without scheduling a retry
+- Held issues are excluded from polling dispatch and retry timers
+- Tracker-state changes cannot release cleanup-pending holds; explicit resume confirms cleanup from
+  stored process proof before releasing them
+- Manual stop/resume controls return unknown-issue errors and preserve workspaces
 - Slot exhaustion requeues retries with explicit error reason
 - If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate
   limits
@@ -2061,6 +2160,7 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
   app-server protocol
 - Policy-related startup payloads use the implementation's documented approval/sandbox settings
 - `thread/start` and `turn/start` parse nested IDs and emit `session_started`
+- `turn/steer` warning responses distinguish delivered from unsupported steering
 - Request/response read timeout is enforced
 - Turn timeout is enforced
 - Partial JSON lines are buffered until newline

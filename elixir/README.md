@@ -104,6 +104,12 @@ agent:
   max_turns: 20
 codex:
   command: codex app-server
+  # Optional per-run input-token budget. Omit to disable.
+  input_token_limit: 200000
+  input_token_limits_by_label:
+    expensive: 120000
+    urgent: 80000
+  input_token_warning_ratio: 0.70
 ---
 
 You are working on a Linear issue {{ issue.identifier }}.
@@ -125,6 +131,22 @@ Notes:
   Symphony validation.
 - `agent.max_turns` caps how many back-to-back Codex turns Symphony will run in a single agent
   invocation when a turn completes normally but the issue is still in an active state. Default: `20`.
+- Input-token budgets are opt-in. `codex.input_token_limit` sets the default positive per-run limit;
+  `codex.input_token_limits_by_label` supplies lower positive limits for matching issue labels. Label
+  matching is case-insensitive, and the smallest configured limit wins when several labels match.
+  `codex.input_token_warning_ratio` defaults to `0.70` and must be greater than `0` and less than
+  `1`.
+- On the first warning-threshold crossing, Symphony asks an active app-server turn to checkpoint via
+  `turn/steer`. The state/API reports `requested`, `delivered`, or `unsupported`; older app-server
+  versions that reject steering are reported as unsupported rather than as a successful warning.
+- At the exact input-token limit or above, Symphony interrupts the turn, terminates the app-server
+  process tree locally or on its SSH worker, preserves the workspace, and puts the issue on a
+  durable internal hold. Holds are atomically stored with owner-only permissions in
+  `<workspace.root>/.symphony-holds.json` and restored before polling after a restart. A held issue
+  is not retried or polled into another run until a fetched tracker state verifiably changes or the
+  authenticated local resume control is used; missing tracker results keep the hold. Corrupt,
+  insecure, or unreadable hold state fails startup closed. Manual and token-budget stops do not
+  mutate Linear.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -153,7 +175,10 @@ codex:
 - If a later reload fails, Symphony keeps running with the last known good workflow and logs the
   reload error until the file is fixed.
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
-  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
+  `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`. The existing loopback
+  service also exposes `POST /api/v1/<issue_identifier>/stop` and `/resume`; these control endpoints
+  reject non-loopback callers and require the `X-Symphony-Control-Token` header to match the
+  `SYMPHONY_CONTROL_TOKEN` environment secret.
 
 ### Hardened local runner capability profile
 
@@ -210,7 +235,9 @@ Runner contract:
 - Local app-server commands run in their own process group. Normal shutdown, startup failure, turn
   timeout, and orchestrator stall restart terminate the recorded process tree with a bounded
   shared TERM-to-KILL cleanup window controlled by `process_cleanup_timeout_ms` (maximum 4000ms).
-  The process group uses Perl on macOS or `setsid` on Linux.
+  The process group uses Perl on macOS or `setsid` on Linux. Remote cleanup uses the same deadline,
+  kills its SSH subprocess on expiry, and surfaces timeouts or non-zero exits; Symphony will not
+  report a successful hold when the remote run could still be active.
 
 Set `SYMPHONY_REAL_CODEX_BIN` directly for new installations. The legacy normalization exists so an
 older `SYMPHONY_CODEX_BIN=/custom/path/codex` configuration cannot bypass the wrapper.
@@ -223,6 +250,19 @@ The observability UI now runs on a minimal Phoenix stack:
 - JSON API for operational debugging under `/api/v1/*`
 - Bandit as the HTTP server
 - Phoenix dependency static assets for the LiveView client bootstrap
+
+Operational control endpoints:
+
+- `POST /api/v1/<issue_identifier>/stop` waits until a known running issue has left `running`, then
+  returns its hold details. It also converts a known queued retry into a hold. The workspace is
+  preserved. Remote cleanup timeout/failure returns `503 cleanup_failed`; the durable hold remains
+  active with `cleanup_pending: true` and cannot be released by tracker changes.
+- `POST /api/v1/<issue_identifier>/resume` retries any pending cleanup from stored process proof,
+  clears the hold only after cleanup is confirmed, and queues an immediate poll.
+- Set a non-empty `SYMPHONY_CONTROL_TOKEN` environment secret before using either endpoint and send
+  it in `X-Symphony-Control-Token`. Missing configuration returns `503`; a missing or invalid token
+  returns `401`. Unknown issue identifiers return `404`. Both endpoints are loopback-only and never
+  mutate the tracker.
 
 ## Project Layout
 
