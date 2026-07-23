@@ -137,8 +137,14 @@ Notes:
   `codex.input_token_warning_ratio` defaults to `0.70` and must be greater than `0` and less than
   `1`.
 - On the first warning-threshold crossing, Symphony asks an active app-server turn to checkpoint via
-  `turn/steer`. The state/API reports `requested`, `delivered`, or `unsupported`; older app-server
-  versions that reject steering are reported as unsupported rather than as a successful warning.
+  `turn/steer`. The state/API reports `requested` or `delivered`. A missing control channel, rejected
+  response, or five-second acknowledgement timeout creates an `input_token_warning_unsupported`
+  hold before the hard limit. If the hold-state write fails, Symphony still interrupts the run,
+  quarantines it in memory, pauses new dispatches, and retries persistence once per second before
+  allowing dispatch to resume. The acknowledgement deadline pauses while Symphony's protocol reader
+  is synchronously executing a client tool, then restarts when response processing resumes. A worker
+  exit with acknowledgement still pending becomes a hold instead of a retry, and dispatch stays
+  paused until both persistence and any quarantined process cleanup recover.
 - At the exact input-token limit or above, Symphony interrupts the turn, terminates the app-server
   process tree locally or on its SSH worker, preserves the workspace, and puts the issue on a
   durable internal hold. Holds are atomically stored with owner-only permissions in

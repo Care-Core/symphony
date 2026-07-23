@@ -168,7 +168,7 @@ defmodule SymphonyElixir.Codex.AppServer do
       "id" => @token_warning_steer_id,
       "params" => %{
         "threadId" => thread_id,
-        "turnId" => turn_id,
+        "expectedTurnId" => turn_id,
         "input" => [%{"type" => "text", "text" => instruction}]
       }
     })
@@ -675,6 +675,13 @@ defmodule SymphonyElixir.Codex.AppServer do
        ) do
     tool_name = tool_call_name(params)
     arguments = tool_call_arguments(params)
+
+    emit_message(
+      on_message,
+      :tool_call_started,
+      %{payload: payload, raw: payload_string},
+      metadata
+    )
 
     result =
       tool_name
