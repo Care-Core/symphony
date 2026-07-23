@@ -37,6 +37,10 @@ defmodule SymphonyElixir.TokenBudgetTest do
     write_workflow_file!(Workflow.workflow_file_path(), codex_input_token_warning_ratio: 1.0)
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.input_token_warning_ratio"
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_input_token_checkpoint_grace: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.input_token_checkpoint_grace"
   end
 
   test "warning threshold with no live steering channel creates a durable hold" do
@@ -202,6 +206,7 @@ defmodule SymphonyElixir.TokenBudgetTest do
              Orchestrator.snapshot(pid, 1_000).running
 
     assert Orchestrator.snapshot(pid, 1_000).held == []
+    refute GenServer.call(pid, {:continue_after_turn, issue.id})
     assert Process.alive?(worker_pid)
   end
 
@@ -453,7 +458,7 @@ defmodule SymphonyElixir.TokenBudgetTest do
     refute Process.alive?(worker_pid)
   end
 
-  test "a delivered steering response keeps the checkpointed run active" do
+  test "a delivered warning permits the checkpoint turn to finish and then holds" do
     {pid, issue, worker_pid} = start_budget_orchestrator("delivered-warning", 100)
     command = "while IFS= read -r _line; do :; done"
     {:ok, codex_port} = ProcessTree.open_port(System.find_executable("sh"), ["-c", command])
@@ -484,6 +489,83 @@ defmodule SymphonyElixir.TokenBudgetTest do
 
     assert Orchestrator.snapshot(pid, 1_000).held == []
     assert Process.alive?(worker_pid)
+
+    running_ref = :sys.get_state(pid).running[issue.id].ref
+    send(pid, {:DOWN, running_ref, :process, worker_pid, :normal})
+
+    assert_eventually(fn ->
+      match?(
+        [%{reason: "input_token_checkpoint", warning_threshold: 70}],
+        Orchestrator.snapshot(pid, 1_000).held
+      )
+    end)
+  end
+
+  test "checkpoint grace fails closed after the configured additional allowance" do
+    {pid, issue, worker_pid} = start_budget_orchestrator("checkpoint-grace", 2_000_000)
+    command = "while IFS= read -r _line; do :; done"
+    {:ok, codex_port} = ProcessTree.open_port(System.find_executable("sh"), ["-c", command])
+
+    put_running_entry(pid, issue, worker_pid,
+      input_token_limit: 2_000_000,
+      input_token_checkpoint_grace: 500_000,
+      codex_app_server_port: codex_port,
+      thread_id: "thread-warning",
+      turn_id: "turn-warning"
+    )
+
+    send_token_update(pid, issue.id, 1_400_000)
+
+    send(
+      pid,
+      {:codex_worker_update, issue.id,
+       %{
+         event: :token_budget_warning_delivered,
+         payload: %{"turnId" => "turn-warning"},
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    send_token_update(pid, issue.id, 1_900_000)
+
+    assert [%{reason: "input_token_checkpoint_grace", observed_tokens: 1_900_000}] =
+             Orchestrator.snapshot(pid, 2_000).held
+  end
+
+  test "CC-1809 trace would hold after checkpoint grace instead of spending another 5.31M" do
+    {pid, issue, worker_pid} = start_budget_orchestrator("cc-1809-trace", 18_000_000)
+    command = "while IFS= read -r _line; do :; done"
+    {:ok, codex_port} = ProcessTree.open_port(System.find_executable("sh"), ["-c", command])
+
+    put_running_entry(pid, issue, worker_pid,
+      input_token_limit: 18_000_000,
+      input_token_checkpoint_grace: 500_000,
+      codex_app_server_port: codex_port,
+      thread_id: "thread-warning",
+      turn_id: "turn-warning"
+    )
+
+    send_token_update(pid, issue.id, 12_708_674)
+
+    send(
+      pid,
+      {:codex_worker_update, issue.id,
+       %{
+         event: :token_budget_warning_delivered,
+         payload: %{"turnId" => "turn-warning"},
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    send_token_update(pid, issue.id, 13_208_674)
+
+    assert [
+             %{
+               reason: "input_token_checkpoint_grace",
+               warning_observed_at: 12_708_674,
+               observed_tokens: 13_208_674
+             }
+           ] = Orchestrator.snapshot(pid, 2_000).held
   end
 
   test "exact hard limit stops the process tree, suppresses retries, and preserves workspace" do
@@ -541,19 +623,57 @@ defmodule SymphonyElixir.TokenBudgetTest do
     refute Process.alive?(worker_pid)
   end
 
-  test "explicit resume clears a hold and queues one continuation attempt" do
+  test "explicit resume durably authorizes and queues one continuation attempt" do
     {pid, issue, worker_pid} = start_budget_orchestrator("resume", 100)
     workspace = Path.join(Config.settings!().workspace.root, issue.identifier)
     put_running_entry(pid, issue, worker_pid, input_token_limit: 100, workspace_path: workspace)
     send_token_update(pid, issue.id, 100)
 
-    assert {:ok, %{resumed: true}} = Orchestrator.resume_issue(issue.identifier, pid)
-    assert Orchestrator.snapshot(pid, 1_000).held == []
+    assert {:error, :resume_phase_required} = Orchestrator.resume_issue(issue.identifier, pid)
+
+    assert {:error, :invalid_resume_phase} =
+             Orchestrator.resume_issue(
+               issue.identifier,
+               %{phase: "unknown", max_additional_input_tokens: 50},
+               pid
+             )
+
+    assert {:error, :max_additional_input_tokens_required} =
+             Orchestrator.resume_issue(issue.identifier, %{phase: "validation"}, pid)
+
+    assert {:ok,
+            %{
+              resumed: true,
+              phase: "validation",
+              requested_additional_input_tokens: 200,
+              effective_additional_input_tokens: 100,
+              attempt_input_token_baseline: 0
+            }} =
+             Orchestrator.resume_issue(
+               issue.identifier,
+               %{phase: "validation", max_additional_input_tokens: 200},
+               pid
+             )
+
+    assert [
+             %{
+               reason: "input_token_resume_pending",
+               resume_phase: "validation",
+               requested_additional_input_tokens: 200,
+               effective_additional_input_tokens: 100,
+               attempt_input_token_baseline: 0
+             }
+           ] = Orchestrator.snapshot(pid, 1_000).held
 
     assert %{
              attempt: 1,
              identifier: identifier,
              workspace_path: ^workspace,
+             phase_budget: %{
+               phase: "validation",
+               requested_additional_input_tokens: 200,
+               effective_additional_input_tokens: 100
+             },
              retry_token: retry_token
            } = :sys.get_state(pid).retry_attempts[issue.id]
 
@@ -565,6 +685,143 @@ defmodule SymphonyElixir.TokenBudgetTest do
 
     assert {:error, :issue_not_found} = Orchestrator.stop_issue("UNKNOWN-1", pid)
     assert {:error, :issue_not_found} = Orchestrator.resume_issue("UNKNOWN-1", pid)
+  end
+
+  test "a pending bounded resume survives an orchestrator restart without dispatch" do
+    {pid, issue, worker_pid} = start_budget_orchestrator("resume-restart", 100)
+    workspace = Path.join(Config.settings!().workspace.root, issue.identifier)
+    put_running_entry(pid, issue, worker_pid, input_token_limit: 100, workspace_path: workspace)
+    send_token_update(pid, issue.id, 100)
+
+    assert {:ok, %{phase: "validation", effective_additional_input_tokens: 50}} =
+             Orchestrator.resume_issue(
+               issue.identifier,
+               %{phase: "validation", max_additional_input_tokens: 50},
+               pid
+             )
+
+    :ok = GenServer.stop(pid, :normal)
+    restarted_pid = start_replacement_orchestrator()
+
+    snapshot = Orchestrator.snapshot(restarted_pid, 1_000)
+
+    assert snapshot.running == []
+    assert snapshot.retrying == []
+
+    assert [
+             %{
+               reason: "input_token_resume_pending",
+               resume_phase: "validation",
+               effective_additional_input_tokens: 50,
+               workspace_path: ^workspace
+             }
+           ] = snapshot.held
+  end
+
+  test "a dispatched bounded resume re-holds on every worker exit instead of becoming unbounded" do
+    for {suffix, exit_reason, expected_hold_reason} <- [
+          {"resume-normal-exit", :normal, "input_token_checkpoint"},
+          {"resume-failed-exit", :boom, "input_token_checkpoint_failed"}
+        ] do
+      {pid, issue, worker_pid} = start_budget_orchestrator(suffix, 100)
+      workspace = Path.join(Config.settings!().workspace.root, issue.identifier)
+      put_running_entry(pid, issue, worker_pid, input_token_limit: 100, workspace_path: workspace)
+      send_token_update(pid, issue.id, 100)
+
+      :sys.replace_state(pid, fn state ->
+        pending_hold =
+          Map.merge(state.holds[issue.id], %{
+            reason: "input_token_resume_pending",
+            limit: 50,
+            observed_tokens: 0,
+            resume_phase: "review-fix",
+            requested_additional_input_tokens: 50,
+            effective_additional_input_tokens: 50,
+            attempt_input_token_baseline: 0,
+            input_token_tier_limit: 100
+          })
+
+        %{state | holds: %{issue.id => pending_hold}, retry_attempts: %{}}
+      end)
+
+      resumed_worker = spawn(fn -> Process.sleep(:infinity) end)
+      on_exit(fn -> if Process.alive?(resumed_worker), do: Process.exit(resumed_worker, :shutdown) end)
+
+      put_running_entry(pid, issue, resumed_worker,
+        input_token_limit: 50,
+        input_token_tier_limit: 100,
+        workspace_path: workspace,
+        resume_phase: "review-fix",
+        requested_additional_input_tokens: 50,
+        effective_additional_input_tokens: 50,
+        attempt_input_token_baseline: 0
+      )
+
+      running_ref = :sys.get_state(pid).running[issue.id].ref
+      send(pid, {:DOWN, running_ref, :process, resumed_worker, exit_reason})
+
+      assert_eventually(fn ->
+        snapshot = Orchestrator.snapshot(pid, 1_000)
+
+        snapshot.retrying == [] and
+          match?(
+            [%{reason: ^expected_hold_reason, resume_phase: "review-fix"}],
+            snapshot.held
+          )
+      end)
+    end
+  end
+
+  test "a bounded resumed attempt starts from zero and re-holds at its effective allowance" do
+    {pid, issue, worker_pid} = start_budget_orchestrator("resume-rehold", 100)
+    workspace = Path.join(Config.settings!().workspace.root, issue.identifier)
+    put_running_entry(pid, issue, worker_pid, input_token_limit: 100, workspace_path: workspace)
+    send_token_update(pid, issue.id, 100)
+
+    assert {:ok,
+            %{
+              phase: "review-fix",
+              effective_additional_input_tokens: 50,
+              attempt_input_token_baseline: 0
+            }} =
+             Orchestrator.resume_issue(
+               issue.identifier,
+               %{phase: "review-fix", max_additional_input_tokens: 50},
+               pid
+             )
+
+    retry = :sys.get_state(pid).retry_attempts[issue.id]
+    Process.cancel_timer(retry.timer_ref)
+    resumed_worker = spawn(fn -> Process.sleep(:infinity) end)
+    on_exit(fn -> if Process.alive?(resumed_worker), do: Process.exit(resumed_worker, :shutdown) end)
+
+    put_running_entry(pid, issue, resumed_worker,
+      input_token_limit: 50,
+      input_token_tier_limit: 100,
+      workspace_path: workspace,
+      resume_phase: "review-fix",
+      requested_additional_input_tokens: 50,
+      effective_additional_input_tokens: 50,
+      attempt_input_token_baseline: 0
+    )
+
+    send_token_update(pid, issue.id, 50)
+
+    assert [
+             %{
+               reason: "input_token_limit",
+               resume_phase: "review-fix",
+               effective_additional_input_tokens: 50,
+               attempt_input_token_baseline: 0,
+               observed_tokens: 50
+             }
+           ] = Orchestrator.snapshot(pid, 2_000).held
+
+    assert {:ok, payload} =
+             SymphonyElixirWeb.Presenter.issue_payload(issue.identifier, pid, 1_000)
+
+    assert payload.hold.current_attempt_input_tokens == 50
+    assert payload.hold.resume_phase == "review-fix"
   end
 
   test "resume continuation context renders the non-fresh workflow branch" do
@@ -583,6 +840,27 @@ defmodule SymphonyElixir.TokenBudgetTest do
     prompt = PromptBuilder.build_prompt(issue, attempt: 1)
     assert prompt =~ "Resume attempt 1"
     refute prompt =~ "Fresh run"
+  end
+
+  test "a phase-bounded resume stops after one completed Codex turn" do
+    issue = %Issue{
+      id: "issue-phase-turn",
+      identifier: "MT-PHASE-TURN",
+      title: "Bounded phase turn",
+      state: "In Progress",
+      labels: []
+    }
+
+    assert :stop =
+             AgentRunner.continue_after_turn_for_test(issue,
+               resume_phase: "validation",
+               continue_after_turn: fn _issue_id -> true end
+             )
+
+    assert :continue =
+             AgentRunner.continue_after_turn_for_test(issue,
+               continue_after_turn: fn _issue_id -> true end
+             )
   end
 
   test "manual stop returns after running ends and preserves the workspace" do
@@ -636,7 +914,7 @@ defmodule SymphonyElixir.TokenBudgetTest do
     assert identifier == issue.identifier
   end
 
-  test "a later issue-state change releases a hold" do
+  test "a later issue-state change does not release a token-budget hold" do
     {pid, issue, worker_pid} = start_budget_orchestrator("state-change", 100)
     put_running_entry(pid, issue, worker_pid, input_token_limit: 100)
     send_token_update(pid, issue.id, 100)
@@ -647,10 +925,16 @@ defmodule SymphonyElixir.TokenBudgetTest do
     ])
 
     send(pid, :run_poll_cycle)
-    assert_eventually(fn -> Orchestrator.snapshot(pid, 1_000).held == [] end)
+
+    assert_eventually(fn ->
+      match?(
+        [%{issue_state: "Human Review", reason: "input_token_limit"}],
+        Orchestrator.snapshot(pid, 1_000).held
+      )
+    end)
   end
 
-  test "holds survive restart and release only after a verified tracker-state change" do
+  test "budget holds survive restart and tracker-state changes" do
     {pid, issue, worker_pid} = start_budget_orchestrator("restart-state-change", 100)
     workspace_root = Config.settings!().workspace.root
     state_file = Path.join(workspace_root, ".symphony-holds.json")
@@ -675,9 +959,16 @@ defmodule SymphonyElixir.TokenBudgetTest do
 
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [%{issue | state: "Human Review"}])
     send(restarted_pid, :run_poll_cycle)
-    assert_eventually(fn -> Orchestrator.snapshot(restarted_pid, 1_000).held == [] end)
 
-    assert %{"version" => 1, "holds" => []} = state_file |> File.read!() |> Jason.decode!()
+    assert_eventually(fn ->
+      match?(
+        [%{issue_state: "Human Review", reason: "input_token_limit"}],
+        Orchestrator.snapshot(restarted_pid, 1_000).held
+      )
+    end)
+
+    assert %{"version" => 1, "holds" => [_hold]} =
+             state_file |> File.read!() |> Jason.decode!()
   end
 
   test "restart restoration keeps pending cleanup held across tracker changes" do
@@ -707,7 +998,7 @@ defmodule SymphonyElixir.TokenBudgetTest do
     end)
   end
 
-  test "an explicit resume releases a restored durable hold" do
+  test "an explicit resume replaces a restored hold with durable phase authorization" do
     {pid, issue, worker_pid} = start_budget_orchestrator("restart-resume", 100)
     put_running_entry(pid, issue, worker_pid, input_token_limit: 100)
     send_modern_token_update(pid, issue.id, 100)
@@ -717,8 +1008,21 @@ defmodule SymphonyElixir.TokenBudgetTest do
     restarted_pid = start_replacement_orchestrator()
     assert [_hold] = Orchestrator.snapshot(restarted_pid, 1_000).held
 
-    assert {:ok, %{resumed: true}} = Orchestrator.resume_issue(issue.identifier, restarted_pid)
-    assert Orchestrator.snapshot(restarted_pid, 1_000).held == []
+    assert {:ok, %{resumed: true, phase: "implementation"}} =
+             Orchestrator.resume_issue(
+               issue.identifier,
+               %{phase: "implementation", max_additional_input_tokens: 50},
+               restarted_pid
+             )
+
+    assert [
+             %{
+               reason: "input_token_resume_pending",
+               resume_phase: "implementation",
+               effective_additional_input_tokens: 50
+             }
+           ] = Orchestrator.snapshot(restarted_pid, 1_000).held
+
     assert %{attempt: 1, identifier: identifier} = :sys.get_state(restarted_pid).retry_attempts[issue.id]
     assert identifier == issue.identifier
     assert map_size(:sys.get_state(restarted_pid).retry_attempts) == 1
@@ -739,9 +1043,10 @@ defmodule SymphonyElixir.TokenBudgetTest do
 
     assert {:error, :cleanup_failed} = Orchestrator.stop_issue(issue.identifier, pid)
     :ok = GenServer.stop(pid)
-    restarted_pid = start_replacement_orchestrator()
-
     File.write!(fake_ssh, "#!/bin/sh\nprintf '%s\\n' \"$@\" > '#{cleanup_trace}'\nexit 17\n")
+    restarted_pid = start_replacement_orchestrator()
+    cancel_hold_state_retry(restarted_pid)
+
     assert {:error, :cleanup_failed} = Orchestrator.resume_issue(issue.identifier, restarted_pid)
     assert [%{cleanup_pending: true}] = Orchestrator.snapshot(restarted_pid, 1_000).held
     assert File.read!(cleanup_trace) =~ Path.join(remote_workspace, ".symphony-codex-app-server.pid")
@@ -771,6 +1076,7 @@ defmodule SymphonyElixir.TokenBudgetTest do
     assert {:error, :cleanup_failed} = Orchestrator.stop_issue(issue.identifier, pid)
     :ok = GenServer.stop(pid)
     restarted_pid = start_replacement_orchestrator()
+    cancel_hold_state_retry(restarted_pid)
 
     File.write!(fake_ssh, "#!/bin/sh\nexit 0\n")
     File.rm!(state_file)
@@ -808,6 +1114,7 @@ defmodule SymphonyElixir.TokenBudgetTest do
     assert {:error, :cleanup_failed} = Orchestrator.stop_issue(issue.identifier, pid)
     :ok = GenServer.stop(pid)
     restarted_pid = start_replacement_orchestrator()
+    cancel_hold_state_retry(restarted_pid)
     pending_hold_json = File.read!(state_file)
 
     File.write!(fake_ssh, "#!/bin/sh\nexit 0\n")
@@ -1068,12 +1375,20 @@ defmodule SymphonyElixir.TokenBudgetTest do
       codex_last_reported_output_tokens: 0,
       codex_last_reported_total_tokens: 0,
       input_token_limit: nil,
+      input_token_tier_limit: nil,
       input_token_warning_ratio: 0.70,
+      input_token_checkpoint_grace: 500_000,
       input_token_warning_sent: false,
       input_token_warning_status: nil,
+      input_token_warning_threshold: nil,
+      input_token_warning_observed_at: nil,
       input_token_warning_ack_timer_ref: nil,
       input_token_warning_ack_token: nil,
       input_token_warning_reader_busy: false,
+      resume_phase: nil,
+      requested_additional_input_tokens: nil,
+      effective_additional_input_tokens: nil,
+      attempt_input_token_baseline: 0,
       turn_count: 1,
       retry_attempt: 0,
       started_at: started_at
@@ -1085,6 +1400,7 @@ defmodule SymphonyElixir.TokenBudgetTest do
       %{
         state
         | running: %{issue.id => entry},
+          retry_attempts: %{},
           claimed: MapSet.put(state.claimed, issue.id)
       }
     end)
@@ -1155,6 +1471,19 @@ defmodule SymphonyElixir.TokenBudgetTest do
     pid
   end
 
+  defp cancel_hold_state_retry(pid) do
+    retry_ref = :sys.get_state(pid).hold_state_persist_retry_timer_ref
+    Process.cancel_timer(retry_ref)
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | hold_state_persist_retry_timer_ref: nil,
+          hold_state_persist_retry_token: nil
+      }
+    end)
+  end
+
   defp install_fake_ssh!(suffix, body) do
     test_root =
       Path.join(System.tmp_dir!(), "symphony-fake-ssh-#{suffix}-#{System.unique_integer([:positive])}")
@@ -1185,7 +1514,7 @@ defmodule SymphonyElixir.TokenBudgetTest do
     status == 0
   end
 
-  defp assert_eventually(fun, attempts \\ 40)
+  defp assert_eventually(fun, attempts \\ 80)
 
   defp assert_eventually(fun, attempts) when attempts > 0 do
     if fun.() do

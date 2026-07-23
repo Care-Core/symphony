@@ -80,8 +80,18 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:reply, Keyword.get(state, :stop, {:error, :issue_not_found}), state}
     end
 
-    def handle_call({:resume_issue, _identifier}, _from, state) do
-      {:reply, Keyword.get(state, :resume, {:error, :issue_not_found}), state}
+    def handle_call({:resume_issue, identifier, options}, _from, state) do
+      if test_pid = Keyword.get(state, :test_pid) do
+        send(test_pid, {:resume_issue_called, identifier, options})
+      end
+
+      result =
+        case Keyword.get(state, :resume, {:error, :issue_not_found}) do
+          resume when is_function(resume, 1) -> resume.(options)
+          resume -> resume
+        end
+
+      {:reply, result, state}
     end
   end
 
@@ -377,9 +387,19 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
                  "input_token_budget" => %{
                    "limit" => nil,
+                   "tier_limit" => nil,
                    "observed_tokens" => 4,
+                   "current_attempt_input_tokens" => 4,
+                   "attempt_input_token_baseline" => 0,
                    "warning_ratio" => nil,
-                   "warning_status" => nil
+                   "warning_status" => nil,
+                   "warning_threshold" => nil,
+                   "warning_observed_at" => nil,
+                   "checkpoint_grace" => nil,
+                   "checkpoint_grace_consumed" => 0,
+                   "resume_phase" => nil,
+                   "requested_additional_input_tokens" => nil,
+                   "effective_additional_input_tokens" => nil
                  }
                }
              ],
@@ -432,9 +452,19 @@ defmodule SymphonyElixir.ExtensionsTest do
                "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12},
                "input_token_budget" => %{
                  "limit" => nil,
+                 "tier_limit" => nil,
                  "observed_tokens" => 4,
+                 "current_attempt_input_tokens" => 4,
+                 "attempt_input_token_baseline" => 0,
                  "warning_ratio" => nil,
-                 "warning_status" => nil
+                 "warning_status" => nil,
+                 "warning_threshold" => nil,
+                 "warning_observed_at" => nil,
+                 "checkpoint_grace" => nil,
+                 "checkpoint_grace_consumed" => 0,
+                 "resume_phase" => nil,
+                 "requested_additional_input_tokens" => nil,
+                 "effective_additional_input_tokens" => nil
                }
              },
              "retry" => nil,
@@ -570,7 +600,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
 
     assert {:error, :cleanup_failed} =
-             SymphonyElixirWeb.Presenter.resume_payload("MT-CONTROL", orchestrator_name)
+             SymphonyElixirWeb.Presenter.resume_payload("MT-CONTROL", %{}, orchestrator_name)
 
     payload =
       build_conn()
@@ -584,6 +614,111 @@ defmodule SymphonyElixir.ExtensionsTest do
                "message" => "Cleanup could not be confirmed; the hold remains active"
              }
            }
+  end
+
+  test "phoenix resume api passes a bounded phase and returns its effective receipt" do
+    orchestrator_name = Module.concat(__MODULE__, :BoundedResumeControlApiOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        test_pid: self(),
+        snapshot: static_snapshot(),
+        resume:
+          {:ok,
+           %{
+             issue_id: "issue-control",
+             identifier: "MT-CONTROL",
+             resumed: true,
+             phase: "validation",
+             requested_additional_input_tokens: 1_500,
+             effective_additional_input_tokens: 1_000,
+             current_issue_tier_limit: 1_000,
+             attempt_input_token_baseline: 0,
+             workspace_path: "/tmp/MT-CONTROL"
+           }}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+
+    resume_payload =
+      build_conn()
+      |> Plug.Conn.put_req_header("x-symphony-control-token", "test-control-token")
+      |> post("/api/v1/MT-CONTROL/resume", %{
+        "phase" => "validation",
+        "max_additional_input_tokens" => 1_500,
+        "ignored" => "not-forwarded"
+      })
+      |> json_response(200)
+
+    assert_received {:resume_issue_called, "MT-CONTROL",
+                     %{
+                       "phase" => "validation",
+                       "max_additional_input_tokens" => 1_500
+                     }}
+
+    assert resume_payload == %{
+             "issue_id" => "issue-control",
+             "issue_identifier" => "MT-CONTROL",
+             "status" => "resumed",
+             "hold" => nil,
+             "resume_phase" => "validation",
+             "requested_additional_input_tokens" => 1_500,
+             "effective_additional_input_tokens" => 1_000,
+             "current_issue_tier_limit" => 1_000,
+             "attempt_input_token_baseline" => 0,
+             "workspace_path" => "/tmp/MT-CONTROL"
+           }
+  end
+
+  test "phoenix resume api fails closed on invalid or unverifiable phase budgets" do
+    orchestrator_name = Module.concat(__MODULE__, :RejectedBudgetResumeControlApiOrchestrator)
+
+    resume = fn options ->
+      case options do
+        %{"phase" => "unknown"} ->
+          {:error, :invalid_resume_phase}
+
+        %{"phase" => "validation", "max_additional_input_tokens" => "many"} ->
+          {:error, :invalid_max_additional_input_tokens}
+
+        %{"phase" => "validation", "max_additional_input_tokens" => 100} ->
+          {:error, :tracker_unavailable}
+
+        %{"phase" => "validation"} ->
+          {:error, :max_additional_input_tokens_required}
+
+        _ ->
+          {:error, :resume_phase_required}
+      end
+    end
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        resume: resume
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+
+    for {body, expected_code, expected_status} <- [
+          {%{}, "resume_phase_required", 422},
+          {%{"phase" => "unknown"}, "invalid_resume_phase", 422},
+          {%{"phase" => "validation"}, "max_additional_input_tokens_required", 422},
+          {%{"phase" => "validation", "max_additional_input_tokens" => "many"}, "invalid_max_additional_input_tokens", 422},
+          {%{"phase" => "validation", "max_additional_input_tokens" => 100}, "tracker_unavailable", 503}
+        ] do
+      payload =
+        build_conn()
+        |> Plug.Conn.put_req_header("x-symphony-control-token", "test-control-token")
+        |> post("/api/v1/MT-CONTROL/resume", body)
+        |> json_response(expected_status)
+
+      assert payload["error"]["code"] == expected_code
+    end
   end
 
   test "phoenix control api requires an env-backed token and loopback access" do

@@ -110,6 +110,7 @@ codex:
     expensive: 120000
     urgent: 80000
   input_token_warning_ratio: 0.70
+  input_token_checkpoint_grace: 500000
 ---
 
 You are working on a Linear issue {{ issue.identifier }}.
@@ -135,24 +136,33 @@ Notes:
   `codex.input_token_limits_by_label` supplies lower positive limits for matching issue labels. Label
   matching is case-insensitive, and the smallest configured limit wins when several labels match.
   `codex.input_token_warning_ratio` defaults to `0.70` and must be greater than `0` and less than
-  `1`.
+  `1`. `codex.input_token_checkpoint_grace` defaults to `500000` and sets the maximum additional
+  input tokens allowed after the warning is first observed while the active turn checkpoints.
 - On the first warning-threshold crossing, Symphony asks an active app-server turn to checkpoint via
-  `turn/steer`. The state/API reports `requested` or `delivered`. A missing control channel, rejected
-  response, or five-second acknowledgement timeout creates an `input_token_warning_unsupported`
-  hold before the hard limit. If the hold-state write fails, Symphony still interrupts the run,
-  quarantines it in memory, pauses new dispatches, and retries persistence once per second before
-  allowing dispatch to resume. The acknowledgement deadline pauses while Symphony's protocol reader
-  is synchronously executing a client tool, then restarts when response processing resumes. A worker
-  exit with acknowledgement still pending becomes a hold instead of a retry, and dispatch stays
-  paused until both persistence and any quarantined process cleanup recover.
+  `turn/steer`. The instruction tells the agent to finish only its current atomic operation, record a
+  resumable checkpoint, and end the turn. The state/API reports `requested` or `delivered`. A normal
+  worker exit after delivery creates an `input_token_checkpoint` hold; an abnormal exit creates
+  `input_token_checkpoint_failed`. If the active turn does not exit before the configured checkpoint
+  grace or hard limit is exhausted, Symphony interrupts it and creates a durable hold. A missing
+  control channel, rejected response, or five-second acknowledgement timeout creates an
+  `input_token_warning_unsupported` hold. The acknowledgement deadline pauses while Symphony's
+  protocol reader is synchronously executing a client tool, then restarts when response processing
+  resumes.
 - At the exact input-token limit or above, Symphony interrupts the turn, terminates the app-server
   process tree locally or on its SSH worker, preserves the workspace, and puts the issue on a
   durable internal hold. Holds are atomically stored with owner-only permissions in
   `<workspace.root>/.symphony-holds.json` and restored before polling after a restart. A held issue
-  is not retried or polled into another run until a fetched tracker state verifiably changes or the
-  authenticated local resume control is used; missing tracker results keep the hold. Corrupt,
-  insecure, or unreadable hold state fails startup closed. Manual and token-budget stops do not
-  mutate Linear.
+  is not retried or polled into another run. Tracker-state changes may release an ordinary manual
+  hold but never a token-budget or cleanup-pending hold. Resuming a token-budget hold requires an
+  authenticated local request with a named phase and positive maximum additional input-token
+  allowance. Symphony caps that allowance at the issue's current configured tier, returns the
+  effective allowance, and records a durable `input_token_resume_pending` authorization while it
+  applies the allowance to exactly one continuation attempt from the preserved workspace. That
+  authorization survives pre-dispatch retries and prevents an unbounded fresh run after a Symphony
+  restart. A phase-bounded attempt runs one Codex turn rather than the normal back-to-back turn
+  loop, and every normal or abnormal post-dispatch exit returns to a checkpoint hold. Missing
+  tracker results keep the hold. Corrupt, insecure, or unreadable hold state fails startup closed.
+  Manual and token-budget stops do not mutate Linear.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -263,14 +273,18 @@ Operational control endpoints:
   returns its hold details. It also converts a known queued retry into a hold. The workspace is
   preserved. Remote cleanup timeout/failure returns `503 cleanup_failed`; the durable hold remains
   active with `cleanup_pending: true` and cannot be released by tracker changes.
-- `POST /api/v1/<issue_identifier>/resume` retries any pending cleanup from stored process proof,
-  clears the hold only after cleanup is confirmed, and queues exactly one short continuation
-  attempt with the held workspace and worker metadata. Successful remote
+- `POST /api/v1/<issue_identifier>/resume` retries any pending cleanup from stored process proof
+  and queues exactly one short continuation attempt with the held workspace and worker metadata.
+  Manual resumes clear the hold only after cleanup is confirmed. Token-budget resumes atomically
+  replace it with a durable pending phase authorization before queueing the attempt. Successful remote
   cleanup atomically replaces its identity-bound `running:<pid>:<start-id>` proof with a validated
   `stopped:<pid>:<start-id>` completion proof. The start ID encodes the process start time, which
   cleanup verifies before every signal, so a crash before the hold update can retry without
   signaling a reused PID. The next remote app-server launch overwrites that completion proof with
-  its new identity.
+  its new identity. For a token-budget hold, the JSON body must contain `phase` (`implementation`,
+  `validation`, `review-fix`, `hosted-closeout`, or `landing`) and a positive
+  `max_additional_input_tokens`. The response reports the requested and effective allowance, the
+  current issue tier limit, the attempt-local token baseline, and the reused workspace path.
 - Set a non-empty `SYMPHONY_CONTROL_TOKEN` environment secret before using either endpoint and send
   it in `X-Symphony-Control-Token`. Missing configuration returns `503`; a missing or invalid token
   returns `401`. Unknown issue identifiers return `404`. Both endpoints are loopback-only and never

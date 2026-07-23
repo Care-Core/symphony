@@ -446,6 +446,10 @@ fields locally if they want stricter startup checks.
 - `input_token_warning_ratio` (number greater than `0` and less than `1`)
   - Default: `0.70`.
   - The warning threshold is the ceiling of `effective_limit * ratio`.
+- `input_token_checkpoint_grace` (positive integer)
+  - Default: `500000`.
+  - Maximum additional input tokens permitted after the warning is first observed while the active
+    turn finishes its current atomic operation and writes a resumable checkpoint.
 - `approval_policy` (Codex `AskForApproval` value)
   - Default: implementation-defined.
 - `thread_sandbox` (Codex `SandboxMode` value)
@@ -600,6 +604,7 @@ This section is intentionally redundant so a coding agent can implement the conf
 - `codex.input_token_limits_by_label`: map of label names to positive integers, default `{}`;
   labels are matched case-insensitively and the smallest applicable limit wins
 - `codex.input_token_warning_ratio`: number greater than `0` and less than `1`, default `0.70`
+- `codex.input_token_checkpoint_grace`: positive integer, default `500000`
 - `runner.capability_preflight` (extension): boolean, default `false`; when enabled, startup must
   complete the local runner capability contract before polling or claims
 - `runner.source_repo` (extension): absolute path or `$VAR`; working directory for the review
@@ -648,9 +653,9 @@ claim state.
 4. `Held`
    - A manual stop or input-token hard limit has stopped the worker without deleting its workspace.
    - Held issues are excluded from dispatch and retry scheduling.
-   - A tracker state change may release a hold only when cleanup is not pending. A
-     `cleanup_pending` hold survives tracker changes and explicit resume releases it only after
-     cleanup is confirmed from stored process proof.
+   - A tracker state change may release an ordinary manual hold only when cleanup is not pending.
+     Token-budget holds and `cleanup_pending` holds survive tracker changes. Explicit resume
+     releases cleanup-pending holds only after cleanup is confirmed from stored process proof.
 
 4. `RetryQueued`
    - Worker is not running, but a retry timer exists in `retry_attempts`.
@@ -1116,7 +1121,8 @@ counts from legacy `codex/event/token_count` events and modern `thread/tokenUsag
 notifications as the authoritative measurement.
 
 - On the first event at or above the warning threshold but below the hard limit, send one concise
-  checkpoint instruction to the live turn with the app-server `turn/steer` method.
+  instruction to the live turn with the app-server `turn/steer` method. It must direct the agent to
+  finish only its current atomic operation, record a resumable checkpoint, and end the turn.
 - Record warning delivery as requested until the protocol responds. A successful response may be
   recorded as delivered. A missing live turn/control channel, rejected method, acknowledgement
   timeout, or incompatible app-server must be recorded as unsupported and create a durable internal
@@ -1126,6 +1132,11 @@ notifications as the authoritative measurement.
   executing a client tool. Implementations must not report successful steering without protocol
   evidence or let an uncheckpointable run continue to the hard limit. A worker that exits while
   acknowledgement remains pending must be held instead of retried.
+- After warning delivery, a normal worker exit must create an `input_token_checkpoint` hold rather
+  than schedule another continuation turn. An abnormal worker exit must create an
+  `input_token_checkpoint_failed` hold. If input usage reaches the warning observation plus
+  `codex.input_token_checkpoint_grace` before the worker exits, interrupt the run and create an
+  `input_token_checkpoint_grace` hold. The hard limit remains authoritative if it is reached first.
 - On an event at the exact hard limit or above, interrupt/cancel the live turn, terminate its
   app-server process tree with the normal bounded cleanup mechanism, preserve its workspace, and
   create a durable internal hold before cleanup begins. A remote cleanup timeout or failure must
@@ -1134,15 +1145,27 @@ notifications as the authoritative measurement.
   hooks. Existing terminal-state cleanup behavior remains unchanged.
 - A held issue cannot be dispatched or retried. Persist holds atomically in private storage under
   the configured workspace root and restore them before polling or startup workspace cleanup.
-  A hold whose cleanup is complete may be released after a fetched tracker state verifiably differs
-  from the stored state or after an authenticated local resume request. A `cleanup_pending` hold
-  survives tracker changes; explicit resume must retry cleanup from stored local or remote process
-  proof and release the hold only after cleanup is confirmed. Missing/unreadable tracker results
-  keep every hold.
-- After explicit resume releases a manual or token-budget hold, schedule exactly one short
-  continuation through the retry queue with non-null attempt context (initially `attempt = 1`).
-  Reuse the exact held workspace and worker metadata; do not dispatch the resumed issue as a fresh
-  run or through a competing poll tick. Pre-dispatch failures retain normal retry/backoff semantics.
+  An ordinary manual hold whose cleanup is complete may be released after a fetched tracker state
+  verifiably differs from the stored state or after an authenticated local resume request.
+  Token-budget and `cleanup_pending` holds survive tracker changes. Explicit resume must retry
+  cleanup from stored local or remote process proof and release the hold only after cleanup is
+  confirmed. Missing/unreadable tracker results keep every hold.
+- After explicit resume releases a manual hold, schedule exactly one short continuation through the
+  retry queue with non-null attempt context (initially `attempt = 1`). For a token-budget resume,
+  atomically replace the current hold with a durable `input_token_resume_pending` authorization
+  before scheduling the continuation. Keep that authorization for the lifetime of the dispatched
+  attempt so a service restart cannot turn it into an unbounded fresh run. Reuse the exact held
+  workspace and worker metadata; do not dispatch the resumed issue as a fresh run or through a
+  competing poll tick. Run at most one coding-agent turn for that phase authorization rather than
+  the normal back-to-back turn loop. Pre-dispatch failures retain the same phase budget through
+  normal retry/backoff. Every normal or abnormal post-dispatch exit returns to a durable checkpoint
+  hold.
+- Explicit resume of a token-budget hold must require both a named phase (`implementation`,
+  `validation`, `review-fix`, `hosted-closeout`, or `landing`) and a positive maximum additional
+  input-token allowance. Before release, fetch the current issue and cap the requested allowance at
+  the issue's current configured token tier. If the tier cannot be verified, keep the hold. Start
+  the continuation's attempt-local token counter at zero and reapply normal warning/checkpoint/hold
+  enforcement against the effective allowance.
 
 ### 10.5 Approval, Tool Calls, and User Input Policy
 
@@ -1656,6 +1679,14 @@ Minimum endpoints:
   - Loopback callers only, with `X-Symphony-Control-Token` matching a non-empty env-backed control
     secret. For a `cleanup_pending` hold, retry cleanup from stored process proof and clear the hold
     only after cleanup is confirmed; then queue an immediate poll.
+  - For a token-budget hold, require a JSON body containing `phase` (`implementation`, `validation`,
+    `review-fix`, `hosted-closeout`, or `landing`) and a positive
+    `max_additional_input_tokens`. Cap the requested allowance at the issue's current configured
+    tier, persist the pending authorization before queueing the attempt, and return the requested
+    allowance, effective allowance, current tier limit, attempt-local token baseline, and reused
+    workspace path.
+  - Reject a missing/invalid phase or allowance with `422`; reject an unverifiable current issue
+    tier with `503` and keep the hold.
   - Return `404 issue_not_found` when the identifier is not currently held.
 
 Control endpoint requests received from a non-loopback peer must be rejected. The implementation
@@ -2153,13 +2184,22 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Input-token warning threshold crossing sends at most one checkpoint steer request per run
 - Missing, rejected, or unacknowledged warning steering stops the run before the hard token limit;
   unavailable hold persistence pauses dispatch and retries without letting the run continue
+- A delivered checkpoint warning prevents another back-to-back turn; normal and abnormal exits
+  create distinct durable checkpoint holds
+- Checkpoint grace exhaustion interrupts and holds the run even when the configured hard limit is
+  farther away
 - A persistence outage cannot resume dispatch until cleanup of its quarantined running process has
   succeeded
 - Exact input-token limit crossing interrupts the run, terminates its process tree, preserves its
   workspace, and creates a hold without scheduling a retry
 - Held issues are excluded from polling dispatch and retry timers
-- Tracker-state changes cannot release cleanup-pending holds; explicit resume confirms cleanup from
-  stored process proof before releasing them
+- Tracker-state changes cannot release token-budget or cleanup-pending holds; explicit resume
+  confirms cleanup from stored process proof before releasing them
+- Token-budget resume requires a named phase and positive allowance, caps the allowance at the
+  current issue tier, reuses the preserved workspace, and re-holds at the bounded attempt limit
+- Pending token-budget resume authorization survives pre-dispatch retries and service restarts;
+  it permits at most one coding-agent turn, and every normal or abnormal post-dispatch exit returns
+  to a durable checkpoint hold
 - Manual stop/resume controls return unknown-issue errors and preserve workspaces
 - Slot exhaustion requeues retries with explicit error reason
 - If a snapshot API is implemented, it returns running rows, retry rows, token totals, and rate

@@ -178,6 +178,7 @@ defmodule SymphonyElixir.Config.Schema do
       field(:input_token_limit, :integer)
       field(:input_token_limits_by_label, :map, default: %{})
       field(:input_token_warning_ratio, :float, default: 0.70)
+      field(:input_token_checkpoint_grace, :integer, default: 500_000)
     end
 
     @spec changeset(%__MODULE__{}, map()) :: Ecto.Changeset.t()
@@ -195,7 +196,8 @@ defmodule SymphonyElixir.Config.Schema do
           :stall_timeout_ms,
           :input_token_limit,
           :input_token_limits_by_label,
-          :input_token_warning_ratio
+          :input_token_warning_ratio,
+          :input_token_checkpoint_grace
         ],
         empty_values: []
       )
@@ -206,6 +208,7 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:stall_timeout_ms, greater_than_or_equal_to: 0)
       |> validate_number(:input_token_limit, greater_than: 0)
       |> validate_number(:input_token_warning_ratio, greater_than: 0, less_than: 1)
+      |> validate_number(:input_token_checkpoint_grace, greater_than: 0)
       |> update_change(:input_token_limits_by_label, &normalize_label_limits/1)
       |> validate_label_limits(:input_token_limits_by_label)
     end

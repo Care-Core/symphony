@@ -35,6 +35,7 @@ codex:
   # input_token_limits_by_label:
   #   expensive: 120000
   # input_token_warning_ratio: 0.70
+  # input_token_checkpoint_grace: 500000
   approval_policy: never
   thread_sandbox: workspace-write
   turn_sandbox_policy:

@@ -17,6 +17,9 @@ defmodule SymphonyElixir.Orchestrator do
   @token_warning_ack_timeout_ms 5_000
   @hold_state_persist_retry_delay_ms 1_000
   @default_process_cleanup_timeout_ms 2_000
+  @resume_phases ~w(implementation validation review-fix hosted-closeout landing)
+  @phase_resume_pending_reason "input_token_resume_pending"
+  @budget_hold_reasons ~w(input_token_limit input_token_warning_unsupported input_token_checkpoint input_token_checkpoint_grace input_token_checkpoint_failed input_token_resume_pending)
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -326,6 +329,48 @@ defmodule SymphonyElixir.Orchestrator do
     hold_exited_issue_with_unacknowledged_warning(state, issue_id, running_entry)
   end
 
+  defp handle_running_task_exit(
+         state,
+         issue_id,
+         %{input_token_warning_status: "delivered"} = running_entry,
+         _session_id,
+         :normal
+       ) do
+    hold_checkpointed_issue(state, issue_id, running_entry, "input_token_checkpoint")
+  end
+
+  defp handle_running_task_exit(
+         state,
+         issue_id,
+         %{input_token_warning_status: "delivered"} = running_entry,
+         _session_id,
+         _reason
+       ) do
+    hold_checkpointed_issue(state, issue_id, running_entry, "input_token_checkpoint_failed")
+  end
+
+  defp handle_running_task_exit(
+         state,
+         issue_id,
+         %{resume_phase: phase} = running_entry,
+         _session_id,
+         :normal
+       )
+       when is_binary(phase) do
+    hold_checkpointed_issue(state, issue_id, running_entry, "input_token_checkpoint")
+  end
+
+  defp handle_running_task_exit(
+         state,
+         issue_id,
+         %{resume_phase: phase} = running_entry,
+         _session_id,
+         _reason
+       )
+       when is_binary(phase) do
+    hold_checkpointed_issue(state, issue_id, running_entry, "input_token_checkpoint_failed")
+  end
+
   defp handle_running_task_exit(state, issue_id, running_entry, session_id, :normal) do
     Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
@@ -465,15 +510,43 @@ defmodule SymphonyElixir.Orchestrator do
   defp reconcile_held_issue(state, issue_id, %Issue{} = issue) do
     hold = Map.fetch!(state.holds, issue_id)
 
+    if hold_cleanup_pending?(state, issue_id, hold) do
+      Logger.debug("Held issue cleanup is still pending; keeping hold issue_id=#{issue_id}")
+      state
+    else
+      reconcile_clean_hold(state, issue_id, hold, issue)
+    end
+  end
+
+  defp reconcile_held_issue(state, issue_id, nil) do
+    Logger.debug("Held issue is not currently visible; keeping hold until a tracker state is verified issue_id=#{issue_id}")
+    state
+  end
+
+  defp hold_cleanup_pending?(state, issue_id, hold) do
+    Map.get(hold, :cleanup_pending, false) or Map.has_key?(state.running, issue_id)
+  end
+
+  defp reconcile_clean_hold(state, issue_id, hold, issue) do
+    if budget_hold?(hold) do
+      reconcile_budget_hold(state, issue_id, hold, issue)
+    else
+      reconcile_manual_hold(state, issue_id, hold, issue)
+    end
+  end
+
+  defp reconcile_budget_hold(state, issue_id, hold, issue) do
+    if is_binary(issue.state) and
+         normalize_issue_state(issue.state) != normalize_issue_state(hold.issue_state) do
+      Logger.info("Token-budget hold survives tracker state change: issue_id=#{issue_id} old_state=#{inspect(hold.issue_state)} new_state=#{inspect(issue.state)}")
+      persist_updated_hold(state, issue_id, %{hold | issue_state: issue.state})
+    else
+      state
+    end
+  end
+
+  defp reconcile_manual_hold(state, issue_id, hold, issue) do
     cond do
-      Map.get(hold, :cleanup_pending, false) ->
-        Logger.debug("Held issue cleanup is still pending; keeping hold issue_id=#{issue_id}")
-        state
-
-      Map.has_key?(state.running, issue_id) ->
-        Logger.debug("Held issue cleanup is still pending; keeping hold issue_id=#{issue_id}")
-        state
-
       not is_binary(issue.state) ->
         Logger.debug("Held issue returned without a verifiable tracker state; keeping hold issue_id=#{issue_id}")
         state
@@ -494,11 +567,6 @@ defmodule SymphonyElixir.Orchestrator do
 
         release_issue_hold(state, issue_id)
     end
-  end
-
-  defp reconcile_held_issue(state, issue_id, nil) do
-    Logger.debug("Held issue is not currently visible; keeping hold until a tracker state is verified issue_id=#{issue_id}")
-    state
   end
 
   @doc false
@@ -693,12 +761,59 @@ defmodule SymphonyElixir.Orchestrator do
       when is_integer(limit) and limit > 0 and is_integer(observed) and observed >= limit ->
         enforce_input_token_hard_limit(state, issue_id, running_entry, limit, observed)
 
-      %{input_token_limit: limit, codex_input_tokens: observed} = running_entry
-      when is_integer(limit) and limit > 0 and is_integer(observed) ->
+      %{codex_input_tokens: observed} = running_entry
+      when is_integer(observed) ->
+        if checkpoint_grace_exhausted?(running_entry, observed) do
+          enforce_input_token_checkpoint_grace(state, issue_id, running_entry, observed)
+        else
+          maybe_enforce_input_token_warning(state, issue_id, running_entry, observed)
+        end
+
+      _ ->
+        state
+    end
+  end
+
+  defp maybe_enforce_input_token_warning(state, issue_id, running_entry, observed) do
+    case Map.get(running_entry, :input_token_limit) do
+      limit when is_integer(limit) and limit > 0 ->
         maybe_warn_input_token_budget(state, issue_id, running_entry, limit, observed)
 
       _ ->
         state
+    end
+  end
+
+  defp checkpoint_grace_exhausted?(running_entry, observed) do
+    baseline = Map.get(running_entry, :input_token_warning_observed_at)
+    grace = Map.get(running_entry, :input_token_checkpoint_grace)
+
+    is_integer(baseline) and is_integer(grace) and grace > 0 and observed - baseline >= grace
+  end
+
+  defp enforce_input_token_checkpoint_grace(state, issue_id, running_entry, observed) do
+    limit = Map.get(running_entry, :input_token_limit)
+
+    case hold_token_budget_issue(
+           state,
+           issue_id,
+           running_entry,
+           "input_token_checkpoint_grace",
+           limit,
+           observed
+         ) do
+      {:ok, updated_state, _hold} -> updated_state
+      {:error, updated_state, _reason} -> updated_state
+    end
+  end
+
+  defp hold_checkpointed_issue(state, issue_id, running_entry, reason) do
+    limit = Map.get(running_entry, :input_token_limit)
+    observed = Map.get(running_entry, :codex_input_tokens, 0)
+
+    case hold_token_budget_issue(state, issue_id, running_entry, reason, limit, observed) do
+      {:ok, updated_state, _hold} -> updated_state
+      {:error, updated_state, _reason} -> updated_state
     end
   end
 
@@ -730,7 +845,13 @@ defmodule SymphonyElixir.Orchestrator do
     if observed >= warning_threshold and Map.get(running_entry, :input_token_warning_sent, false) == false do
       warning_status = steer_token_budget_warning(running_entry)
 
-      updated_entry = build_input_token_warning_entry(running_entry, warning_status)
+      updated_entry =
+        build_input_token_warning_entry(
+          running_entry,
+          warning_status,
+          warning_threshold,
+          observed
+        )
 
       Logger.warning(
         "Input-token warning threshold reached: issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} observed_tokens=#{observed} limit=#{limit} warning_ratio=#{warning_ratio} steering_status=#{warning_status}"
@@ -782,17 +903,21 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp build_input_token_warning_entry(running_entry, "requested") do
+  defp build_input_token_warning_entry(running_entry, "requested", warning_threshold, observed) do
     running_entry
     |> Map.put(:input_token_warning_sent, true)
     |> Map.put(:input_token_warning_status, "requested")
+    |> Map.put(:input_token_warning_threshold, warning_threshold)
+    |> Map.put(:input_token_warning_observed_at, observed)
     |> reset_input_token_warning_ack_timeout()
   end
 
-  defp build_input_token_warning_entry(running_entry, warning_status) do
+  defp build_input_token_warning_entry(running_entry, warning_status, warning_threshold, observed) do
     running_entry
     |> Map.put(:input_token_warning_sent, true)
     |> Map.put(:input_token_warning_status, warning_status)
+    |> Map.put(:input_token_warning_threshold, warning_threshold)
+    |> Map.put(:input_token_warning_observed_at, observed)
   end
 
   defp reset_input_token_warning_ack_timeout(running_entry) do
@@ -853,7 +978,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp token_budget_warning_instruction do
-    "Checkpoint now: update the workpad with completed work, remaining tasks, and validation status; then finish the highest-priority remaining scope concisely."
+    "Checkpoint only. Finish the already-running atomic tool call, update the persistent workpad with completed work, remaining tasks, validation status, exact HEAD, and stop conditions, then end this turn. Do not start new implementation, review, validation, or waiting work."
   end
 
   defp hold_token_budget_issue(state, issue_id, running_entry, reason, limit, observed) do
@@ -1084,6 +1209,14 @@ defmodule SymphonyElixir.Orchestrator do
       reason: reason,
       limit: limit,
       observed_tokens: observed,
+      warning_threshold: Map.get(running_entry, :input_token_warning_threshold),
+      warning_observed_at: Map.get(running_entry, :input_token_warning_observed_at),
+      checkpoint_grace: Map.get(running_entry, :input_token_checkpoint_grace),
+      resume_phase: Map.get(running_entry, :resume_phase),
+      requested_additional_input_tokens: Map.get(running_entry, :requested_additional_input_tokens),
+      effective_additional_input_tokens: Map.get(running_entry, :effective_additional_input_tokens),
+      attempt_input_token_baseline: Map.get(running_entry, :attempt_input_token_baseline, 0),
+      input_token_tier_limit: Map.get(running_entry, :input_token_tier_limit),
       issue_state: running_entry.issue.state,
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
@@ -1507,7 +1640,8 @@ defmodule SymphonyElixir.Orchestrator do
          attempt \\ nil,
          preferred_worker_host \\ nil,
          preferred_workspace_path \\ nil,
-         worker_affinity \\ nil
+         worker_affinity \\ nil,
+         phase_budget \\ nil
        ) do
     case revalidate_issue_for_dispatch(issue, &Tracker.fetch_issue_states_by_ids/1, terminal_state_set()) do
       {:ok, %Issue{} = refreshed_issue} ->
@@ -1517,7 +1651,8 @@ defmodule SymphonyElixir.Orchestrator do
           attempt,
           preferred_worker_host,
           preferred_workspace_path,
-          worker_affinity
+          worker_affinity,
+          phase_budget
         )
 
       {:skip, :missing} ->
@@ -1541,7 +1676,8 @@ defmodule SymphonyElixir.Orchestrator do
          attempt,
          preferred_worker_host,
          preferred_workspace_path,
-         worker_affinity
+         worker_affinity,
+         phase_budget
        ) do
     recipient = self()
 
@@ -1558,7 +1694,8 @@ defmodule SymphonyElixir.Orchestrator do
           recipient,
           worker_host,
           preferred_workspace_path,
-          worker_affinity
+          worker_affinity,
+          phase_budget
         )
     end
   end
@@ -1570,13 +1707,19 @@ defmodule SymphonyElixir.Orchestrator do
          recipient,
          worker_host,
          preferred_workspace_path,
-         worker_affinity
+         worker_affinity,
+         phase_budget
        ) do
     case Task.Supervisor.start_child(SymphonyElixir.TaskSupervisor, fn ->
            AgentRunner.run(issue, recipient,
              attempt: attempt,
              worker_host: worker_host,
-             workspace_path: preferred_workspace_path
+             workspace_path: preferred_workspace_path,
+             resume_phase: phase_budget_value(phase_budget, :phase),
+             max_additional_input_tokens: phase_budget_value(phase_budget, :effective_additional_input_tokens),
+             continue_after_turn: fn issue_id ->
+               continue_after_turn?(recipient, issue_id)
+             end
            )
          end) do
       {:ok, pid} ->
@@ -1613,13 +1756,21 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
-            input_token_limit: Config.input_token_limit_for_issue(claimed_issue),
+            input_token_limit: phase_budget_limit(phase_budget) || Config.input_token_limit_for_issue(claimed_issue),
+            input_token_tier_limit: Config.input_token_limit_for_issue(claimed_issue),
             input_token_warning_ratio: Config.settings!().codex.input_token_warning_ratio,
+            input_token_checkpoint_grace: Config.settings!().codex.input_token_checkpoint_grace,
             input_token_warning_sent: false,
             input_token_warning_status: nil,
+            input_token_warning_threshold: nil,
+            input_token_warning_observed_at: nil,
             input_token_warning_ack_timer_ref: nil,
             input_token_warning_ack_token: nil,
             input_token_warning_reader_busy: false,
+            resume_phase: phase_budget_value(phase_budget, :phase),
+            requested_additional_input_tokens: phase_budget_value(phase_budget, :requested_additional_input_tokens),
+            effective_additional_input_tokens: phase_budget_value(phase_budget, :effective_additional_input_tokens),
+            attempt_input_token_baseline: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: started_at
@@ -1642,7 +1793,8 @@ defmodule SymphonyElixir.Orchestrator do
             reason,
             worker_host,
             preferred_workspace_path,
-            worker_affinity
+            worker_affinity,
+            phase_budget
           )
 
         schedule_issue_retry(state, issue.id, next_attempt, metadata)
@@ -1654,14 +1806,16 @@ defmodule SymphonyElixir.Orchestrator do
          reason,
          worker_host,
          workspace_path,
-         worker_affinity
+         worker_affinity,
+         phase_budget
        ) do
     %{
       identifier: identifier,
       error: "failed to spawn agent: #{inspect(reason)}",
       worker_host: worker_host,
       workspace_path: workspace_path,
-      worker_affinity: worker_affinity
+      worker_affinity: worker_affinity,
+      phase_budget: phase_budget
     }
   end
 
@@ -1671,21 +1825,24 @@ defmodule SymphonyElixir.Orchestrator do
           term(),
           String.t() | nil,
           String.t() | nil,
-          :local | nil
+          :local | nil,
+          map() | nil
         ) :: map()
   def spawn_failure_retry_metadata_for_test(
         identifier,
         reason,
         worker_host,
         workspace_path,
-        worker_affinity
+        worker_affinity,
+        phase_budget
       ) do
     spawn_failure_retry_metadata(
       identifier,
       reason,
       worker_host,
       workspace_path,
-      worker_affinity
+      worker_affinity,
+      phase_budget
     )
   end
 
@@ -1719,12 +1876,35 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
-    if Map.has_key?(state.holds, issue_id) do
-      state
-    else
+    if retry_authorized?(state, issue_id, metadata) do
       do_schedule_issue_retry(state, issue_id, attempt, metadata)
+    else
+      state
     end
   end
+
+  defp retry_authorized?(state, issue_id, metadata) do
+    case Map.get(state.holds, issue_id) do
+      nil ->
+        true
+
+      %{reason: @phase_resume_pending_reason} = hold ->
+        phase_budget_matches_hold?(Map.get(metadata, :phase_budget), hold)
+
+      _hold ->
+        false
+    end
+  end
+
+  defp phase_budget_matches_hold?(phase_budget, hold) when is_map(phase_budget) do
+    Map.get(phase_budget, :phase) == Map.get(hold, :resume_phase) and
+      Map.get(phase_budget, :requested_additional_input_tokens) ==
+        Map.get(hold, :requested_additional_input_tokens) and
+      Map.get(phase_budget, :effective_additional_input_tokens) ==
+        Map.get(hold, :effective_additional_input_tokens)
+  end
+
+  defp phase_budget_matches_hold?(_phase_budget, _hold), do: false
 
   defp do_schedule_issue_retry(%State{} = state, issue_id, attempt, metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
@@ -1738,6 +1918,7 @@ defmodule SymphonyElixir.Orchestrator do
     worker_host = pick_retry_worker_host(previous_retry, metadata)
     workspace_path = pick_retry_workspace_path(previous_retry, metadata)
     worker_affinity = pick_retry_worker_affinity(previous_retry, metadata)
+    phase_budget = Map.get(metadata, :phase_budget, Map.get(previous_retry, :phase_budget))
 
     if is_reference(old_timer) do
       Process.cancel_timer(old_timer)
@@ -1761,7 +1942,8 @@ defmodule SymphonyElixir.Orchestrator do
             error: error,
             worker_host: worker_host,
             workspace_path: workspace_path,
-            worker_affinity: worker_affinity
+            worker_affinity: worker_affinity,
+            phase_budget: phase_budget
           })
     }
   end
@@ -1774,7 +1956,8 @@ defmodule SymphonyElixir.Orchestrator do
           error: Map.get(retry_entry, :error),
           worker_host: Map.get(retry_entry, :worker_host),
           workspace_path: Map.get(retry_entry, :workspace_path),
-          worker_affinity: Map.get(retry_entry, :worker_affinity)
+          worker_affinity: Map.get(retry_entry, :worker_affinity),
+          phase_budget: Map.get(retry_entry, :phase_budget)
         }
 
         {:ok, attempt, metadata, %{state | retry_attempts: Map.delete(state.retry_attempts, issue_id)}}
@@ -1786,7 +1969,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
     cond do
-      Map.has_key?(state.holds, issue_id) ->
+      not retry_authorized?(state, issue_id, metadata) ->
         {:noreply, state}
 
       not state.hold_store_available ->
@@ -1896,7 +2079,8 @@ defmodule SymphonyElixir.Orchestrator do
          attempt,
          metadata[:worker_host],
          metadata[:workspace_path],
-         metadata[:worker_affinity]
+         metadata[:worker_affinity],
+         metadata[:phase_budget]
        )}
     else
       Logger.debug("No available slots for retrying #{issue_context(issue)}; retrying again")
@@ -1939,6 +2123,22 @@ defmodule SymphonyElixir.Orchestrator do
       attempt when is_integer(attempt) and attempt > 0 -> attempt + 1
       _ -> nil
     end
+  end
+
+  defp phase_budget_limit(phase_budget) when is_map(phase_budget),
+    do: Map.get(phase_budget, :effective_additional_input_tokens)
+
+  defp phase_budget_limit(_phase_budget), do: nil
+
+  defp phase_budget_value(phase_budget, key) when is_map(phase_budget),
+    do: Map.get(phase_budget, key)
+
+  defp phase_budget_value(_phase_budget, _key), do: nil
+
+  defp continue_after_turn?(server, issue_id) do
+    GenServer.call(server, {:continue_after_turn, issue_id}, 5_000)
+  catch
+    :exit, _ -> false
   end
 
   defp pick_retry_identifier(issue_id, previous_retry, metadata) do
@@ -2201,13 +2401,30 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @spec resume_issue(String.t()) ::
-          {:ok, map()} | {:error, :issue_not_found | :unavailable | :cleanup_failed | :hold_state_unavailable}
-  def resume_issue(issue_identifier), do: resume_issue(issue_identifier, __MODULE__)
+          {:ok, map()}
+          | {:error,
+             :issue_not_found
+             | :unavailable
+             | :cleanup_failed
+             | :hold_state_unavailable
+             | :resume_phase_required
+             | :invalid_resume_phase
+             | :max_additional_input_tokens_required
+             | :invalid_max_additional_input_tokens
+             | :tracker_unavailable}
+  def resume_issue(issue_identifier), do: resume_issue(issue_identifier, %{}, __MODULE__)
 
   @spec resume_issue(String.t(), GenServer.server()) ::
-          {:ok, map()} | {:error, :issue_not_found | :unavailable | :cleanup_failed | :hold_state_unavailable}
+          {:ok, map()} | {:error, atom()}
   def resume_issue(issue_identifier, server) when is_binary(issue_identifier) do
-    call_control(server, {:resume_issue, issue_identifier})
+    resume_issue(issue_identifier, %{}, server)
+  end
+
+  @spec resume_issue(String.t(), map(), GenServer.server()) ::
+          {:ok, map()} | {:error, atom()}
+  def resume_issue(issue_identifier, options, server)
+      when is_binary(issue_identifier) and is_map(options) do
+    call_control(server, {:resume_issue, issue_identifier, options})
   end
 
   @spec snapshot() :: map() | :timeout | :unavailable
@@ -2245,8 +2462,16 @@ defmodule SymphonyElixir.Orchestrator do
           codex_output_tokens: metadata.codex_output_tokens,
           codex_total_tokens: metadata.codex_total_tokens,
           input_token_limit: Map.get(metadata, :input_token_limit),
+          input_token_tier_limit: Map.get(metadata, :input_token_tier_limit),
           input_token_warning_ratio: Map.get(metadata, :input_token_warning_ratio),
           input_token_warning_status: Map.get(metadata, :input_token_warning_status),
+          input_token_warning_threshold: Map.get(metadata, :input_token_warning_threshold),
+          input_token_warning_observed_at: Map.get(metadata, :input_token_warning_observed_at),
+          input_token_checkpoint_grace: Map.get(metadata, :input_token_checkpoint_grace),
+          resume_phase: Map.get(metadata, :resume_phase),
+          requested_additional_input_tokens: Map.get(metadata, :requested_additional_input_tokens),
+          effective_additional_input_tokens: Map.get(metadata, :effective_additional_input_tokens),
+          attempt_input_token_baseline: Map.get(metadata, :attempt_input_token_baseline, 0),
           turn_count: Map.get(metadata, :turn_count, 0),
           started_at: metadata.started_at,
           last_codex_timestamp: metadata.last_codex_timestamp,
@@ -2265,6 +2490,13 @@ defmodule SymphonyElixir.Orchestrator do
           reason: hold.reason,
           limit: hold.limit,
           observed_tokens: hold.observed_tokens,
+          warning_threshold: Map.get(hold, :warning_threshold),
+          warning_observed_at: Map.get(hold, :warning_observed_at),
+          checkpoint_grace: Map.get(hold, :checkpoint_grace),
+          resume_phase: Map.get(hold, :resume_phase),
+          requested_additional_input_tokens: Map.get(hold, :requested_additional_input_tokens),
+          effective_additional_input_tokens: Map.get(hold, :effective_additional_input_tokens),
+          attempt_input_token_baseline: Map.get(hold, :attempt_input_token_baseline, 0),
           issue_state: hold.issue_state,
           worker_host: Map.get(hold, :worker_host),
           workspace_path: Map.get(hold, :workspace_path),
@@ -2330,27 +2562,112 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  def handle_call({:continue_after_turn, issue_id}, _from, state) do
+    continue? =
+      case Map.get(state.running, issue_id) do
+        %{input_token_warning_status: "delivered"} -> false
+        %{input_token_warning_status: "unsupported"} -> false
+        nil -> false
+        _running_entry -> true
+      end
+
+    {:reply, continue?, state}
+  end
+
   def handle_call({:resume_issue, issue_identifier}, _from, state) do
+    handle_resume_call(issue_identifier, %{}, state)
+  end
+
+  def handle_call({:resume_issue, issue_identifier, options}, _from, state) do
+    handle_resume_call(issue_identifier, options, state)
+  end
+
+  defp handle_resume_call(issue_identifier, options, state) do
     case find_hold_by_identifier(state.holds, issue_identifier) do
       nil ->
         {:reply, {:error, :issue_not_found}, state}
 
       {issue_id, hold} ->
-        resume_held_issue(state, issue_id, hold)
+        case authorize_hold_resume(issue_id, hold, options) do
+          {:ok, phase_budget} -> resume_held_issue(state, issue_id, hold, phase_budget)
+          {:error, reason} -> {:reply, {:error, reason}, state}
+        end
     end
   end
 
-  defp resume_held_issue(%State{running: running} = state, issue_id, _hold)
+  defp authorize_hold_resume(issue_id, hold, options) do
+    if budget_hold?(hold) do
+      authorize_budget_hold_resume(issue_id, options)
+    else
+      {:ok, nil}
+    end
+  end
+
+  defp authorize_budget_hold_resume(issue_id, options) do
+    with {:ok, phase} <- validate_resume_phase(option_value(options, :phase)),
+         {:ok, requested} <-
+           validate_resume_allowance(option_value(options, :max_additional_input_tokens)),
+         {:ok, tier_limit} <- current_issue_tier_limit(issue_id) do
+      effective = if is_integer(tier_limit), do: min(requested, tier_limit), else: requested
+
+      {:ok,
+       %{
+         phase: phase,
+         requested_additional_input_tokens: requested,
+         effective_additional_input_tokens: effective,
+         attempt_input_token_baseline: 0,
+         current_issue_tier_limit: tier_limit
+       }}
+    end
+  end
+
+  defp budget_hold?(hold), do: Map.get(hold, :reason) in @budget_hold_reasons
+
+  defp validate_resume_phase(nil), do: {:error, :resume_phase_required}
+
+  defp validate_resume_phase(phase) when is_binary(phase) do
+    normalized = phase |> String.trim() |> String.downcase()
+
+    if normalized in @resume_phases do
+      {:ok, normalized}
+    else
+      {:error, :invalid_resume_phase}
+    end
+  end
+
+  defp validate_resume_phase(_phase), do: {:error, :invalid_resume_phase}
+
+  defp validate_resume_allowance(nil),
+    do: {:error, :max_additional_input_tokens_required}
+
+  defp validate_resume_allowance(value) when is_integer(value) and value > 0,
+    do: {:ok, value}
+
+  defp validate_resume_allowance(_value),
+    do: {:error, :invalid_max_additional_input_tokens}
+
+  defp current_issue_tier_limit(issue_id) do
+    case Tracker.fetch_issue_states_by_ids([issue_id]) do
+      {:ok, [%Issue{} = issue | _]} -> {:ok, Config.input_token_limit_for_issue(issue)}
+      _ -> {:error, :tracker_unavailable}
+    end
+  end
+
+  defp option_value(options, key) do
+    Map.get(options, key, Map.get(options, Atom.to_string(key)))
+  end
+
+  defp resume_held_issue(%State{running: running} = state, issue_id, _hold, _phase_budget)
        when is_map_key(running, issue_id) do
     {:reply, {:error, :cleanup_failed}, state}
   end
 
-  defp resume_held_issue(state, issue_id, %{cleanup_pending: true} = hold) do
+  defp resume_held_issue(state, issue_id, %{cleanup_pending: true} = hold, phase_budget) do
     case terminate_codex_process_tree(hold) do
       :ok ->
         case mark_hold_cleanup_complete(state, issue_id, hold) do
           {:ok, cleaned_state, cleaned_hold} ->
-            resume_cleaned_hold(cleaned_state, issue_id, cleaned_hold)
+            resume_cleaned_hold(cleaned_state, issue_id, cleaned_hold, phase_budget)
 
           {:error, safe_state, reason} ->
             {:reply, {:error, reason}, schedule_hold_state_persist_retry(safe_state)}
@@ -2362,22 +2679,59 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp resume_held_issue(state, issue_id, hold) do
-    resume_cleaned_hold(state, issue_id, hold)
+  defp resume_held_issue(state, issue_id, hold, phase_budget) do
+    resume_cleaned_hold(state, issue_id, hold, phase_budget)
   end
 
-  defp resume_cleaned_hold(state, issue_id, hold) do
-    state
-    |> release_issue_hold(issue_id)
-    |> finish_hold_resume(issue_id, hold)
+  defp resume_cleaned_hold(state, issue_id, hold, phase_budget) do
+    case phase_budget do
+      nil ->
+        state
+        |> release_issue_hold(issue_id)
+        |> finish_hold_resume(issue_id, hold, nil)
+
+      %{} ->
+        persist_phase_resume_authorization(state, issue_id, hold, phase_budget)
+    end
   end
 
-  defp finish_hold_resume(%State{holds: holds} = state, issue_id, _hold)
+  defp persist_phase_resume_authorization(state, issue_id, hold, phase_budget) do
+    pending_hold =
+      Map.merge(hold, %{
+        reason: @phase_resume_pending_reason,
+        limit: phase_budget.effective_additional_input_tokens,
+        observed_tokens: 0,
+        warning_threshold: nil,
+        warning_observed_at: nil,
+        checkpoint_grace: Config.settings!().codex.input_token_checkpoint_grace,
+        resume_phase: phase_budget.phase,
+        requested_additional_input_tokens: phase_budget.requested_additional_input_tokens,
+        effective_additional_input_tokens: phase_budget.effective_additional_input_tokens,
+        attempt_input_token_baseline: 0,
+        input_token_tier_limit: phase_budget.current_issue_tier_limit,
+        codex_app_server_pid: nil,
+        cleanup_pending: false,
+        held_at: DateTime.utc_now()
+      })
+
+    authorized_state = %{
+      state
+      | holds: Map.put(state.holds, issue_id, pending_hold),
+        claimed: MapSet.put(state.claimed, issue_id)
+    }
+
+    case persist_hold_state(authorized_state) do
+      :ok -> finish_phase_resume(authorized_state, issue_id, pending_hold, phase_budget)
+      {:error, _reason} -> {:reply, {:error, :hold_state_unavailable}, state}
+    end
+  end
+
+  defp finish_hold_resume(%State{holds: holds} = state, issue_id, _hold, _phase_budget)
        when is_map_key(holds, issue_id) do
     {:reply, {:error, :hold_state_unavailable}, state}
   end
 
-  defp finish_hold_resume(state, issue_id, hold) do
+  defp finish_hold_resume(state, issue_id, hold, phase_budget) do
     updated_state =
       state
       |> Map.update!(:claimed, &MapSet.put(&1, issue_id))
@@ -2386,10 +2740,43 @@ defmodule SymphonyElixir.Orchestrator do
         worker_host: Map.get(hold, :worker_host),
         workspace_path: Map.get(hold, :workspace_path),
         worker_affinity: if(is_nil(Map.get(hold, :worker_host)), do: :local),
-        delay_type: :continuation
+        delay_type: :continuation,
+        phase_budget: phase_budget
       })
 
-    {:reply, {:ok, %{issue_id: issue_id, identifier: hold.identifier, resumed: true}}, updated_state}
+    receipt =
+      %{
+        issue_id: issue_id,
+        identifier: hold.identifier,
+        resumed: true,
+        workspace_path: Map.get(hold, :workspace_path)
+      }
+      |> Map.merge(phase_budget || %{})
+
+    {:reply, {:ok, receipt}, updated_state}
+  end
+
+  defp finish_phase_resume(state, issue_id, hold, phase_budget) do
+    updated_state =
+      do_schedule_issue_retry(state, issue_id, 1, %{
+        identifier: hold.identifier,
+        worker_host: Map.get(hold, :worker_host),
+        workspace_path: Map.get(hold, :workspace_path),
+        worker_affinity: if(is_nil(Map.get(hold, :worker_host)), do: :local),
+        delay_type: :continuation,
+        phase_budget: phase_budget
+      })
+
+    receipt =
+      %{
+        issue_id: issue_id,
+        identifier: hold.identifier,
+        resumed: true,
+        workspace_path: Map.get(hold, :workspace_path)
+      }
+      |> Map.merge(phase_budget)
+
+    {:reply, {:ok, receipt}, updated_state}
   end
 
   defp integrate_codex_update(running_entry, %{event: event, timestamp: timestamp} = update) do

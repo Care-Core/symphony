@@ -1145,10 +1145,12 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       Codex.changeset(%Codex{}, %{
         input_token_limit: 1_000,
         input_token_warning_ratio: 0.8,
+        input_token_checkpoint_grace: 500,
         input_token_limits_by_label: %{" Backend " => 800, "backend" => 500, :urgent => 250}
       })
 
     assert valid_changeset.valid?
+    assert Changeset.apply_changes(valid_changeset).input_token_checkpoint_grace == 500
 
     assert Changeset.apply_changes(valid_changeset).input_token_limits_by_label == %{
              "backend" => 500,
@@ -1180,6 +1182,15 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     refute right_invalid_changeset.valid?
     assert right_invalid_changeset.errors == [input_token_limits_by_label: {"limits must be positive integers", []}]
+
+    invalid_grace_changeset =
+      Codex.changeset(%Codex{}, %{input_token_checkpoint_grace: 0})
+
+    refute invalid_grace_changeset.valid?
+
+    assert invalid_grace_changeset.errors == [
+             input_token_checkpoint_grace: {"must be greater than %{number}", [validation: :number, kind: :greater_than, number: 0]}
+           ]
   end
 
   test "schema parse normalizes policy keys and env-backed fallbacks" do
