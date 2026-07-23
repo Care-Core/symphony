@@ -654,6 +654,8 @@ defmodule SymphonyElixir.CoreTest do
       pid: self(),
       ref: ref,
       identifier: "MT-560",
+      worker_host: "resume-worker.example",
+      workspace_path: "/srv/workspaces/MT-560-preserved",
       issue: %Issue{id: issue_id, identifier: "MT-560", state: "In Progress"},
       started_at: DateTime.utc_now()
     }
@@ -669,10 +671,49 @@ defmodule SymphonyElixir.CoreTest do
     Process.sleep(50)
     state = :sys.get_state(pid)
 
-    assert %{attempt: 1, due_at_ms: due_at_ms, identifier: "MT-560", error: "agent exited: :boom"} =
+    assert %{
+             attempt: 1,
+             due_at_ms: due_at_ms,
+             identifier: "MT-560",
+             error: "agent exited: :boom",
+             worker_host: "resume-worker.example",
+             workspace_path: "/srv/workspaces/MT-560-preserved"
+           } =
              state.retry_attempts[issue_id]
 
     assert_due_in_range(due_at_ms, 9_000, 10_500)
+  end
+
+  test "child startup failure preserves resumed workspace and local affinity" do
+    assert %{
+             identifier: "MT-RESUME",
+             error: "failed to spawn agent: :noproc",
+             worker_host: nil,
+             workspace_path: "/tmp/workspaces/MT-RESUME",
+             worker_affinity: :local
+           } =
+             Orchestrator.spawn_failure_retry_metadata_for_test(
+               "MT-RESUME",
+               :noproc,
+               nil,
+               "/tmp/workspaces/MT-RESUME",
+               :local
+             )
+  end
+
+  test "local resume affinity cannot switch to a newly configured SSH worker" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      worker_ssh_hosts: ["worker.example"]
+    )
+
+    state = %Orchestrator.State{running: %{}}
+
+    refute Orchestrator.retry_worker_slots_available_for_test(state, %{
+             worker_host: nil,
+             workspace_path: "/tmp/workspaces/MT-RESUME",
+             worker_affinity: :local
+           })
   end
 
   test "stale retry timer messages do not consume newer retry entries" do

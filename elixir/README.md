@@ -264,7 +264,8 @@ Operational control endpoints:
   preserved. Remote cleanup timeout/failure returns `503 cleanup_failed`; the durable hold remains
   active with `cleanup_pending: true` and cannot be released by tracker changes.
 - `POST /api/v1/<issue_identifier>/resume` retries any pending cleanup from stored process proof,
-  clears the hold only after cleanup is confirmed, and queues an immediate poll. Successful remote
+  clears the hold only after cleanup is confirmed, and queues exactly one short continuation
+  attempt with the held workspace and worker metadata. Successful remote
   cleanup atomically replaces its identity-bound `running:<pid>:<start-id>` proof with a validated
   `stopped:<pid>:<start-id>` completion proof. The start ID encodes the process start time, which
   cleanup verifies before every signal, so a crash before the hold update can retry without

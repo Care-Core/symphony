@@ -92,6 +92,30 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "workspace resume reuses the exact validated held path" do
+    workspace_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-held-path-#{System.unique_integer([:positive])}"
+      )
+
+    held_workspace = Path.join(workspace_root, "preserved-workpad")
+    marker = Path.join(held_workspace, "workpad.md")
+
+    try do
+      write_workflow_file!(Workflow.workflow_file_path(), workspace_root: workspace_root)
+      File.mkdir_p!(held_workspace)
+      File.write!(marker, "resume here\n")
+
+      assert {:ok, ^held_workspace} =
+               Workspace.create_for_issue("MT-RESUME", nil, workspace_path: held_workspace)
+
+      assert File.read!(marker) == "resume here\n"
+    after
+      File.rm_rf(workspace_root)
+    end
+  end
+
   test "workspace replaces stale non-directory paths" do
     workspace_root =
       Path.join(

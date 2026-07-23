@@ -541,16 +541,48 @@ defmodule SymphonyElixir.TokenBudgetTest do
     refute Process.alive?(worker_pid)
   end
 
-  test "explicit resume clears a hold and unknown controls are rejected" do
+  test "explicit resume clears a hold and queues one continuation attempt" do
     {pid, issue, worker_pid} = start_budget_orchestrator("resume", 100)
-    put_running_entry(pid, issue, worker_pid, input_token_limit: 100)
+    workspace = Path.join(Config.settings!().workspace.root, issue.identifier)
+    put_running_entry(pid, issue, worker_pid, input_token_limit: 100, workspace_path: workspace)
     send_token_update(pid, issue.id, 100)
 
     assert {:ok, %{resumed: true}} = Orchestrator.resume_issue(issue.identifier, pid)
     assert Orchestrator.snapshot(pid, 1_000).held == []
 
+    assert %{
+             attempt: 1,
+             identifier: identifier,
+             workspace_path: ^workspace,
+             retry_token: retry_token
+           } = :sys.get_state(pid).retry_attempts[issue.id]
+
+    assert identifier == issue.identifier
+    assert is_reference(retry_token)
+    assert map_size(:sys.get_state(pid).retry_attempts) == 1
+    assert MapSet.member?(:sys.get_state(pid).claimed, issue.id)
+    refute Orchestrator.should_dispatch_issue_for_test(issue, :sys.get_state(pid))
+
     assert {:error, :issue_not_found} = Orchestrator.stop_issue("UNKNOWN-1", pid)
     assert {:error, :issue_not_found} = Orchestrator.resume_issue("UNKNOWN-1", pid)
+  end
+
+  test "resume continuation context renders the non-fresh workflow branch" do
+    write_workflow_file!(Workflow.workflow_file_path(),
+      prompt: "{% if attempt %}Resume attempt {{ attempt }}{% else %}Fresh run{% endif %}"
+    )
+
+    issue = %Issue{
+      id: "issue-resume-prompt",
+      identifier: "MT-RESUME-PROMPT",
+      title: "Resume prompt",
+      state: "In Progress",
+      labels: []
+    }
+
+    prompt = PromptBuilder.build_prompt(issue, attempt: 1)
+    assert prompt =~ "Resume attempt 1"
+    refute prompt =~ "Fresh run"
   end
 
   test "manual stop returns after running ends and preserves the workspace" do
@@ -687,6 +719,10 @@ defmodule SymphonyElixir.TokenBudgetTest do
 
     assert {:ok, %{resumed: true}} = Orchestrator.resume_issue(issue.identifier, restarted_pid)
     assert Orchestrator.snapshot(restarted_pid, 1_000).held == []
+    assert %{attempt: 1, identifier: identifier} = :sys.get_state(restarted_pid).retry_attempts[issue.id]
+    assert identifier == issue.identifier
+    assert map_size(:sys.get_state(restarted_pid).retry_attempts) == 1
+    assert MapSet.member?(:sys.get_state(restarted_pid).claimed, issue.id)
   end
 
   test "resume retries stored cleanup proof and releases only after confirmed cleanup" do
@@ -713,6 +749,12 @@ defmodule SymphonyElixir.TokenBudgetTest do
     File.write!(fake_ssh, "#!/bin/sh\nprintf '%s\\n' \"$@\" > '#{cleanup_trace}'\nexit 0\n")
     assert {:ok, %{resumed: true}} = Orchestrator.resume_issue(issue.identifier, restarted_pid)
     assert Orchestrator.snapshot(restarted_pid, 1_000).held == []
+
+    assert %{attempt: 1, worker_host: "worker.example", workspace_path: ^remote_workspace} =
+             :sys.get_state(restarted_pid).retry_attempts[issue.id]
+
+    assert map_size(:sys.get_state(restarted_pid).retry_attempts) == 1
+    assert MapSet.member?(:sys.get_state(restarted_pid).claimed, issue.id)
   end
 
   test "persistence recovery durably confirms an already successful cleanup" do
