@@ -39,7 +39,7 @@ defmodule SymphonyElixir.TokenBudgetTest do
     assert message =~ "codex.input_token_warning_ratio"
   end
 
-  test "warning threshold crosses once and records unsupported steering honestly" do
+  test "warning threshold with no live steering channel creates a durable hold" do
     {pid, issue, worker_pid} = start_budget_orchestrator("warning", 100)
     put_running_entry(pid, issue, worker_pid, input_token_limit: 100)
 
@@ -48,25 +48,442 @@ defmodule SymphonyElixir.TokenBudgetTest do
     assert running.input_token_warning_status == nil
 
     send_token_update(pid, issue.id, 70)
-    assert [running] = Orchestrator.snapshot(pid, 1_000).running
-    assert running.input_token_warning_status == "unsupported"
+    snapshot = Orchestrator.snapshot(pid, 30_000)
+    assert snapshot.running == []
+    assert snapshot.retrying == []
 
-    send_token_update(pid, issue.id, 80)
-    assert [running] = Orchestrator.snapshot(pid, 1_000).running
-    assert running.input_token_warning_status == "unsupported"
-    assert :sys.get_state(pid).running[issue.id].input_token_warning_sent == true
+    assert [%{reason: "input_token_warning_unsupported", limit: 100, observed_tokens: 70}] =
+             snapshot.held
+
+    refute Process.alive?(worker_pid)
   end
 
-  test "modern thread token-usage notifications enforce the warning threshold" do
+  test "modern thread token-usage warning also fails closed without steering" do
     {pid, issue, worker_pid} = start_budget_orchestrator("modern-warning", 100)
     put_running_entry(pid, issue, worker_pid, input_token_limit: 100)
 
     send_modern_token_update(pid, issue.id, 70)
 
-    assert [running] = Orchestrator.snapshot(pid, 1_000).running
-    assert running.codex_input_tokens == 70
-    assert running.input_token_warning_status == "unsupported"
-    assert :sys.get_state(pid).running[issue.id].input_token_warning_sent == true
+    snapshot = Orchestrator.snapshot(pid, 30_000)
+    assert snapshot.running == []
+    assert [%{reason: "input_token_warning_unsupported", observed_tokens: 70}] = snapshot.held
+    refute Process.alive?(worker_pid)
+  end
+
+  test "a rejected steering response holds the run before the hard limit" do
+    {pid, issue, worker_pid} = start_budget_orchestrator("rejected-warning", 100)
+    workspace = Path.join(Config.settings!().workspace.root, issue.identifier)
+    marker = Path.join(workspace, "preserve-me")
+    File.mkdir_p!(workspace)
+    File.write!(marker, "kept")
+
+    command = "while IFS= read -r _line; do :; done"
+    {:ok, codex_port} = ProcessTree.open_port(System.find_executable("sh"), ["-c", command])
+
+    put_running_entry(pid, issue, worker_pid,
+      input_token_limit: 100,
+      workspace_path: workspace,
+      codex_app_server_port: codex_port,
+      thread_id: "thread-warning",
+      turn_id: "turn-warning"
+    )
+
+    send_token_update(pid, issue.id, 70)
+    assert [%{input_token_warning_status: "requested"}] = Orchestrator.snapshot(pid, 1_000).running
+
+    send(
+      pid,
+      {:codex_worker_update, issue.id,
+       %{
+         event: :token_budget_warning_unsupported,
+         payload: %{"code" => -32_602, "message" => "invalid params"},
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    snapshot = Orchestrator.snapshot(pid, 30_000)
+    assert snapshot.running == []
+    assert snapshot.retrying == []
+
+    assert [%{reason: "input_token_warning_unsupported", limit: 100, observed_tokens: 70}] =
+             snapshot.held
+
+    refute Process.alive?(worker_pid)
+    assert File.read!(marker) == "kept"
+  end
+
+  test "an unacknowledged steering request holds the run after its deadline" do
+    {pid, issue, worker_pid} = start_budget_orchestrator("unacknowledged-warning", 100)
+    command = "while IFS= read -r _line; do :; done"
+    {:ok, codex_port} = ProcessTree.open_port(System.find_executable("sh"), ["-c", command])
+
+    put_running_entry(pid, issue, worker_pid,
+      input_token_limit: 100,
+      codex_app_server_port: codex_port,
+      thread_id: "thread-warning",
+      turn_id: "turn-warning"
+    )
+
+    send_token_update(pid, issue.id, 70)
+    state = :sys.get_state(pid)
+    timeout_token = state.running[issue.id].input_token_warning_ack_token
+    assert is_reference(timeout_token)
+
+    send(pid, {:input_token_warning_ack_timeout, issue.id, timeout_token})
+
+    snapshot = Orchestrator.snapshot(pid, 30_000)
+    assert snapshot.running == []
+    assert snapshot.retrying == []
+    assert [%{reason: "input_token_warning_unsupported", observed_tokens: 70}] = snapshot.held
+    refute Process.alive?(worker_pid)
+  end
+
+  test "acknowledgement deadline defers while the protocol reader executes a tool" do
+    {pid, issue, worker_pid} = start_budget_orchestrator("busy-reader-warning", 100)
+    command = "while IFS= read -r _line; do :; done"
+    {:ok, codex_port} = ProcessTree.open_port(System.find_executable("sh"), ["-c", command])
+    on_exit(fn -> ProcessTree.terminate_port(codex_port, 500) end)
+
+    put_running_entry(pid, issue, worker_pid,
+      input_token_limit: 100,
+      codex_app_server_port: codex_port,
+      thread_id: "thread-warning",
+      turn_id: "turn-warning"
+    )
+
+    send_token_update(pid, issue.id, 70)
+    first_timeout_token = :sys.get_state(pid).running[issue.id].input_token_warning_ack_token
+
+    send(
+      pid,
+      {:codex_worker_update, issue.id,
+       %{
+         event: :tool_call_started,
+         payload: %{"method" => "item/tool/call"},
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    send(pid, {:input_token_warning_ack_timeout, issue.id, first_timeout_token})
+    busy_entry = :sys.get_state(pid).running[issue.id]
+    assert busy_entry.input_token_warning_status == "requested"
+    assert busy_entry.input_token_warning_reader_busy == true
+    refute busy_entry.input_token_warning_ack_token == first_timeout_token
+
+    busy_timeout_token = busy_entry.input_token_warning_ack_token
+
+    send(
+      pid,
+      {:codex_worker_update, issue.id,
+       %{
+         event: :tool_call_completed,
+         payload: %{"success" => true},
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    ready_entry = :sys.get_state(pid).running[issue.id]
+    assert ready_entry.input_token_warning_reader_busy == false
+    refute ready_entry.input_token_warning_ack_token == busy_timeout_token
+
+    send(pid, {:input_token_warning_ack_timeout, issue.id, busy_timeout_token})
+
+    send(
+      pid,
+      {:codex_worker_update, issue.id,
+       %{
+         event: :token_budget_warning_delivered,
+         payload: %{"turnId" => "turn-warning"},
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    assert [%{input_token_warning_status: "delivered"}] =
+             Orchestrator.snapshot(pid, 1_000).running
+
+    assert Orchestrator.snapshot(pid, 1_000).held == []
+    assert Process.alive?(worker_pid)
+  end
+
+  test "worker exit while warning acknowledgement is pending creates a hold instead of a retry" do
+    install_fake_ssh!("pending-warning-exit", "exit 0\n")
+    {pid, issue, worker_pid} = start_budget_orchestrator("pending-warning-exit", 100)
+    command = "while IFS= read -r _line; do :; done"
+    {:ok, codex_port} = ProcessTree.open_port(System.find_executable("sh"), ["-c", command])
+    on_exit(fn -> ProcessTree.terminate_port(codex_port, 500) end)
+
+    put_running_entry(pid, issue, worker_pid,
+      input_token_limit: 100,
+      worker_host: "worker.example",
+      workspace_path: "/srv/workspaces/#{issue.identifier}",
+      codex_app_server_port: codex_port,
+      thread_id: "thread-warning",
+      turn_id: "turn-warning"
+    )
+
+    send_token_update(pid, issue.id, 70)
+    assert [%{input_token_warning_status: "requested"}] = Orchestrator.snapshot(pid, 1_000).running
+
+    running_ref = :sys.get_state(pid).running[issue.id].ref
+    Process.exit(worker_pid, :shutdown)
+    send(pid, {:DOWN, running_ref, :process, worker_pid, :shutdown})
+
+    assert_eventually(fn ->
+      case Orchestrator.snapshot(pid, 1_000) do
+        %{running: [], retrying: [], held: held} ->
+          match?(
+            [
+              %{
+                reason: "input_token_warning_unsupported",
+                observed_tokens: 70,
+                cleanup_pending: false
+              }
+            ],
+            held
+          )
+
+        _ ->
+          false
+      end
+    end)
+  end
+
+  test "worker-exit warning cleanup retries from durable proof after the running entry is gone" do
+    {fake_ssh, _fake_root} = install_fake_ssh!("pending-warning-exit-cleanup", "exit 17\n")
+    {pid, issue, worker_pid} = start_budget_orchestrator("pending-warning-exit-cleanup", 100)
+    command = "while IFS= read -r _line; do :; done"
+    {:ok, codex_port} = ProcessTree.open_port(System.find_executable("sh"), ["-c", command])
+    on_exit(fn -> ProcessTree.terminate_port(codex_port, 500) end)
+
+    put_running_entry(pid, issue, worker_pid,
+      input_token_limit: 100,
+      worker_host: "worker.example",
+      workspace_path: "/srv/workspaces/#{issue.identifier}",
+      codex_app_server_port: codex_port,
+      thread_id: "thread-warning",
+      turn_id: "turn-warning"
+    )
+
+    send_token_update(pid, issue.id, 70)
+    assert [%{input_token_warning_status: "requested"}] = Orchestrator.snapshot(pid, 1_000).running
+
+    running_ref = :sys.get_state(pid).running[issue.id].ref
+    Process.exit(worker_pid, :shutdown)
+    send(pid, {:DOWN, running_ref, :process, worker_pid, :shutdown})
+
+    assert_eventually(fn ->
+      state = :sys.get_state(pid)
+
+      state.running == %{} and state.hold_store_available == false and
+        state.holds[issue.id].cleanup_pending == true
+    end)
+
+    paused_state = :sys.get_state(pid)
+    Process.cancel_timer(paused_state.hold_state_persist_retry_timer_ref)
+    File.write!(fake_ssh, "#!/bin/sh\nexit 0\n")
+
+    send(pid, {:hold_state_persist_retry, paused_state.hold_state_persist_retry_token})
+
+    assert_eventually(fn ->
+      recovered_state = :sys.get_state(pid)
+
+      recovered_state.running == %{} and recovered_state.hold_store_available == true and
+        recovered_state.holds[issue.id].cleanup_pending == false
+    end)
+  end
+
+  test "a warning hold stops immediately and pauses dispatch while persistence retries" do
+    {pid, issue, worker_pid} = start_budget_orchestrator("warning-hold-retry", 100)
+    state_file = Path.join(Config.settings!().workspace.root, ".symphony-holds.json")
+    File.mkdir_p!(state_file)
+
+    put_running_entry(pid, issue, worker_pid, input_token_limit: 100)
+    send_token_update(pid, issue.id, 70)
+
+    state = :sys.get_state(pid)
+    assert state.running == %{}
+    assert state.hold_store_available == false
+    assert state.holds[issue.id].reason == "input_token_warning_unsupported"
+    retry_token = state.hold_state_persist_retry_token
+    assert is_reference(retry_token)
+    refute Process.alive?(worker_pid)
+
+    send(pid, :run_poll_cycle)
+    assert :sys.get_state(pid).running == %{}
+
+    retry_issue = %Issue{
+      id: "issue-dispatch-paused",
+      identifier: "MT-DISPATCH-PAUSED",
+      title: "Dispatch remains paused",
+      state: "In Progress",
+      labels: []
+    }
+
+    queued_retry_token = make_ref()
+
+    :sys.replace_state(pid, fn paused_state ->
+      retry_entry = %{
+        attempt: 1,
+        retry_token: queued_retry_token,
+        identifier: retry_issue.identifier,
+        worker_host: nil,
+        workspace_path: nil
+      }
+
+      %{
+        paused_state
+        | retry_attempts: Map.put(paused_state.retry_attempts, retry_issue.id, retry_entry),
+          claimed: MapSet.put(paused_state.claimed, retry_issue.id)
+      }
+    end)
+
+    send(pid, {:retry_issue, retry_issue.id, queued_retry_token})
+
+    assert_eventually(fn ->
+      paused_state = :sys.get_state(pid)
+
+      Map.has_key?(paused_state.retry_attempts, retry_issue.id) and
+        not Map.has_key?(paused_state.running, retry_issue.id)
+    end)
+
+    File.rmdir!(state_file)
+    send(pid, {:hold_state_persist_retry, retry_token})
+
+    snapshot = Orchestrator.snapshot(pid, 30_000)
+    assert snapshot.running == []
+    assert [%{reason: "input_token_warning_unsupported", observed_tokens: 70}] = snapshot.held
+    assert :sys.get_state(pid).hold_store_available == true
+    assert File.regular?(state_file)
+    refute Process.alive?(worker_pid)
+  end
+
+  test "hard-limit enforcement stops even when hold persistence is unavailable" do
+    {pid, issue, worker_pid} = start_budget_orchestrator("hard-limit-hold-retry", 100)
+    state_file = Path.join(Config.settings!().workspace.root, ".symphony-holds.json")
+    File.mkdir_p!(state_file)
+
+    put_running_entry(pid, issue, worker_pid, input_token_limit: 100)
+    send_token_update(pid, issue.id, 100)
+
+    state = :sys.get_state(pid)
+    assert state.running == %{}
+    assert state.hold_store_available == false
+    assert state.holds[issue.id].reason == "input_token_limit"
+    assert state.holds[issue.id].observed_tokens == 100
+    refute Process.alive?(worker_pid)
+  end
+
+  test "dispatch stays paused until quarantined cleanup succeeds after persistence recovery" do
+    {fake_ssh, _fake_root} = install_fake_ssh!("outage-cleanup-retry", "exit 17\n")
+    {pid, issue, worker_pid} = start_budget_orchestrator("outage-cleanup-retry", 100)
+    state_file = Path.join(Config.settings!().workspace.root, ".symphony-holds.json")
+    File.mkdir_p!(state_file)
+
+    put_running_entry(pid, issue, worker_pid,
+      input_token_limit: 100,
+      worker_host: "worker.example",
+      workspace_path: "/srv/workspaces/#{issue.identifier}"
+    )
+
+    send_token_update(pid, issue.id, 70)
+    paused_state = :sys.get_state(pid)
+    assert paused_state.hold_store_available == false
+    assert Map.has_key?(paused_state.running, issue.id)
+    assert paused_state.holds[issue.id].cleanup_pending == true
+    Process.cancel_timer(paused_state.hold_state_persist_retry_timer_ref)
+
+    File.rmdir!(state_file)
+    send(pid, {:hold_state_persist_retry, paused_state.hold_state_persist_retry_token})
+
+    assert_eventually(fn ->
+      retry_state = :sys.get_state(pid)
+      retry_state.hold_store_available == false and Map.has_key?(retry_state.running, issue.id)
+    end)
+
+    cleanup_retry_state = :sys.get_state(pid)
+    Process.cancel_timer(cleanup_retry_state.hold_state_persist_retry_timer_ref)
+    File.write!(fake_ssh, "#!/bin/sh\nexit 0\n")
+
+    send(
+      pid,
+      {:hold_state_persist_retry, cleanup_retry_state.hold_state_persist_retry_token}
+    )
+
+    assert_eventually(fn ->
+      recovered_state = :sys.get_state(pid)
+
+      recovered_state.hold_store_available == true and
+        recovered_state.running == %{} and
+        recovered_state.holds[issue.id].cleanup_pending == false
+    end)
+
+    refute Process.alive?(worker_pid)
+  end
+
+  test "warning cleanup failure pauses dispatch and retries until cleanup succeeds" do
+    {fake_ssh, _fake_root} = install_fake_ssh!("warning-cleanup-retry", "exit 17\n")
+    {pid, issue, worker_pid} = start_budget_orchestrator("warning-cleanup-retry", 100)
+
+    put_running_entry(pid, issue, worker_pid,
+      input_token_limit: 100,
+      worker_host: "worker.example",
+      workspace_path: "/srv/workspaces/#{issue.identifier}"
+    )
+
+    send_token_update(pid, issue.id, 70)
+
+    paused_state = :sys.get_state(pid)
+    assert paused_state.hold_store_available == false
+    assert Map.has_key?(paused_state.running, issue.id)
+    assert paused_state.holds[issue.id].cleanup_pending == true
+    assert is_reference(paused_state.hold_state_persist_retry_token)
+    Process.cancel_timer(paused_state.hold_state_persist_retry_timer_ref)
+
+    File.write!(fake_ssh, "#!/bin/sh\nexit 0\n")
+    send(pid, {:hold_state_persist_retry, paused_state.hold_state_persist_retry_token})
+
+    assert_eventually(fn ->
+      recovered_state = :sys.get_state(pid)
+
+      recovered_state.hold_store_available == true and
+        recovered_state.running == %{} and
+        recovered_state.holds[issue.id].cleanup_pending == false
+    end)
+
+    refute Process.alive?(worker_pid)
+  end
+
+  test "a delivered steering response keeps the checkpointed run active" do
+    {pid, issue, worker_pid} = start_budget_orchestrator("delivered-warning", 100)
+    command = "while IFS= read -r _line; do :; done"
+    {:ok, codex_port} = ProcessTree.open_port(System.find_executable("sh"), ["-c", command])
+    on_exit(fn -> ProcessTree.terminate_port(codex_port, 500) end)
+
+    put_running_entry(pid, issue, worker_pid,
+      input_token_limit: 100,
+      codex_app_server_port: codex_port,
+      thread_id: "thread-warning",
+      turn_id: "turn-warning"
+    )
+
+    send_token_update(pid, issue.id, 70)
+    assert [%{input_token_warning_status: "requested"}] = Orchestrator.snapshot(pid, 1_000).running
+
+    send(
+      pid,
+      {:codex_worker_update, issue.id,
+       %{
+         event: :token_budget_warning_delivered,
+         payload: %{"turnId" => "turn-warning"},
+         timestamp: DateTime.utc_now()
+       }}
+    )
+
+    assert [%{input_token_warning_status: "delivered"}] =
+             Orchestrator.snapshot(pid, 1_000).running
+
+    assert Orchestrator.snapshot(pid, 1_000).held == []
+    assert Process.alive?(worker_pid)
   end
 
   test "exact hard limit stops the process tree, suppresses retries, and preserves workspace" do
@@ -246,6 +663,11 @@ defmodule SymphonyElixir.TokenBudgetTest do
     :ok = GenServer.stop(pid)
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [%{issue | state: "Human Review"}])
     restarted_pid = start_replacement_orchestrator()
+    restarted_state = :sys.get_state(restarted_pid)
+    assert restarted_state.hold_store_available == false
+    assert is_reference(restarted_state.hold_state_persist_retry_token)
+    Process.cancel_timer(restarted_state.hold_state_persist_retry_timer_ref)
+
     send(restarted_pid, :run_poll_cycle)
 
     assert_eventually(fn ->
@@ -293,7 +715,7 @@ defmodule SymphonyElixir.TokenBudgetTest do
     assert Orchestrator.snapshot(restarted_pid, 1_000).held == []
   end
 
-  test "persistence failure after successful cleanup keeps the pending hold" do
+  test "persistence recovery durably confirms an already successful cleanup" do
     {fake_ssh, _fake_root} = install_fake_ssh!("cleanup-persist-failure", "exit 17\n")
     {pid, issue, worker_pid} = start_budget_orchestrator("cleanup-persist-failure", 100)
     workspace_root = Config.settings!().workspace.root
@@ -315,7 +737,64 @@ defmodule SymphonyElixir.TokenBudgetTest do
     assert {:error, :hold_state_unavailable} =
              Orchestrator.resume_issue(issue.identifier, restarted_pid)
 
-    assert [%{cleanup_pending: true}] = Orchestrator.snapshot(restarted_pid, 1_000).held
+    assert [%{cleanup_pending: false}] = Orchestrator.snapshot(restarted_pid, 1_000).held
+
+    paused_state = :sys.get_state(restarted_pid)
+    assert paused_state.hold_store_available == false
+    Process.cancel_timer(paused_state.hold_state_persist_retry_timer_ref)
+
+    File.write!(fake_ssh, "#!/bin/sh\nexit 17\n")
+    File.rmdir!(state_file)
+    send(restarted_pid, {:hold_state_persist_retry, paused_state.hold_state_persist_retry_token})
+
+    assert_eventually(fn -> :sys.get_state(restarted_pid).hold_store_available == true end)
+    assert File.regular?(state_file)
+    assert [%{cleanup_pending: false}] = Orchestrator.snapshot(restarted_pid, 1_000).held
+  end
+
+  test "restart can confirm remote cleanup after the hold update crash window" do
+    {fake_ssh, _fake_root} = install_fake_ssh!("cleanup-crash-window", "exit 17\n")
+    {pid, issue, worker_pid} = start_budget_orchestrator("cleanup-crash-window", 100)
+    workspace_root = Config.settings!().workspace.root
+    state_file = Path.join(workspace_root, ".symphony-holds.json")
+
+    put_running_entry(pid, issue, worker_pid,
+      worker_host: "worker.example",
+      workspace_path: "/srv/workspaces/#{issue.identifier}"
+    )
+
+    assert {:error, :cleanup_failed} = Orchestrator.stop_issue(issue.identifier, pid)
+    :ok = GenServer.stop(pid)
+    restarted_pid = start_replacement_orchestrator()
+    pending_hold_json = File.read!(state_file)
+
+    File.write!(fake_ssh, "#!/bin/sh\nexit 0\n")
+    File.rm!(state_file)
+    File.mkdir_p!(state_file)
+
+    assert {:error, :hold_state_unavailable} =
+             Orchestrator.resume_issue(issue.identifier, restarted_pid)
+
+    :ok = GenServer.stop(restarted_pid)
+    File.rmdir!(state_file)
+    File.write!(state_file, pending_hold_json)
+
+    crash_restarted_pid = start_replacement_orchestrator()
+    crash_restarted_state = :sys.get_state(crash_restarted_pid)
+    assert crash_restarted_state.hold_store_available == false
+    Process.cancel_timer(crash_restarted_state.hold_state_persist_retry_timer_ref)
+
+    send(
+      crash_restarted_pid,
+      {:hold_state_persist_retry, crash_restarted_state.hold_state_persist_retry_token}
+    )
+
+    assert_eventually(fn ->
+      recovered_state = :sys.get_state(crash_restarted_pid)
+
+      recovered_state.hold_store_available == true and
+        recovered_state.holds[issue.id].cleanup_pending == false
+    end)
   end
 
   test "manual stop of a retry stores a non-pending hold without process proof" do
@@ -476,7 +955,8 @@ defmodule SymphonyElixir.TokenBudgetTest do
     payload = trace |> File.read!() |> Jason.decode!()
     assert payload["method"] == "turn/steer"
     assert payload["params"]["threadId"] == "thread-1"
-    assert payload["params"]["turnId"] == "turn-1"
+    assert payload["params"]["expectedTurnId"] == "turn-1"
+    refute Map.has_key?(payload["params"], "turnId")
     assert payload["params"]["input"] == [%{"type" => "text", "text" => "checkpoint"}]
   end
 
@@ -549,6 +1029,9 @@ defmodule SymphonyElixir.TokenBudgetTest do
       input_token_warning_ratio: 0.70,
       input_token_warning_sent: false,
       input_token_warning_status: nil,
+      input_token_warning_ack_timer_ref: nil,
+      input_token_warning_ack_token: nil,
+      input_token_warning_reader_busy: false,
       turn_count: 1,
       retry_attempt: 0,
       started_at: started_at

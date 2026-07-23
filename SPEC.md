@@ -1103,6 +1103,7 @@ Important emitted events may include:
 - `turn_ended_with_error`
 - `turn_input_required`
 - `approval_auto_approved`
+- `tool_call_started`
 - `unsupported_tool_call`
 - `notification`
 - `other_message`
@@ -1117,9 +1118,14 @@ notifications as the authoritative measurement.
 - On the first event at or above the warning threshold but below the hard limit, send one concise
   checkpoint instruction to the live turn with the app-server `turn/steer` method.
 - Record warning delivery as requested until the protocol responds. A successful response may be
-  recorded as delivered. A missing live turn/control channel, rejected method, or incompatible
-  app-server must be recorded as unsupported; implementations must not report successful steering
-  without protocol evidence.
+  recorded as delivered. A missing live turn/control channel, rejected method, acknowledgement
+  timeout, or incompatible app-server must be recorded as unsupported and create a durable internal
+  hold immediately. If hold persistence is unavailable, the run must still be interrupted and
+  quarantined in memory, new dispatches must pause, and persistence must retry before dispatch can
+  resume. The acknowledgement deadline must pause while the protocol reader is synchronously
+  executing a client tool. Implementations must not report successful steering without protocol
+  evidence or let an uncheckpointable run continue to the hard limit. A worker that exits while
+  acknowledgement remains pending must be held instead of retried.
 - On an event at the exact hard limit or above, interrupt/cancel the live turn, terminate its
   app-server process tree with the normal bounded cleanup mechanism, preserve its workspace, and
   create a durable internal hold before cleanup begins. A remote cleanup timeout or failure must
@@ -2141,6 +2147,10 @@ Unless otherwise noted, Sections 17.1 through 17.7 are `Core Conformance`. Bulle
 - Retry queue entries include attempt, due time, identifier, and error
 - Stall detection kills stalled sessions and schedules retry
 - Input-token warning threshold crossing sends at most one checkpoint steer request per run
+- Missing, rejected, or unacknowledged warning steering stops the run before the hard token limit;
+  unavailable hold persistence pauses dispatch and retries without letting the run continue
+- A persistence outage cannot resume dispatch until cleanup of its quarantined running process has
+  succeeded
 - Exact input-token limit crossing interrupts the run, terminates its process tree, preserves its
   workspace, and creates a hold without scheduling a retry
 - Held issues are excluded from polling dispatch and retry timers

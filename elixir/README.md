@@ -137,8 +137,14 @@ Notes:
   `codex.input_token_warning_ratio` defaults to `0.70` and must be greater than `0` and less than
   `1`.
 - On the first warning-threshold crossing, Symphony asks an active app-server turn to checkpoint via
-  `turn/steer`. The state/API reports `requested`, `delivered`, or `unsupported`; older app-server
-  versions that reject steering are reported as unsupported rather than as a successful warning.
+  `turn/steer`. The state/API reports `requested` or `delivered`. A missing control channel, rejected
+  response, or five-second acknowledgement timeout creates an `input_token_warning_unsupported`
+  hold before the hard limit. If the hold-state write fails, Symphony still interrupts the run,
+  quarantines it in memory, pauses new dispatches, and retries persistence once per second before
+  allowing dispatch to resume. The acknowledgement deadline pauses while Symphony's protocol reader
+  is synchronously executing a client tool, then restarts when response processing resumes. A worker
+  exit with acknowledgement still pending becomes a hold instead of a retry, and dispatch stays
+  paused until both persistence and any quarantined process cleanup recover.
 - At the exact input-token limit or above, Symphony interrupts the turn, terminates the app-server
   process tree locally or on its SSH worker, preserves the workspace, and puts the issue on a
   durable internal hold. Holds are atomically stored with owner-only permissions in
@@ -258,7 +264,12 @@ Operational control endpoints:
   preserved. Remote cleanup timeout/failure returns `503 cleanup_failed`; the durable hold remains
   active with `cleanup_pending: true` and cannot be released by tracker changes.
 - `POST /api/v1/<issue_identifier>/resume` retries any pending cleanup from stored process proof,
-  clears the hold only after cleanup is confirmed, and queues an immediate poll.
+  clears the hold only after cleanup is confirmed, and queues an immediate poll. Successful remote
+  cleanup atomically replaces its identity-bound `running:<pid>:<start-id>` proof with a validated
+  `stopped:<pid>:<start-id>` completion proof. The start ID encodes the process start time, which
+  cleanup verifies before every signal, so a crash before the hold update can retry without
+  signaling a reused PID. The next remote app-server launch overwrites that completion proof with
+  its new identity.
 - Set a non-empty `SYMPHONY_CONTROL_TOKEN` environment secret before using either endpoint and send
   it in `X-Symphony-Control-Token`. Missing configuration returns `503`; a missing or invalid token
   returns `401`. Unknown issue identifiers return `404`. Both endpoints are loopback-only and never

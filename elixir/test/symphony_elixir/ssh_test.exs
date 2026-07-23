@@ -190,7 +190,7 @@ defmodule SymphonyElixir.SSHTest do
 
   test "terminate_remote_process_tree/3 fails closed when the remote PID proof file is malformed" do
     %{pid_file: pid_file, workspace: workspace} = install_remote_shell_fixture!("malformed-pid")
-    File.write!(pid_file, "123x\n")
+    File.write!(pid_file, "running:123x:00\n")
 
     assert {:error, {:remote_process_cleanup_failed, "worker.example", 76, output}} =
              SSH.terminate_remote_process_tree("worker.example", workspace, 1_000)
@@ -204,13 +204,14 @@ defmodule SymphonyElixir.SSHTest do
       install_remote_shell_fixture!("unsafe-numeric-pid", protect_signals: true)
 
     for pid <- ["0", "1", "00", "01", "2147483648", "999999999999999999999999999999"] do
-      File.write!(pid_file, pid <> "\n")
+      proof = "running:#{pid}:00\n"
+      File.write!(pid_file, proof)
 
       assert {:error, {:remote_process_cleanup_failed, "worker.example", 77, output}} =
                SSH.terminate_remote_process_tree("worker.example", workspace, 1_000)
 
       assert output =~ "remote PID proof file is outside the safe process-group range"
-      assert File.read!(pid_file) == pid <> "\n"
+      assert File.read!(pid_file) == proof
       refute File.exists?(signal_trace_file)
     end
   end
@@ -219,13 +220,13 @@ defmodule SymphonyElixir.SSHTest do
     %{pid_file: pid_file, workspace: workspace} =
       install_remote_shell_fixture!("probe-error", probe_error: true)
 
-    File.write!(pid_file, "2147483647\n")
+    File.write!(pid_file, "running:2147483647:00\n")
 
     assert {:error, {:remote_process_cleanup_failed, "worker.example", 78, output}} =
-             SSH.terminate_remote_process_tree("worker.example", workspace, 1_000)
+             SSH.terminate_remote_process_tree("worker.example", workspace, 2_000)
 
     assert output =~ "simulated liveness probe failure"
-    assert File.read!(pid_file) == "2147483647\n"
+    assert File.read!(pid_file) == "running:2147483647:00\n"
   end
 
   test "terminate_remote_process_tree/3 terminates the live remote process group" do
@@ -243,19 +244,70 @@ defmodule SymphonyElixir.SSHTest do
     on_exit(fn -> ProcessTree.terminate_port(port, 500) end)
     wait_for_trace!(ready_file)
     {:os_pid, os_pid} = :erlang.port_info(port, :os_pid)
-    File.write!(pid_file, "#{os_pid}\n")
+    identity = process_identity!(os_pid)
+    File.write!(pid_file, "running:#{os_pid}:#{identity}\n")
 
-    assert :ok = SSH.terminate_remote_process_tree("worker.example", workspace, 1_000)
-    refute File.exists?(pid_file)
+    assert :ok = SSH.terminate_remote_process_tree("worker.example", workspace, 2_000)
+    assert File.read!(pid_file) == "stopped:#{os_pid}:#{identity}\n"
     refute os_process_alive?(os_pid)
   end
 
-  test "terminate_remote_process_tree/3 removes a stale numeric remote PID proof file" do
+  test "terminate_remote_process_tree/3 records completion for a stale identity-bound PID proof" do
     %{pid_file: pid_file, workspace: workspace} = install_remote_shell_fixture!("stale-pid")
-    File.write!(pid_file, "2147483647\n")
+    File.write!(pid_file, "running:2147483647:00\n")
 
     assert :ok = SSH.terminate_remote_process_tree("worker.example", workspace, 1_000)
-    refute File.exists?(pid_file)
+    assert File.read!(pid_file) == "stopped:2147483647:00\n"
+  end
+
+  test "terminate_remote_process_tree/3 refuses to signal a reused PID with a different identity" do
+    %{pid_file: pid_file, signal_trace_file: signal_trace_file, test_root: test_root, workspace: workspace} =
+      install_remote_shell_fixture!("reused-pid", protect_signals: true)
+
+    ready_file = Path.join(test_root, "process.ready")
+
+    assert {:ok, port} =
+             ProcessTree.open_port(
+               System.find_executable("bash"),
+               ["-c", "printf ready > \"$1\"; exec sleep 60", "bash", ready_file]
+             )
+
+    on_exit(fn -> ProcessTree.terminate_port(port, 500) end)
+    wait_for_trace!(ready_file)
+    {:os_pid, os_pid} = :erlang.port_info(port, :os_pid)
+    File.write!(pid_file, "running:#{os_pid}:00\n")
+
+    assert {:error, {:remote_process_cleanup_failed, "worker.example", 80, output}} =
+             SSH.terminate_remote_process_tree("worker.example", workspace, 1_000)
+
+    assert output =~ "remote process identity no longer matches the launch proof"
+    assert os_process_alive?(os_pid)
+    refute File.exists?(signal_trace_file)
+  end
+
+  test "terminate_remote_process_tree/3 treats a validated completion proof as idempotent" do
+    %{pid_file: pid_file, signal_trace_file: signal_trace_file, workspace: workspace} =
+      install_remote_shell_fixture!("completed-cleanup", protect_signals: true)
+
+    File.write!(pid_file, "stopped:2147483647:00\n")
+
+    assert :ok = SSH.terminate_remote_process_tree("worker.example", workspace, 1_000)
+    assert File.read!(pid_file) == "stopped:2147483647:00\n"
+    refute File.exists?(signal_trace_file)
+  end
+
+  test "terminate_remote_process_tree/3 rejects a malformed completion proof without signaling" do
+    %{pid_file: pid_file, signal_trace_file: signal_trace_file, workspace: workspace} =
+      install_remote_shell_fixture!("malformed-completed-cleanup", protect_signals: true)
+
+    File.write!(pid_file, "stopped:123x:00\n")
+
+    assert {:error, {:remote_process_cleanup_failed, "worker.example", 76, output}} =
+             SSH.terminate_remote_process_tree("worker.example", workspace, 1_000)
+
+    assert output =~ "remote PID proof file is nonnumeric"
+    assert File.read!(pid_file) == "stopped:123x:00\n"
+    refute File.exists?(signal_trace_file)
   end
 
   test "terminate_remote_process_tree/3 returns remote command failures" do
@@ -332,6 +384,15 @@ defmodule SymphonyElixir.SSHTest do
   test "remote_shell_command/1 escapes embedded single quotes" do
     assert SSH.remote_shell_command("printf 'hello'") ==
              "bash -lc 'printf '\"'\"'hello'\"'\"''"
+  end
+
+  defp process_identity!(os_pid) do
+    assert {started_at, 0} =
+             System.cmd("ps", ["-o", "lstart=", "-p", Integer.to_string(os_pid)], env: [{"LC_ALL", "C"}])
+
+    started_at
+    |> String.trim_trailing("\n")
+    |> Base.encode16(case: :lower)
   end
 
   defp install_fake_ssh!(test_root, trace_file, script \\ nil) do

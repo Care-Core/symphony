@@ -14,6 +14,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   @continuation_retry_delay_ms 1_000
   @failure_retry_base_ms 10_000
+  @token_warning_ack_timeout_ms 5_000
+  @hold_state_persist_retry_delay_ms 1_000
   @default_process_cleanup_timeout_ms 2_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
@@ -36,6 +38,9 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      hold_store_available: true,
+      hold_state_persist_retry_timer_ref: nil,
+      hold_state_persist_retry_token: nil,
       running: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
@@ -86,12 +91,23 @@ defmodule SymphonyElixir.Orchestrator do
           Logger.info("Restored durable issue holds count=#{map_size(holds)}")
         end
 
+        state = maybe_pause_for_pending_cleanup(state, holds)
+
         run_terminal_workspace_cleanup(holds)
         {:ok, schedule_tick(state, 0)}
 
       {:error, reason} ->
         Logger.error("Failed to restore durable issue holds: #{inspect(reason)}")
         {:stop, {:hold_state_load_failed, reason}}
+    end
+  end
+
+  defp maybe_pause_for_pending_cleanup(state, holds) do
+    if Enum.any?(holds, fn {_issue_id, hold} -> Map.get(hold, :cleanup_pending, false) end) do
+      Logger.warning("Restored pending issue cleanup; keeping dispatch paused until cleanup is confirmed")
+      schedule_hold_state_persist_retry(state)
+    else
+      state
     end
   end
 
@@ -154,32 +170,7 @@ defmodule SymphonyElixir.Orchestrator do
         state = record_session_completion_totals(state, running_entry)
         session_id = running_entry_session_id(running_entry)
 
-        state =
-          case reason do
-            :normal ->
-              Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
-
-              state
-              |> complete_issue(issue_id)
-              |> schedule_issue_retry(issue_id, 1, %{
-                identifier: running_entry.identifier,
-                delay_type: :continuation,
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
-
-            _ ->
-              Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
-
-              next_attempt = next_retry_attempt_from_running(running_entry)
-
-              schedule_issue_retry(state, issue_id, next_attempt, %{
-                identifier: running_entry.identifier,
-                error: "agent exited: #{inspect(reason)}",
-                worker_host: Map.get(running_entry, :worker_host),
-                workspace_path: Map.get(running_entry, :workspace_path)
-              })
-          end
+        state = handle_running_task_exit(state, issue_id, running_entry, session_id, reason)
 
         Logger.info("Agent task finished for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}")
 
@@ -218,6 +209,10 @@ defmodule SymphonyElixir.Orchestrator do
 
       running_entry ->
         {updated_running_entry, token_delta} = integrate_codex_update(running_entry, update)
+        updated_running_entry = settle_input_token_warning_response(updated_running_entry, update.event)
+
+        updated_running_entry =
+          track_input_token_warning_reader_activity(updated_running_entry, update.event)
 
         state =
           state
@@ -227,10 +222,15 @@ defmodule SymphonyElixir.Orchestrator do
         state = %{state | running: Map.put(running, issue_id, updated_running_entry)}
 
         state =
-          if token_count_update?(update) do
-            enforce_input_token_budget(state, issue_id)
-          else
-            state
+          cond do
+            token_count_update?(update) ->
+              enforce_input_token_budget(state, issue_id)
+
+            update.event == :token_budget_warning_unsupported ->
+              enforce_input_token_warning_delivery(state, issue_id)
+
+            true ->
+              state
           end
 
         notify_dashboard()
@@ -239,6 +239,64 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   def handle_info({:codex_worker_update, _issue_id, _update}, state), do: {:noreply, state}
+
+  def handle_info({:input_token_warning_ack_timeout, issue_id, timeout_token}, state) do
+    state =
+      case Map.get(state.running, issue_id) do
+        %{
+          input_token_warning_status: "requested",
+          input_token_warning_ack_token: ^timeout_token
+        } = running_entry ->
+          if Map.get(running_entry, :input_token_warning_reader_busy, false) do
+            updated_entry = reset_input_token_warning_ack_timeout(running_entry)
+            %{state | running: Map.put(state.running, issue_id, updated_entry)}
+          else
+            updated_entry =
+              running_entry
+              |> Map.put(:input_token_warning_status, "unsupported")
+              |> clear_input_token_warning_ack_timeout()
+
+            state
+            |> Map.put(:running, Map.put(state.running, issue_id, updated_entry))
+            |> enforce_input_token_warning_delivery(issue_id)
+          end
+
+        _ ->
+          state
+      end
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:hold_state_persist_retry, retry_token}, state) do
+    state =
+      case state do
+        %{hold_state_persist_retry_token: ^retry_token} ->
+          candidate_state = clear_hold_state_persist_retry(state)
+          {candidate_state, cleanup_complete?} = retry_quarantined_running_cleanup(candidate_state)
+
+          case persist_hold_state(candidate_state) do
+            :ok when cleanup_complete? ->
+              Logger.info("Durable hold state recovered; issue dispatch may resume")
+              %{candidate_state | hold_store_available: true}
+
+            :ok ->
+              Logger.error("Durable hold state recovered but quarantined process cleanup is still pending; keeping issue dispatch paused")
+              schedule_hold_state_persist_retry(candidate_state)
+
+            {:error, reason} ->
+              Logger.error("Durable hold state is still unavailable; keeping issue dispatch paused reason=#{inspect(reason)}")
+              schedule_hold_state_persist_retry(candidate_state)
+          end
+
+        _ ->
+          state
+      end
+
+    notify_dashboard()
+    {:noreply, state}
+  end
 
   def handle_info({:retry_issue, issue_id, retry_token}, state) do
     result =
@@ -258,6 +316,40 @@ defmodule SymphonyElixir.Orchestrator do
     {:noreply, state}
   end
 
+  defp handle_running_task_exit(
+         state,
+         issue_id,
+         %{input_token_warning_status: "requested"} = running_entry,
+         _session_id,
+         _reason
+       ) do
+    hold_exited_issue_with_unacknowledged_warning(state, issue_id, running_entry)
+  end
+
+  defp handle_running_task_exit(state, issue_id, running_entry, session_id, :normal) do
+    Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+
+    state
+    |> complete_issue(issue_id)
+    |> schedule_issue_retry(issue_id, 1, %{
+      identifier: running_entry.identifier,
+      delay_type: :continuation,
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path)
+    })
+  end
+
+  defp handle_running_task_exit(state, issue_id, running_entry, session_id, reason) do
+    Logger.warning("Agent task exited for issue_id=#{issue_id} session_id=#{session_id} reason=#{inspect(reason)}; scheduling retry")
+
+    schedule_issue_retry(state, issue_id, next_retry_attempt_from_running(running_entry), %{
+      identifier: running_entry.identifier,
+      error: "agent exited: #{inspect(reason)}",
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path)
+    })
+  end
+
   @impl true
   def terminate(_reason, %State{running: running}) do
     terminate_codex_process_trees(Map.values(running))
@@ -267,6 +359,15 @@ defmodule SymphonyElixir.Orchestrator do
   defp maybe_dispatch(%State{} = state) do
     state = state |> reconcile_running_issues() |> reconcile_held_issues()
 
+    if state.hold_store_available do
+      dispatch_available_issues(state)
+    else
+      Logger.warning("Skipping issue dispatch while durable hold state is unavailable")
+      state
+    end
+  end
+
+  defp dispatch_available_issues(%State{} = state) do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_candidate_issues(),
          true <- available_slots(state) > 0 do
@@ -600,7 +701,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp enforce_input_token_hard_limit(state, issue_id, running_entry, limit, observed) do
-    case hold_running_issue(state, issue_id, running_entry, "input_token_limit", limit, observed) do
+    case hold_token_budget_issue(state, issue_id, running_entry, "input_token_limit", limit, observed) do
       {:ok, updated_state, _hold} -> updated_state
       {:error, updated_state, _reason} -> updated_state
     end
@@ -627,18 +728,44 @@ defmodule SymphonyElixir.Orchestrator do
     if observed >= warning_threshold and Map.get(running_entry, :input_token_warning_sent, false) == false do
       warning_status = steer_token_budget_warning(running_entry)
 
-      updated_entry =
-        running_entry
-        |> Map.put(:input_token_warning_sent, true)
-        |> Map.put(:input_token_warning_status, warning_status)
+      updated_entry = build_input_token_warning_entry(running_entry, warning_status)
 
       Logger.warning(
         "Input-token warning threshold reached: issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} observed_tokens=#{observed} limit=#{limit} warning_ratio=#{warning_ratio} steering_status=#{warning_status}"
       )
 
-      %{state | running: Map.put(state.running, issue_id, updated_entry)}
+      state = %{state | running: Map.put(state.running, issue_id, updated_entry)}
+
+      if warning_status == "unsupported" do
+        enforce_input_token_warning_delivery(state, issue_id)
+      else
+        state
+      end
     else
       state
+    end
+  end
+
+  defp enforce_input_token_warning_delivery(state, issue_id) do
+    case Map.get(state.running, issue_id) do
+      %{input_token_warning_status: "unsupported"} = running_entry ->
+        limit = Map.get(running_entry, :input_token_limit)
+        observed = Map.get(running_entry, :codex_input_tokens, 0)
+
+        case hold_token_budget_issue(
+               state,
+               issue_id,
+               running_entry,
+               "input_token_warning_unsupported",
+               limit,
+               observed
+             ) do
+          {:ok, updated_state, _hold} -> updated_state
+          {:error, updated_state, _reason} -> updated_state
+        end
+
+      _ ->
+        state
     end
   end
 
@@ -653,24 +780,90 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp build_input_token_warning_entry(running_entry, "requested") do
+    running_entry
+    |> Map.put(:input_token_warning_sent, true)
+    |> Map.put(:input_token_warning_status, "requested")
+    |> reset_input_token_warning_ack_timeout()
+  end
+
+  defp build_input_token_warning_entry(running_entry, warning_status) do
+    running_entry
+    |> Map.put(:input_token_warning_sent, true)
+    |> Map.put(:input_token_warning_status, warning_status)
+  end
+
+  defp reset_input_token_warning_ack_timeout(running_entry) do
+    timeout_token = make_ref()
+
+    timer_ref =
+      Process.send_after(
+        self(),
+        {:input_token_warning_ack_timeout, running_entry.issue.id, timeout_token},
+        @token_warning_ack_timeout_ms
+      )
+
+    running_entry
+    |> clear_input_token_warning_ack_timeout()
+    |> Map.put(:input_token_warning_ack_timer_ref, timer_ref)
+    |> Map.put(:input_token_warning_ack_token, timeout_token)
+  end
+
+  defp settle_input_token_warning_response(running_entry, event)
+       when event in [:token_budget_warning_delivered, :token_budget_warning_unsupported],
+       do: clear_input_token_warning_ack_timeout(running_entry)
+
+  defp settle_input_token_warning_response(running_entry, _event), do: running_entry
+
+  defp track_input_token_warning_reader_activity(running_entry, :tool_call_started) do
+    Map.put(running_entry, :input_token_warning_reader_busy, true)
+  end
+
+  defp track_input_token_warning_reader_activity(running_entry, event)
+       when event in [:tool_call_completed, :tool_call_failed, :unsupported_tool_call] do
+    running_entry = Map.put(running_entry, :input_token_warning_reader_busy, false)
+
+    if Map.get(running_entry, :input_token_warning_status) == "requested" do
+      reset_input_token_warning_ack_timeout(running_entry)
+    else
+      running_entry
+    end
+  end
+
+  defp track_input_token_warning_reader_activity(running_entry, _event), do: running_entry
+
+  defp clear_input_token_warning_ack_timeout(running_entry) do
+    running_entry
+    |> cancel_timer(:input_token_warning_ack_timer_ref)
+    |> Map.put(:input_token_warning_ack_timer_ref, nil)
+    |> Map.put(:input_token_warning_ack_token, nil)
+  end
+
+  defp cancel_timer(running_entry, key) do
+    case Map.get(running_entry, key) do
+      timer_ref when is_reference(timer_ref) ->
+        Process.cancel_timer(timer_ref)
+        running_entry
+
+      _ ->
+        running_entry
+    end
+  end
+
   defp token_budget_warning_instruction do
     "Checkpoint now: update the workpad with completed work, remaining tasks, and validation status; then finish the highest-priority remaining scope concisely."
   end
 
+  defp hold_token_budget_issue(state, issue_id, running_entry, reason, limit, observed) do
+    hold_running_issue(state, issue_id, running_entry, reason, limit, observed, true)
+  end
+
   defp hold_running_issue(state, issue_id, running_entry, reason, limit, observed) do
-    hold = %{
-      issue_id: issue_id,
-      identifier: running_entry.identifier,
-      reason: reason,
-      limit: limit,
-      observed_tokens: observed,
-      issue_state: running_entry.issue.state,
-      worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path),
-      codex_app_server_pid: durable_local_codex_os_pid(running_entry),
-      cleanup_pending: true,
-      held_at: DateTime.utc_now()
-    }
+    hold_running_issue(state, issue_id, running_entry, reason, limit, observed, false)
+  end
+
+  defp hold_running_issue(state, issue_id, running_entry, reason, limit, observed, stop_if_persist_fails) do
+    hold = build_issue_hold(issue_id, running_entry, reason, limit, observed, true)
 
     held_state = %{
       state
@@ -688,10 +881,214 @@ defmodule SymphonyElixir.Orchestrator do
         |> finish_running_hold_cleanup(held_state, issue_id, hold)
 
       {:error, persist_reason} ->
-        Logger.error("Refusing to stop issue because durable hold persistence failed: issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} reason=#{inspect(persist_reason)}")
-
-        {:error, state, :hold_state_unavailable}
+        handle_initial_hold_persist_failure(
+          state,
+          held_state,
+          issue_id,
+          running_entry,
+          hold,
+          persist_reason,
+          stop_if_persist_fails
+        )
     end
+  end
+
+  defp handle_initial_hold_persist_failure(
+         _state,
+         held_state,
+         issue_id,
+         running_entry,
+         hold,
+         persist_reason,
+         true
+       ) do
+    Logger.error(
+      "Durable token-budget hold persistence failed; stopping the run and pausing dispatch while persistence retries: issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} reason=#{inspect(persist_reason)}"
+    )
+
+    maybe_interrupt_turn(running_entry)
+
+    quarantined_state =
+      case terminate_running_issue_with_result(held_state, issue_id, false) do
+        {:ok, terminated_state} ->
+          cleaned_hold = Map.put(hold, :cleanup_pending, false)
+          %{terminated_state | holds: Map.put(terminated_state.holds, issue_id, cleaned_hold)}
+
+        {:error, cleanup_reason, unchanged_state} ->
+          Logger.error("Token-budget process cleanup failed while hold persistence is unavailable: issue_id=#{issue_id} issue_identifier=#{hold.identifier} reason=#{inspect(cleanup_reason)}")
+          unchanged_state
+      end
+
+    {:error, schedule_hold_state_persist_retry(quarantined_state), :hold_state_unavailable}
+  end
+
+  defp handle_initial_hold_persist_failure(
+         state,
+         _held_state,
+         issue_id,
+         running_entry,
+         _hold,
+         persist_reason,
+         false
+       ) do
+    Logger.error("Refusing to stop issue because durable hold persistence failed: issue_id=#{issue_id} issue_identifier=#{running_entry.identifier} reason=#{inspect(persist_reason)}")
+
+    {:error, state, :hold_state_unavailable}
+  end
+
+  defp schedule_hold_state_persist_retry(%State{} = state) do
+    case state.hold_state_persist_retry_token do
+      retry_token when is_reference(retry_token) ->
+        %{state | hold_store_available: false}
+
+      _ ->
+        retry_token = make_ref()
+
+        timer_ref =
+          Process.send_after(
+            self(),
+            {:hold_state_persist_retry, retry_token},
+            @hold_state_persist_retry_delay_ms
+          )
+
+        %{
+          state
+          | hold_store_available: false,
+            hold_state_persist_retry_timer_ref: timer_ref,
+            hold_state_persist_retry_token: retry_token
+        }
+    end
+  end
+
+  defp clear_hold_state_persist_retry(%State{} = state) do
+    %{
+      state
+      | hold_state_persist_retry_timer_ref: nil,
+        hold_state_persist_retry_token: nil
+    }
+  end
+
+  defp retry_quarantined_running_cleanup(%State{} = state) do
+    Enum.reduce(state.holds, {state, true}, &retry_quarantined_hold_cleanup/2)
+  end
+
+  defp retry_quarantined_hold_cleanup(
+         {issue_id, %{cleanup_pending: true} = hold},
+         {%State{} = state, all_complete?}
+       ) do
+    retry_quarantined_process_cleanup(state, issue_id, hold, all_complete?)
+  end
+
+  defp retry_quarantined_hold_cleanup(_hold_entry, state_and_completion),
+    do: state_and_completion
+
+  defp retry_quarantined_process_cleanup(state, issue_id, hold, all_complete?) do
+    cleanup_result =
+      if Map.has_key?(state.running, issue_id) do
+        terminate_running_issue_with_result(state, issue_id, false)
+      else
+        case terminate_detached_hold_process_tree(hold) do
+          :ok -> {:ok, state}
+          {:error, reason} -> {:error, reason, state}
+        end
+      end
+
+    case cleanup_result do
+      {:ok, terminated_state} ->
+        cleaned_hold = Map.put(hold, :cleanup_pending, false)
+        {%{terminated_state | holds: Map.put(terminated_state.holds, issue_id, cleaned_hold)}, all_complete?}
+
+      {:error, cleanup_reason, unchanged_state} ->
+        Logger.error("Quarantined process cleanup is still failing: issue_id=#{issue_id} issue_identifier=#{hold.identifier} reason=#{inspect(cleanup_reason)}")
+        {unchanged_state, false}
+    end
+  end
+
+  defp hold_exited_issue_with_unacknowledged_warning(state, issue_id, running_entry) do
+    running_entry = clear_input_token_warning_ack_timeout(running_entry)
+    limit = Map.get(running_entry, :input_token_limit)
+    observed = Map.get(running_entry, :codex_input_tokens, 0)
+
+    hold =
+      build_issue_hold(
+        issue_id,
+        running_entry,
+        "input_token_warning_unsupported",
+        limit,
+        observed,
+        true
+      )
+
+    held_state = %{
+      state
+      | holds: Map.put(state.holds, issue_id, hold),
+        claimed: MapSet.put(state.claimed, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+
+    case persist_hold_state(held_state) do
+      :ok ->
+        finish_exited_warning_hold_cleanup(held_state, issue_id, hold)
+
+      {:error, persist_reason} ->
+        Logger.error(
+          "Agent exited before token-budget warning acknowledgement and hold persistence failed; keeping in-memory quarantine and pausing dispatch: issue_id=#{issue_id} issue_identifier=#{hold.identifier} reason=#{inspect(persist_reason)}"
+        )
+
+        schedule_hold_state_persist_retry(held_state)
+    end
+  end
+
+  defp finish_exited_warning_hold_cleanup(state, issue_id, hold) do
+    case terminate_detached_hold_process_tree(hold) do
+      :ok ->
+        case mark_hold_cleanup_complete(state, issue_id, hold) do
+          {:ok, cleaned_state, _cleaned_hold} ->
+            Logger.warning("Agent exited before token-budget warning acknowledgement; issue placed on durable hold after process cleanup: issue_id=#{issue_id} issue_identifier=#{hold.identifier}")
+            cleaned_state
+
+          {:error, safe_state, :hold_state_unavailable} ->
+            Logger.error("Agent process cleanup completed but durable cleanup confirmation failed: issue_id=#{issue_id} issue_identifier=#{hold.identifier}; keeping dispatch paused")
+            schedule_hold_state_persist_retry(safe_state)
+        end
+
+      {:error, cleanup_reason} ->
+        Logger.error(
+          "Agent exited before token-budget warning acknowledgement and detached process cleanup failed: issue_id=#{issue_id} issue_identifier=#{hold.identifier} reason=#{inspect(cleanup_reason)}; keeping dispatch paused"
+        )
+
+        schedule_hold_state_persist_retry(state)
+    end
+  end
+
+  defp terminate_detached_hold_process_tree(hold) do
+    if detached_hold_cleanup_target?(hold) do
+      terminate_codex_process_tree(hold)
+    else
+      {:error, :missing_process_cleanup_proof}
+    end
+  end
+
+  defp detached_hold_cleanup_target?(%{worker_host: worker_host, workspace_path: workspace_path})
+       when is_binary(worker_host) and is_binary(workspace_path),
+       do: true
+
+  defp detached_hold_cleanup_target?(hold), do: local_codex_os_pid(hold) != []
+
+  defp build_issue_hold(issue_id, running_entry, reason, limit, observed, cleanup_pending) do
+    %{
+      issue_id: issue_id,
+      identifier: running_entry.identifier,
+      reason: reason,
+      limit: limit,
+      observed_tokens: observed,
+      issue_state: running_entry.issue.state,
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      codex_app_server_pid: durable_local_codex_os_pid(running_entry),
+      cleanup_pending: cleanup_pending,
+      held_at: DateTime.utc_now()
+    }
   end
 
   defp finish_running_hold_cleanup({:ok, terminated_state}, _held_state, issue_id, hold) do
@@ -710,9 +1107,9 @@ defmodule SymphonyElixir.Orchestrator do
         {:ok, cleaned_state, cleaned_hold}
 
       {:error, safe_state, :hold_state_unavailable} ->
-        Logger.error("Issue cleanup completed but durable cleanup confirmation failed: issue_id=#{issue_id} issue_identifier=#{hold.identifier}; keeping cleanup pending")
+        Logger.error("Issue cleanup completed but durable cleanup confirmation failed: issue_id=#{issue_id} issue_identifier=#{hold.identifier}; keeping dispatch paused")
 
-        {:error, safe_state, :hold_state_unavailable}
+        {:error, schedule_hold_state_persist_retry(safe_state), :hold_state_unavailable}
     end
   end
 
@@ -724,7 +1121,7 @@ defmodule SymphonyElixir.Orchestrator do
        ) do
     Logger.error("Issue is durably held but process cleanup failed: issue_id=#{issue_id} issue_identifier=#{hold.identifier} reason=#{inspect(cleanup_reason)}")
 
-    {:error, held_state, :cleanup_failed}
+    {:error, schedule_hold_state_persist_retry(held_state), :cleanup_failed}
   end
 
   defp maybe_interrupt_turn(running_entry) do
@@ -781,9 +1178,9 @@ defmodule SymphonyElixir.Orchestrator do
         {:ok, candidate_state, cleaned_hold}
 
       {:error, reason} ->
-        Logger.error("Failed to persist completed hold cleanup issue_id=#{issue_id} reason=#{inspect(reason)}; keeping cleanup pending")
+        Logger.error("Failed to persist completed hold cleanup issue_id=#{issue_id} reason=#{inspect(reason)}; keeping dispatch paused")
 
-        {:error, state, :hold_state_unavailable}
+        {:error, candidate_state, :hold_state_unavailable}
     end
   end
 
@@ -1176,6 +1573,9 @@ defmodule SymphonyElixir.Orchestrator do
             input_token_warning_ratio: Config.settings!().codex.input_token_warning_ratio,
             input_token_warning_sent: false,
             input_token_warning_status: nil,
+            input_token_warning_ack_timer_ref: nil,
+            input_token_warning_ack_token: nil,
+            input_token_warning_reader_busy: false,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: started_at
@@ -1293,10 +1693,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_retry_issue(%State{} = state, issue_id, attempt, metadata) do
-    if Map.has_key?(state.holds, issue_id) do
-      {:noreply, state}
-    else
-      do_handle_retry_issue(state, issue_id, attempt, metadata)
+    cond do
+      Map.has_key?(state.holds, issue_id) ->
+        {:noreply, state}
+
+      not state.hold_store_available ->
+        {:noreply,
+         schedule_issue_retry(
+           state,
+           issue_id,
+           attempt,
+           Map.put(metadata, :error, "durable hold state unavailable")
+         )}
+
+      true ->
+        do_handle_retry_issue(state, issue_id, attempt, metadata)
     end
   end
 
@@ -1810,8 +2221,11 @@ defmodule SymphonyElixir.Orchestrator do
     case terminate_codex_process_tree(hold) do
       :ok ->
         case mark_hold_cleanup_complete(state, issue_id, hold) do
-          {:ok, cleaned_state, cleaned_hold} -> resume_cleaned_hold(cleaned_state, issue_id, cleaned_hold)
-          {:error, safe_state, reason} -> {:reply, {:error, reason}, safe_state}
+          {:ok, cleaned_state, cleaned_hold} ->
+            resume_cleaned_hold(cleaned_state, issue_id, cleaned_hold)
+
+          {:error, safe_state, reason} ->
+            {:reply, {:error, reason}, schedule_hold_state_persist_retry(safe_state)}
         end
 
       {:error, reason} ->

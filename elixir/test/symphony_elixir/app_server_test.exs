@@ -1551,17 +1551,27 @@ defmodule SymphonyElixir.AppServerTest do
     try do
       trace_file = Path.join(test_root, "ssh.trace")
       fake_ssh = Path.join(test_root, "ssh")
-      remote_workspace = "/remote/workspaces/MT-REMOTE"
+      fake_remote_codex = Path.join(test_root, "fake-remote-codex")
+      remote_workspace = Path.join(test_root, "remote-workspaces/MT-REMOTE")
 
-      File.mkdir_p!(test_root)
+      File.mkdir_p!(remote_workspace)
       System.put_env("SYMP_TEST_SSH_TRACE", trace_file)
       System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
 
       File.write!(fake_ssh, """
       #!/bin/sh
       trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
-      count=0
       printf 'ARGV:%s\\n' "$*" >> "$trace_file"
+      for arg in "$@"; do
+        remote_command=$arg
+      done
+      exec /bin/sh -c "$remote_command"
+      """)
+
+      File.write!(fake_remote_codex, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_SSH_TRACE:-/tmp/symphony-fake-ssh.trace}"
+      count=0
 
       while IFS= read -r line; do
         count=$((count + 1))
@@ -1589,10 +1599,11 @@ defmodule SymphonyElixir.AppServerTest do
       """)
 
       File.chmod!(fake_ssh, 0o755)
+      File.chmod!(fake_remote_codex, 0o755)
 
       write_workflow_file!(Workflow.workflow_file_path(),
-        workspace_root: "/remote/workspaces",
-        codex_command: "fake-remote-codex app-server"
+        workspace_root: Path.dirname(remote_workspace),
+        codex_command: "#{fake_remote_codex} app-server"
       )
 
       issue = %Issue{
@@ -1621,7 +1632,12 @@ defmodule SymphonyElixir.AppServerTest do
       assert argv_line =~ "cd "
       assert argv_line =~ remote_workspace
       assert argv_line =~ "exec "
-      assert argv_line =~ "fake-remote-codex app-server"
+      assert argv_line =~ "running:"
+      assert argv_line =~ ".symphony-codex-app-server.pid"
+      assert argv_line =~ fake_remote_codex
+
+      assert File.read!(Path.join(remote_workspace, ".symphony-codex-app-server.pid")) =~
+               ~r/^running:\d+:[0-9a-f]+\n$/
 
       expected_turn_policy = %{
         "type" => "workspaceWrite",
