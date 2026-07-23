@@ -73,11 +73,11 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  @spec resume_payload(String.t(), GenServer.name()) ::
+  @spec resume_payload(String.t(), map(), GenServer.name()) ::
           {:ok, map()}
-          | {:error, :issue_not_found | :unavailable | :cleanup_failed | :hold_state_unavailable}
-  def resume_payload(issue_identifier, orchestrator) do
-    case Orchestrator.resume_issue(issue_identifier, orchestrator) do
+          | {:error, atom()}
+  def resume_payload(issue_identifier, options, orchestrator) do
+    case Orchestrator.resume_issue(issue_identifier, options, orchestrator) do
       {:ok, result} -> {:ok, control_payload(result, true)}
       error -> error
     end
@@ -114,6 +114,14 @@ defmodule SymphonyElixirWeb.Presenter do
   defp restart_count(retry), do: max(retry_attempt(retry) - 1, 0)
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
+
+  defp issue_status(running, _retry, %{reason: "input_token_resume_pending"})
+       when not is_nil(running),
+       do: "running"
+
+  defp issue_status(nil, retry, %{reason: "input_token_resume_pending"})
+       when not is_nil(retry),
+       do: "retrying"
 
   defp issue_status(_running, _retry, hold) when not is_nil(hold), do: "held"
   defp issue_status(_running, nil, nil), do: "running"
@@ -164,6 +172,23 @@ defmodule SymphonyElixirWeb.Presenter do
       reason: entry.reason,
       limit: entry.limit,
       observed_tokens: entry.observed_tokens,
+      warning_threshold: Map.get(entry, :warning_threshold),
+      warning_observed_at: Map.get(entry, :warning_observed_at),
+      checkpoint_grace: Map.get(entry, :checkpoint_grace),
+      checkpoint_grace_consumed:
+        checkpoint_grace_consumed(
+          entry.observed_tokens,
+          Map.get(entry, :warning_observed_at)
+        ),
+      resume_phase: Map.get(entry, :resume_phase),
+      requested_additional_input_tokens: Map.get(entry, :requested_additional_input_tokens),
+      effective_additional_input_tokens: Map.get(entry, :effective_additional_input_tokens),
+      attempt_input_token_baseline: Map.get(entry, :attempt_input_token_baseline, 0),
+      current_attempt_input_tokens:
+        current_attempt_input_tokens(
+          entry.observed_tokens,
+          Map.get(entry, :attempt_input_token_baseline, 0)
+        ),
       issue_state: entry.issue_state,
       worker_host: Map.get(entry, :worker_host),
       workspace_path: Map.get(entry, :workspace_path),
@@ -219,22 +244,61 @@ defmodule SymphonyElixirWeb.Presenter do
   end
 
   defp input_token_budget(entry) do
+    observed = Map.get(entry, :codex_input_tokens, 0)
+    warning_observed_at = Map.get(entry, :input_token_warning_observed_at)
+    attempt_baseline = Map.get(entry, :attempt_input_token_baseline, 0)
+
     %{
       limit: Map.get(entry, :input_token_limit),
-      observed_tokens: Map.get(entry, :codex_input_tokens, 0),
+      tier_limit: Map.get(entry, :input_token_tier_limit),
+      observed_tokens: observed,
+      current_attempt_input_tokens: current_attempt_input_tokens(observed, attempt_baseline),
+      attempt_input_token_baseline: attempt_baseline,
       warning_ratio: Map.get(entry, :input_token_warning_ratio),
-      warning_status: Map.get(entry, :input_token_warning_status)
+      warning_threshold: Map.get(entry, :input_token_warning_threshold),
+      warning_status: Map.get(entry, :input_token_warning_status),
+      warning_observed_at: warning_observed_at,
+      checkpoint_grace: Map.get(entry, :input_token_checkpoint_grace),
+      checkpoint_grace_consumed: checkpoint_grace_consumed(observed, warning_observed_at),
+      resume_phase: Map.get(entry, :resume_phase),
+      requested_additional_input_tokens: Map.get(entry, :requested_additional_input_tokens),
+      effective_additional_input_tokens: Map.get(entry, :effective_additional_input_tokens)
     }
   end
 
   defp control_payload(result, resumed) do
-    %{
+    payload = %{
       issue_id: result.issue_id,
       issue_identifier: result.identifier,
       status: if(resumed, do: "resumed", else: "held"),
       hold: if(resumed, do: nil, else: held_entry_payload(result))
     }
+
+    if resumed and is_binary(Map.get(result, :phase)) do
+      Map.merge(payload, %{
+        resume_phase: Map.get(result, :phase),
+        requested_additional_input_tokens: Map.get(result, :requested_additional_input_tokens),
+        effective_additional_input_tokens: Map.get(result, :effective_additional_input_tokens),
+        current_issue_tier_limit: Map.get(result, :current_issue_tier_limit),
+        attempt_input_token_baseline: Map.get(result, :attempt_input_token_baseline, 0),
+        workspace_path: Map.get(result, :workspace_path)
+      })
+    else
+      payload
+    end
   end
+
+  defp checkpoint_grace_consumed(observed, baseline)
+       when is_integer(observed) and is_integer(baseline),
+       do: max(observed - baseline, 0)
+
+  defp checkpoint_grace_consumed(_observed, _baseline), do: 0
+
+  defp current_attempt_input_tokens(observed, baseline)
+       when is_integer(observed) and is_integer(baseline),
+       do: max(observed - baseline, 0)
+
+  defp current_attempt_input_tokens(_observed, _baseline), do: 0
 
   defp recent_events_payload(running) do
     [

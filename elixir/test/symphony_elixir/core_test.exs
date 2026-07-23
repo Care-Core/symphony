@@ -690,14 +690,16 @@ defmodule SymphonyElixir.CoreTest do
              error: "failed to spawn agent: :noproc",
              worker_host: nil,
              workspace_path: "/tmp/workspaces/MT-RESUME",
-             worker_affinity: :local
+             worker_affinity: :local,
+             phase_budget: %{phase: "validation", effective_additional_input_tokens: 50}
            } =
              Orchestrator.spawn_failure_retry_metadata_for_test(
                "MT-RESUME",
                :noproc,
                nil,
                "/tmp/workspaces/MT-RESUME",
-               :local
+               :local,
+               %{phase: "validation", effective_additional_input_tokens: 50}
              )
   end
 

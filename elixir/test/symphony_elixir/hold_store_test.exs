@@ -48,14 +48,35 @@ defmodule SymphonyElixir.HoldStoreTest do
   test "load defaults cleanup proof for legacy holds" do
     workspace_root = workspace_root("legacy-cleanup-proof")
 
-    legacy_hold = Map.drop(encoded_hold(), ["cleanup_pending", "codex_app_server_pid"])
+    legacy_hold =
+      Map.drop(encoded_hold(), [
+        "cleanup_pending",
+        "codex_app_server_pid",
+        "warning_threshold",
+        "warning_observed_at",
+        "checkpoint_grace",
+        "resume_phase",
+        "requested_additional_input_tokens",
+        "effective_additional_input_tokens",
+        "attempt_input_token_baseline",
+        "input_token_tier_limit"
+      ])
+
     write_json_state!(workspace_root, %{"version" => 1, "holds" => [legacy_hold]})
 
     assert {:ok,
             %{
               "issue-a" => %{
                 cleanup_pending: false,
-                codex_app_server_pid: nil
+                codex_app_server_pid: nil,
+                warning_threshold: nil,
+                warning_observed_at: nil,
+                checkpoint_grace: nil,
+                resume_phase: nil,
+                requested_additional_input_tokens: nil,
+                effective_additional_input_tokens: nil,
+                attempt_input_token_baseline: 0,
+                input_token_tier_limit: nil
               }
             }} = HoldStore.load(workspace_root)
   end
@@ -127,6 +148,21 @@ defmodule SymphonyElixir.HoldStoreTest do
       {:issue_state, "issue_state", 1},
       {:worker_host, "worker_host", false},
       {:workspace_path, "workspace_path", []},
+      {:warning_threshold, "warning_threshold", 0},
+      {:warning_threshold, "warning_threshold", "700"},
+      {:warning_observed_at, "warning_observed_at", -1},
+      {:warning_observed_at, "warning_observed_at", 1.5},
+      {:checkpoint_grace, "checkpoint_grace", 0},
+      {:checkpoint_grace, "checkpoint_grace", "500"},
+      {:resume_phase, "resume_phase", []},
+      {:requested_additional_input_tokens, "requested_additional_input_tokens", 0},
+      {:requested_additional_input_tokens, "requested_additional_input_tokens", "100"},
+      {:effective_additional_input_tokens, "effective_additional_input_tokens", -1},
+      {:effective_additional_input_tokens, "effective_additional_input_tokens", 1.5},
+      {:attempt_input_token_baseline, "attempt_input_token_baseline", -1},
+      {:attempt_input_token_baseline, "attempt_input_token_baseline", "0"},
+      {:input_token_tier_limit, "input_token_tier_limit", 0},
+      {:input_token_tier_limit, "input_token_tier_limit", "1000"},
       {:held_at, "held_at", ""},
       {:held_at, "held_at", 1}
     ]
@@ -509,6 +545,14 @@ defmodule SymphonyElixir.HoldStoreTest do
       "worker_host" => "worker.example",
       "workspace_path" => "/tmp/SYM-1",
       "codex_app_server_pid" => nil,
+      "warning_threshold" => 700,
+      "warning_observed_at" => 710,
+      "checkpoint_grace" => 500,
+      "resume_phase" => "validation",
+      "requested_additional_input_tokens" => 800,
+      "effective_additional_input_tokens" => 750,
+      "attempt_input_token_baseline" => 0,
+      "input_token_tier_limit" => 750,
       "cleanup_pending" => false,
       "held_at" => "2026-07-21T12:00:00.000000Z"
     }
@@ -525,6 +569,14 @@ defmodule SymphonyElixir.HoldStoreTest do
       worker_host: "worker.example",
       workspace_path: "/tmp/#{identifier}",
       codex_app_server_pid: nil,
+      warning_threshold: 700,
+      warning_observed_at: 710,
+      checkpoint_grace: 500,
+      resume_phase: "validation",
+      requested_additional_input_tokens: 800,
+      effective_additional_input_tokens: 750,
+      attempt_input_token_baseline: 0,
+      input_token_tier_limit: 750,
       cleanup_pending: false,
       held_at: held_at
     })

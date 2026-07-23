@@ -17,6 +17,14 @@ defmodule SymphonyElixir.HoldStore do
           required(:issue_state) => String.t() | nil,
           required(:held_at) => DateTime.t(),
           required(:cleanup_pending) => boolean(),
+          optional(:warning_threshold) => pos_integer() | nil,
+          optional(:warning_observed_at) => non_neg_integer() | nil,
+          optional(:checkpoint_grace) => pos_integer() | nil,
+          optional(:resume_phase) => String.t() | nil,
+          optional(:requested_additional_input_tokens) => pos_integer() | nil,
+          optional(:effective_additional_input_tokens) => pos_integer() | nil,
+          optional(:attempt_input_token_baseline) => non_neg_integer(),
+          optional(:input_token_tier_limit) => pos_integer() | nil,
           optional(:worker_host) => String.t() | nil,
           optional(:workspace_path) => Path.t() | nil,
           optional(:codex_app_server_pid) => pos_integer() | nil
@@ -246,6 +254,21 @@ defmodule SymphonyElixir.HoldStore do
        ) do
     cleanup_pending = Map.get(encoded_hold, "cleanup_pending", false)
     codex_app_server_pid = Map.get(encoded_hold, "codex_app_server_pid")
+    warning_threshold = Map.get(encoded_hold, "warning_threshold")
+    warning_observed_at = Map.get(encoded_hold, "warning_observed_at")
+    checkpoint_grace = Map.get(encoded_hold, "checkpoint_grace")
+    resume_phase = Map.get(encoded_hold, "resume_phase")
+
+    requested_additional_input_tokens =
+      Map.get(encoded_hold, "requested_additional_input_tokens")
+
+    effective_additional_input_tokens =
+      Map.get(encoded_hold, "effective_additional_input_tokens")
+
+    attempt_input_token_baseline =
+      Map.get(encoded_hold, "attempt_input_token_baseline", 0)
+
+    input_token_tier_limit = Map.get(encoded_hold, "input_token_tier_limit")
 
     with :ok <- require_non_empty_string(issue_id, :issue_id),
          :ok <- require_non_empty_string(identifier, :identifier),
@@ -257,6 +280,30 @@ defmodule SymphonyElixir.HoldStore do
          :ok <- require_optional_string(workspace_path, :workspace_path),
          :ok <- require_boolean(cleanup_pending, :cleanup_pending),
          :ok <- require_optional_positive_integer(codex_app_server_pid, :codex_app_server_pid),
+         :ok <- require_optional_positive_integer(warning_threshold, :warning_threshold),
+         :ok <- require_optional_non_negative_integer(warning_observed_at, :warning_observed_at),
+         :ok <- require_optional_positive_integer(checkpoint_grace, :checkpoint_grace),
+         :ok <- require_optional_string(resume_phase, :resume_phase),
+         :ok <-
+           require_optional_positive_integer(
+             requested_additional_input_tokens,
+             :requested_additional_input_tokens
+           ),
+         :ok <-
+           require_optional_positive_integer(
+             effective_additional_input_tokens,
+             :effective_additional_input_tokens
+           ),
+         :ok <-
+           require_non_negative_integer(
+             attempt_input_token_baseline,
+             :attempt_input_token_baseline
+           ),
+         :ok <-
+           require_optional_positive_integer(
+             input_token_tier_limit,
+             :input_token_tier_limit
+           ),
          :ok <- require_non_empty_string(held_at, :held_at),
          {:ok, held_at, 0} <- DateTime.from_iso8601(held_at) do
       {:ok,
@@ -270,6 +317,14 @@ defmodule SymphonyElixir.HoldStore do
          worker_host: worker_host,
          workspace_path: workspace_path,
          codex_app_server_pid: codex_app_server_pid,
+         warning_threshold: warning_threshold,
+         warning_observed_at: warning_observed_at,
+         checkpoint_grace: checkpoint_grace,
+         resume_phase: resume_phase,
+         requested_additional_input_tokens: requested_additional_input_tokens,
+         effective_additional_input_tokens: effective_additional_input_tokens,
+         attempt_input_token_baseline: attempt_input_token_baseline,
+         input_token_tier_limit: input_token_tier_limit,
          cleanup_pending: cleanup_pending,
          held_at: held_at
        }}
@@ -300,6 +355,14 @@ defmodule SymphonyElixir.HoldStore do
       "reason" => hold.reason,
       "limit" => hold.limit,
       "observed_tokens" => hold.observed_tokens,
+      "warning_threshold" => Map.get(hold, :warning_threshold),
+      "warning_observed_at" => Map.get(hold, :warning_observed_at),
+      "checkpoint_grace" => Map.get(hold, :checkpoint_grace),
+      "resume_phase" => Map.get(hold, :resume_phase),
+      "requested_additional_input_tokens" => Map.get(hold, :requested_additional_input_tokens),
+      "effective_additional_input_tokens" => Map.get(hold, :effective_additional_input_tokens),
+      "attempt_input_token_baseline" => Map.get(hold, :attempt_input_token_baseline, 0),
+      "input_token_tier_limit" => Map.get(hold, :input_token_tier_limit),
       "issue_state" => hold.issue_state,
       "worker_host" => Map.get(hold, :worker_host),
       "workspace_path" => Map.get(hold, :workspace_path),
@@ -426,6 +489,15 @@ defmodule SymphonyElixir.HoldStore do
 
   defp require_non_negative_integer(value, _field) when is_integer(value) and value >= 0, do: :ok
   defp require_non_negative_integer(_value, field), do: {:error, {:invalid_field, field}}
+
+  defp require_optional_non_negative_integer(nil, _field), do: :ok
+
+  defp require_optional_non_negative_integer(value, _field)
+       when is_integer(value) and value >= 0,
+       do: :ok
+
+  defp require_optional_non_negative_integer(_value, field),
+    do: {:error, {:invalid_field, field}}
 
   defp require_optional_string(nil, _field), do: :ok
   defp require_optional_string(value, _field) when is_binary(value), do: :ok

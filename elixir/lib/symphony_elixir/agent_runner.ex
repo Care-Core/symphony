@@ -111,36 +111,84 @@ defmodule SymphonyElixir.AgentRunner do
            ) do
       Logger.info("Completed agent run for #{issue_context(issue)} session_id=#{turn_session[:session_id]} workspace=#{workspace} turn=#{turn_number}/#{max_turns}")
 
-      case continue_with_issue?(issue, issue_state_fetcher) do
-        {:continue, refreshed_issue} when turn_number < max_turns ->
-          Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+      case continue_after_turn?(issue, opts) do
+        :stop ->
+          :ok
 
-          do_run_codex_turns(
+        :continue ->
+          continue_agent_run(
             app_session,
             workspace,
-            refreshed_issue,
+            issue,
             codex_update_recipient,
             opts,
             issue_state_fetcher,
-            turn_number + 1,
+            turn_number,
             max_turns
           )
-
-        {:continue, refreshed_issue} ->
-          Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
-
-          :ok
-
-        {:done, _refreshed_issue} ->
-          :ok
-
-        {:error, reason} ->
-          {:error, reason}
       end
     end
   end
 
-  defp build_turn_prompt(issue, opts, 1, _max_turns), do: PromptBuilder.build_prompt(issue, opts)
+  defp continue_agent_run(
+         app_session,
+         workspace,
+         issue,
+         codex_update_recipient,
+         opts,
+         issue_state_fetcher,
+         turn_number,
+         max_turns
+       ) do
+    case continue_with_issue?(issue, issue_state_fetcher) do
+      {:continue, refreshed_issue} when turn_number < max_turns ->
+        Logger.info("Continuing agent run for #{issue_context(refreshed_issue)} after normal turn completion turn=#{turn_number}/#{max_turns}")
+
+        do_run_codex_turns(
+          app_session,
+          workspace,
+          refreshed_issue,
+          codex_update_recipient,
+          opts,
+          issue_state_fetcher,
+          turn_number + 1,
+          max_turns
+        )
+
+      {:continue, refreshed_issue} ->
+        Logger.info("Reached agent.max_turns for #{issue_context(refreshed_issue)} with issue still active; returning control to orchestrator")
+
+        :ok
+
+      {:done, _refreshed_issue} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp build_turn_prompt(issue, opts, 1, _max_turns) do
+    base_prompt = PromptBuilder.build_prompt(issue, opts)
+
+    case Keyword.get(opts, :resume_phase) do
+      phase when is_binary(phase) ->
+        allowance = Keyword.fetch!(opts, :max_additional_input_tokens)
+
+        """
+        #{base_prompt}
+
+        Phase-bounded resume:
+
+        - Authorized phase: #{phase}
+        - Maximum additional input tokens for this attempt: #{allowance}
+        - Work only within this named phase. Checkpoint and stop when it is complete or the allowance is reached.
+        """
+
+      _ ->
+        base_prompt
+    end
+  end
 
   defp build_turn_prompt(_issue, _opts, turn_number, max_turns) do
     """
@@ -152,6 +200,31 @@ defmodule SymphonyElixir.AgentRunner do
     - The original task instructions and prior turn context are already present in this thread, so do not restate them before acting.
     - Focus on the remaining ticket work and do not end the turn while the issue stays active unless you are truly blocked.
     """
+  end
+
+  defp continue_after_turn?(issue, opts) do
+    case Keyword.get(opts, :resume_phase) do
+      phase when is_binary(phase) -> :stop
+      _ -> continue_after_unbounded_turn?(issue, opts)
+    end
+  end
+
+  defp continue_after_unbounded_turn?(%Issue{id: issue_id}, opts) when is_binary(issue_id) do
+    case Keyword.get(opts, :continue_after_turn) do
+      callback when is_function(callback, 1) ->
+        if callback.(issue_id), do: :continue, else: :stop
+
+      _ ->
+        :continue
+    end
+  end
+
+  defp continue_after_unbounded_turn?(_issue, _opts), do: :continue
+
+  @doc false
+  @spec continue_after_turn_for_test(Issue.t(), keyword()) :: :continue | :stop
+  def continue_after_turn_for_test(%Issue{} = issue, opts) when is_list(opts) do
+    continue_after_turn?(issue, opts)
   end
 
   defp continue_with_issue?(%Issue{id: issue_id} = issue, issue_state_fetcher) when is_binary(issue_id) do

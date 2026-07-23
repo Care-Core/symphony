@@ -118,6 +118,7 @@ defmodule SymphonyElixir.TestSupport do
           codex_input_token_limit: nil,
           codex_input_token_limits_by_label: %{},
           codex_input_token_warning_ratio: 0.70,
+          codex_input_token_checkpoint_grace: 500_000,
           runner_capability_preflight: false,
           runner_source_repo: nil,
           runner_reviewer_codex_home: nil,
@@ -170,6 +171,10 @@ defmodule SymphonyElixir.TestSupport do
     codex_input_token_limit = Keyword.get(config, :codex_input_token_limit)
     codex_input_token_limits_by_label = Keyword.get(config, :codex_input_token_limits_by_label)
     codex_input_token_warning_ratio = Keyword.get(config, :codex_input_token_warning_ratio)
+
+    codex_input_token_checkpoint_grace =
+      Keyword.get(config, :codex_input_token_checkpoint_grace)
+
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -215,6 +220,7 @@ defmodule SymphonyElixir.TestSupport do
         "  input_token_limit: #{yaml_value(codex_input_token_limit)}",
         "  input_token_limits_by_label: #{yaml_value(codex_input_token_limits_by_label)}",
         "  input_token_warning_ratio: #{yaml_value(codex_input_token_warning_ratio)}",
+        "  input_token_checkpoint_grace: #{yaml_value(codex_input_token_checkpoint_grace)}",
         runner_yaml(config),
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),

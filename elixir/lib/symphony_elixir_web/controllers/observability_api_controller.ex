@@ -69,9 +69,12 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   end
 
   @spec resume(Conn.t(), map()) :: Conn.t()
-  def resume(conn, %{"issue_identifier" => issue_identifier}) do
+  def resume(conn, %{"issue_identifier" => issue_identifier} = params) do
+    options =
+      Map.take(params, ["phase", "max_additional_input_tokens"])
+
     with :ok <- require_control_access(conn),
-         {:ok, payload} <- Presenter.resume_payload(issue_identifier, orchestrator()) do
+         {:ok, payload} <- Presenter.resume_payload(issue_identifier, options, orchestrator()) do
       json(conn, payload)
     else
       {:error, :issue_not_found} ->
@@ -85,6 +88,21 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
       {:error, :hold_state_unavailable} ->
         error_response(conn, 503, "hold_state_unavailable", "Durable hold state is unavailable")
+
+      {:error, :resume_phase_required} ->
+        error_response(conn, 422, "resume_phase_required", "A named resume phase is required for this token-budget hold")
+
+      {:error, :invalid_resume_phase} ->
+        error_response(conn, 422, "invalid_resume_phase", "Resume phase is not supported")
+
+      {:error, :max_additional_input_tokens_required} ->
+        error_response(conn, 422, "max_additional_input_tokens_required", "A maximum additional input-token allowance is required")
+
+      {:error, :invalid_max_additional_input_tokens} ->
+        error_response(conn, 422, "invalid_max_additional_input_tokens", "Maximum additional input tokens must be a positive integer")
+
+      {:error, :tracker_unavailable} ->
+        error_response(conn, 503, "tracker_unavailable", "Current issue tier could not be verified; the hold remains active")
 
       {:error, :loopback_only} ->
         error_response(conn, 403, "loopback_only", "Control endpoints are available only on loopback")
