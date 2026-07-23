@@ -13,12 +13,20 @@ defmodule SymphonyElixir.Workspace do
   @spec create_for_issue(map() | String.t() | nil, worker_host()) ::
           {:ok, Path.t()} | {:error, term()}
   def create_for_issue(issue_or_identifier, worker_host \\ nil) do
+    create_for_issue(issue_or_identifier, worker_host, [])
+  end
+
+  @spec create_for_issue(map() | String.t() | nil, worker_host(), keyword()) ::
+          {:ok, Path.t()} | {:error, term()}
+  def create_for_issue(issue_or_identifier, worker_host, opts) when is_list(opts) do
     issue_context = issue_context(issue_or_identifier)
 
     try do
       safe_id = safe_identifier(issue_context.issue_identifier)
+      preferred_workspace = Keyword.get(opts, :workspace_path)
 
-      with {:ok, workspace} <- workspace_path_for_issue(safe_id, worker_host),
+      with {:ok, workspace} <-
+             preferred_workspace_path(preferred_workspace, safe_id, worker_host),
            :ok <- validate_workspace_path(workspace, worker_host),
            {:ok, workspace, created?} <- ensure_workspace(workspace, worker_host),
            :ok <- maybe_run_after_create_hook(workspace, issue_context, created?, worker_host) do
@@ -30,6 +38,13 @@ defmodule SymphonyElixir.Workspace do
         {:error, error}
     end
   end
+
+  defp preferred_workspace_path(path, _safe_id, _worker_host)
+       when is_binary(path) and path != "",
+       do: {:ok, path}
+
+  defp preferred_workspace_path(_path, safe_id, worker_host),
+    do: workspace_path_for_issue(safe_id, worker_host)
 
   defp ensure_workspace(workspace, nil) do
     cond do

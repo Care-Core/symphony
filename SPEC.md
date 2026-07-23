@@ -1139,6 +1139,10 @@ notifications as the authoritative measurement.
   survives tracker changes; explicit resume must retry cleanup from stored local or remote process
   proof and release the hold only after cleanup is confirmed. Missing/unreadable tracker results
   keep every hold.
+- After explicit resume releases a manual or token-budget hold, schedule exactly one short
+  continuation through the retry queue with non-null attempt context (initially `attempt = 1`).
+  Reuse the exact held workspace and worker metadata; do not dispatch the resumed issue as a fresh
+  run or through a competing poll tick. Pre-dispatch failures retain normal retry/backoff semantics.
 
 ### 10.5 Approval, Tool Calls, and User Input Policy
 
