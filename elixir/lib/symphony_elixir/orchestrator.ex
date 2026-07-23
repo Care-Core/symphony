@@ -91,12 +91,23 @@ defmodule SymphonyElixir.Orchestrator do
           Logger.info("Restored durable issue holds count=#{map_size(holds)}")
         end
 
+        state = maybe_pause_for_pending_cleanup(state, holds)
+
         run_terminal_workspace_cleanup(holds)
         {:ok, schedule_tick(state, 0)}
 
       {:error, reason} ->
         Logger.error("Failed to restore durable issue holds: #{inspect(reason)}")
         {:stop, {:hold_state_load_failed, reason}}
+    end
+  end
+
+  defp maybe_pause_for_pending_cleanup(state, holds) do
+    if Enum.any?(holds, fn {_issue_id, hold} -> Map.get(hold, :cleanup_pending, false) end) do
+      Logger.warning("Restored pending issue cleanup; keeping dispatch paused until cleanup is confirmed")
+      schedule_hold_state_persist_retry(state)
+    else
+      state
     end
   end
 
@@ -1096,7 +1107,7 @@ defmodule SymphonyElixir.Orchestrator do
         {:ok, cleaned_state, cleaned_hold}
 
       {:error, safe_state, :hold_state_unavailable} ->
-        Logger.error("Issue cleanup completed but durable cleanup confirmation failed: issue_id=#{issue_id} issue_identifier=#{hold.identifier}; keeping cleanup pending")
+        Logger.error("Issue cleanup completed but durable cleanup confirmation failed: issue_id=#{issue_id} issue_identifier=#{hold.identifier}; keeping dispatch paused")
 
         {:error, schedule_hold_state_persist_retry(safe_state), :hold_state_unavailable}
     end
@@ -1110,7 +1121,7 @@ defmodule SymphonyElixir.Orchestrator do
        ) do
     Logger.error("Issue is durably held but process cleanup failed: issue_id=#{issue_id} issue_identifier=#{hold.identifier} reason=#{inspect(cleanup_reason)}")
 
-    {:error, held_state, :cleanup_failed}
+    {:error, schedule_hold_state_persist_retry(held_state), :cleanup_failed}
   end
 
   defp maybe_interrupt_turn(running_entry) do
@@ -1167,9 +1178,9 @@ defmodule SymphonyElixir.Orchestrator do
         {:ok, candidate_state, cleaned_hold}
 
       {:error, reason} ->
-        Logger.error("Failed to persist completed hold cleanup issue_id=#{issue_id} reason=#{inspect(reason)}; keeping cleanup pending")
+        Logger.error("Failed to persist completed hold cleanup issue_id=#{issue_id} reason=#{inspect(reason)}; keeping dispatch paused")
 
-        {:error, state, :hold_state_unavailable}
+        {:error, candidate_state, :hold_state_unavailable}
     end
   end
 

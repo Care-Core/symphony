@@ -420,6 +420,39 @@ defmodule SymphonyElixir.TokenBudgetTest do
     refute Process.alive?(worker_pid)
   end
 
+  test "warning cleanup failure pauses dispatch and retries until cleanup succeeds" do
+    {fake_ssh, _fake_root} = install_fake_ssh!("warning-cleanup-retry", "exit 17\n")
+    {pid, issue, worker_pid} = start_budget_orchestrator("warning-cleanup-retry", 100)
+
+    put_running_entry(pid, issue, worker_pid,
+      input_token_limit: 100,
+      worker_host: "worker.example",
+      workspace_path: "/srv/workspaces/#{issue.identifier}"
+    )
+
+    send_token_update(pid, issue.id, 70)
+
+    paused_state = :sys.get_state(pid)
+    assert paused_state.hold_store_available == false
+    assert Map.has_key?(paused_state.running, issue.id)
+    assert paused_state.holds[issue.id].cleanup_pending == true
+    assert is_reference(paused_state.hold_state_persist_retry_token)
+    Process.cancel_timer(paused_state.hold_state_persist_retry_timer_ref)
+
+    File.write!(fake_ssh, "#!/bin/sh\nexit 0\n")
+    send(pid, {:hold_state_persist_retry, paused_state.hold_state_persist_retry_token})
+
+    assert_eventually(fn ->
+      recovered_state = :sys.get_state(pid)
+
+      recovered_state.hold_store_available == true and
+        recovered_state.running == %{} and
+        recovered_state.holds[issue.id].cleanup_pending == false
+    end)
+
+    refute Process.alive?(worker_pid)
+  end
+
   test "a delivered steering response keeps the checkpointed run active" do
     {pid, issue, worker_pid} = start_budget_orchestrator("delivered-warning", 100)
     command = "while IFS= read -r _line; do :; done"
@@ -630,6 +663,11 @@ defmodule SymphonyElixir.TokenBudgetTest do
     :ok = GenServer.stop(pid)
     Application.put_env(:symphony_elixir, :memory_tracker_issues, [%{issue | state: "Human Review"}])
     restarted_pid = start_replacement_orchestrator()
+    restarted_state = :sys.get_state(restarted_pid)
+    assert restarted_state.hold_store_available == false
+    assert is_reference(restarted_state.hold_state_persist_retry_token)
+    Process.cancel_timer(restarted_state.hold_state_persist_retry_timer_ref)
+
     send(restarted_pid, :run_poll_cycle)
 
     assert_eventually(fn ->
@@ -699,18 +737,64 @@ defmodule SymphonyElixir.TokenBudgetTest do
     assert {:error, :hold_state_unavailable} =
              Orchestrator.resume_issue(issue.identifier, restarted_pid)
 
-    assert [%{cleanup_pending: true}] = Orchestrator.snapshot(restarted_pid, 1_000).held
+    assert [%{cleanup_pending: false}] = Orchestrator.snapshot(restarted_pid, 1_000).held
 
     paused_state = :sys.get_state(restarted_pid)
     assert paused_state.hold_store_available == false
     Process.cancel_timer(paused_state.hold_state_persist_retry_timer_ref)
 
+    File.write!(fake_ssh, "#!/bin/sh\nexit 17\n")
     File.rmdir!(state_file)
     send(restarted_pid, {:hold_state_persist_retry, paused_state.hold_state_persist_retry_token})
 
     assert_eventually(fn -> :sys.get_state(restarted_pid).hold_store_available == true end)
     assert File.regular?(state_file)
     assert [%{cleanup_pending: false}] = Orchestrator.snapshot(restarted_pid, 1_000).held
+  end
+
+  test "restart can confirm remote cleanup after the hold update crash window" do
+    {fake_ssh, _fake_root} = install_fake_ssh!("cleanup-crash-window", "exit 17\n")
+    {pid, issue, worker_pid} = start_budget_orchestrator("cleanup-crash-window", 100)
+    workspace_root = Config.settings!().workspace.root
+    state_file = Path.join(workspace_root, ".symphony-holds.json")
+
+    put_running_entry(pid, issue, worker_pid,
+      worker_host: "worker.example",
+      workspace_path: "/srv/workspaces/#{issue.identifier}"
+    )
+
+    assert {:error, :cleanup_failed} = Orchestrator.stop_issue(issue.identifier, pid)
+    :ok = GenServer.stop(pid)
+    restarted_pid = start_replacement_orchestrator()
+    pending_hold_json = File.read!(state_file)
+
+    File.write!(fake_ssh, "#!/bin/sh\nexit 0\n")
+    File.rm!(state_file)
+    File.mkdir_p!(state_file)
+
+    assert {:error, :hold_state_unavailable} =
+             Orchestrator.resume_issue(issue.identifier, restarted_pid)
+
+    :ok = GenServer.stop(restarted_pid)
+    File.rmdir!(state_file)
+    File.write!(state_file, pending_hold_json)
+
+    crash_restarted_pid = start_replacement_orchestrator()
+    crash_restarted_state = :sys.get_state(crash_restarted_pid)
+    assert crash_restarted_state.hold_store_available == false
+    Process.cancel_timer(crash_restarted_state.hold_state_persist_retry_timer_ref)
+
+    send(
+      crash_restarted_pid,
+      {:hold_state_persist_retry, crash_restarted_state.hold_state_persist_retry_token}
+    )
+
+    assert_eventually(fn ->
+      recovered_state = :sys.get_state(crash_restarted_pid)
+
+      recovered_state.hold_store_available == true and
+        recovered_state.holds[issue.id].cleanup_pending == false
+    end)
   end
 
   test "manual stop of a retry stores a non-pending hold without process proof" do

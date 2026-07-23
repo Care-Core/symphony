@@ -42,20 +42,47 @@ defmodule SymphonyElixir.SSH do
       printf 'remote PID proof file is missing or unreadable\n' >&2
       exit 73
     fi
-    if ! pid=$(< \"$pid_file\"); then
+    if ! pid_proof=$(< \"$pid_file\"); then
       printf 'remote PID proof file is unreadable\n' >&2
       exit 74
     fi
+    if [ -z \"$pid_proof\" ]; then
+      printf 'remote PID proof file is empty\n' >&2
+      exit 75
+    fi
+    proof_state=${pid_proof%%:*}
+    proof_remainder=${pid_proof#*:}
+    pid=${proof_remainder%%:*}
+    process_identity=${proof_remainder#*:}
+    case \"$proof_state\" in
+      running) cleanup_confirmed=0 ;;
+      stopped) cleanup_confirmed=1 ;;
+      *)
+        printf 'remote PID proof file has an unsupported format\n' >&2
+        exit 76
+        ;;
+    esac
     case \"$pid\" in
       '')
-        printf 'remote PID proof file is empty\n' >&2
-        exit 75
+        printf 'remote PID proof file has an empty PID\n' >&2
+        exit 76
         ;;
       *[!0-9]*)
         printf 'remote PID proof file is nonnumeric\n' >&2
         exit 76
         ;;
     esac
+    case \"$process_identity\" in
+      ''|*[!0-9a-f]*)
+        printf 'remote PID proof file has an invalid process identity\n' >&2
+        exit 76
+        ;;
+    esac
+    identity_length=${#process_identity}
+    if [ \"$identity_length\" -gt 256 ] || [ $((identity_length % 2)) -ne 0 ]; then
+      printf 'remote PID proof file has an invalid process identity\n' >&2
+      exit 76
+    fi
 
     if ! perl -e '
       my $pid = shift;
@@ -67,6 +94,29 @@ defmodule SymphonyElixir.SSH do
       printf 'remote PID proof file is outside the safe process-group range\n' >&2
       exit 77
     fi
+
+    if [ \"$cleanup_confirmed\" -eq 1 ]; then
+      exit 0
+    fi
+
+    verify_process_identity() {
+      if ! current_started_at=$(LC_ALL=C ps -o lstart= -p \"$pid\" 2>/dev/null); then
+        printf 'remote process identity could not be read\n' >&2
+        return 1
+      fi
+      if ! current_identity=$(printf '%s' \"$current_started_at\" | perl -e '
+        local $/;
+        my $value = <STDIN> // \"\";
+        print unpack(\"H*\", $value);
+      '); then
+        printf 'remote process identity could not be encoded\n' >&2
+        return 1
+      fi
+      if [ \"$current_identity\" != \"$process_identity\" ]; then
+        printf 'remote process identity no longer matches the launch proof\n' >&2
+        return 1
+      fi
+    }
 
     probe_process_group() {
       perl -MPOSIX -MErrno=ESRCH -e '
@@ -83,6 +133,7 @@ defmodule SymphonyElixir.SSH do
     probe_status=$?
     case \"$probe_status\" in
       0)
+        verify_process_identity || exit 80
         kill -TERM -- \"-$pid\" 2>/dev/null || {
           probe_process_group
           probe_status=$?
@@ -107,6 +158,7 @@ defmodule SymphonyElixir.SSH do
     probe_status=$?
     case \"$probe_status\" in
       0)
+        verify_process_identity || exit 80
         kill -KILL -- \"-$pid\" 2>/dev/null || {
           probe_process_group
           probe_status=$?
@@ -149,7 +201,17 @@ defmodule SymphonyElixir.SSH do
         exit 72
         ;;
       1)
-        rm -f \"$pid_file\"
+        completion_file=\"${pid_file}.stopped.$$\"
+        if ! (umask 077 && printf 'stopped:%s:%s\n' \"$pid\" \"$process_identity\" > \"$completion_file\"); then
+          rm -f \"$completion_file\"
+          printf 'remote cleanup completion proof could not be written\n' >&2
+          exit 79
+        fi
+        if ! mv -f \"$completion_file\" \"$pid_file\"; then
+          rm -f \"$completion_file\"
+          printf 'remote cleanup completion proof could not be installed\n' >&2
+          exit 79
+        fi
         ;;
       *)
         exit 78

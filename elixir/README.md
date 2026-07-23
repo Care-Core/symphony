@@ -264,7 +264,12 @@ Operational control endpoints:
   preserved. Remote cleanup timeout/failure returns `503 cleanup_failed`; the durable hold remains
   active with `cleanup_pending: true` and cannot be released by tracker changes.
 - `POST /api/v1/<issue_identifier>/resume` retries any pending cleanup from stored process proof,
-  clears the hold only after cleanup is confirmed, and queues an immediate poll.
+  clears the hold only after cleanup is confirmed, and queues an immediate poll. Successful remote
+  cleanup atomically replaces its identity-bound `running:<pid>:<start-id>` proof with a validated
+  `stopped:<pid>:<start-id>` completion proof. The start ID encodes the process start time, which
+  cleanup verifies before every signal, so a crash before the hold update can retry without
+  signaling a reused PID. The next remote app-server launch overwrites that completion proof with
+  its new identity.
 - Set a non-empty `SYMPHONY_CONTROL_TOKEN` environment secret before using either endpoint and send
   it in `X-Symphony-Control-Token`. Missing configuration returns `503`; a missing or invalid token
   returns `401`. Unknown issue identifiers return `404`. Both endpoints are loopback-only and never

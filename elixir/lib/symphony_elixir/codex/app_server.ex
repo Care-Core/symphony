@@ -249,14 +249,33 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp remote_launch_command(workspace) when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
-      "printf '%s\\n' \"$$\" > .symphony-codex-app-server.pid",
-      "exec perl -MPOSIX -e #{shell_escape(remote_process_group_exec())} -- bash -lc #{shell_escape(Config.settings!().codex.command)}"
+      "exec perl -MPOSIX -e #{shell_escape(remote_process_group_exec())} -- .symphony-codex-app-server.pid bash -lc #{shell_escape(Config.settings!().codex.command)}"
     ]
     |> Enum.join(" && ")
   end
 
   defp remote_process_group_exec do
-    "POSIX::setpgid(0, 0) == 0 or die \"setpgid failed: $!\\n\"; exec @ARGV; die \"exec failed: $!\\n\";"
+    """
+    my $pid_file = shift @ARGV;
+    POSIX::setpgid(0, 0) == 0 or die "setpgid failed: $!\\n";
+    my $started_at = qx(LC_ALL=C ps -o lstart= -p $$);
+    $? == 0 or die "process identity lookup failed\\n";
+    chomp $started_at;
+    length($started_at) > 0 or die "process identity lookup was empty\\n";
+    my $identity = unpack("H*", $started_at);
+    my $temp_file = "$pid_file.tmp.$$";
+    umask 0077;
+    open my $proof, ">", $temp_file or die "PID proof open failed: $!\\n";
+    print {$proof} "running:$$:$identity\\n" or die "PID proof write failed: $!\\n";
+    close $proof or die "PID proof close failed: $!\\n";
+    rename $temp_file, $pid_file or do {
+      unlink $temp_file;
+      die "PID proof install failed: $!\\n";
+    };
+    exec @ARGV;
+    die "exec failed: $!\\n";
+    """
+    |> String.replace("\n", " ")
   end
 
   defp port_metadata(port, worker_host) when is_port(port) do
