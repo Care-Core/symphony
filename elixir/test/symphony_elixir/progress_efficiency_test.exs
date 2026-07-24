@@ -565,6 +565,79 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
     end)
   end
 
+  test "a phase-resume deferred wait restored after restart wakes once with its bounded authority" do
+    {pid, issue, worker_pid, workspace_root, workspace} =
+      start_progress_orchestrator("phase-resume-watcher-restart")
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    phase_budget = %{
+      phase: "review-fix",
+      requested_additional_input_tokens: 600,
+      effective_additional_input_tokens: 600
+    }
+
+    put_phase_resume_state(pid, issue, phase_budget)
+
+    receipt_path = Path.join(workspace, "output/phase-resume-restart-checks.jsonl")
+    File.mkdir_p!(Path.dirname(receipt_path))
+
+    assert {:ok, %{watcher_token: watcher_token}} =
+             Orchestrator.register_deferred_wait(
+               issue.identifier,
+               deferred_wait_attributes(workspace, receipt_path),
+               pid
+             )
+
+    send(worker_pid, :finish)
+
+    assert_eventually(fn ->
+      state = :sys.get_state(pid)
+
+      Map.has_key?(state.deferred, issue.id) and
+        get_in(state.holds, [issue.id, :reason]) == "input_token_resume_pending"
+    end)
+
+    durable_hold =
+      :sys.get_state(pid).holds
+      |> Map.fetch!(issue.id)
+      |> Map.merge(%{
+        limit: 600,
+        observed_tokens: 0,
+        issue_state: "In Progress",
+        held_at: DateTime.utc_now()
+      })
+
+    assert :ok =
+             SymphonyElixir.HoldStore.persist(workspace_root, %{issue.id => durable_hold})
+
+    GenServer.stop(pid)
+    restarted_pid = start_replacement_orchestrator()
+
+    assert_eventually(fn ->
+      state = :sys.get_state(restarted_pid)
+
+      Map.has_key?(state.deferred, issue.id) and
+        get_in(state.holds, [issue.id, :reason]) == "input_token_resume_pending"
+    end)
+
+    write_receipt(receipt_path, terminal_receipt("passed"))
+    send(restarted_pid, {:poll_deferred_watcher, issue.id, watcher_token})
+
+    assert_eventually(fn ->
+      state = :sys.get_state(restarted_pid)
+
+      state.deferred == %{} and
+        get_in(state.retry_attempts, [issue.id, :phase_budget]) == phase_budget and
+        get_in(state.progress, [issue.id, "watcher", "wake_count"]) == 1
+    end)
+  end
+
   test "a warning-delivered session enters deferred waiting and wakes once" do
     {pid, issue, worker_pid, _workspace_root, workspace} =
       start_progress_orchestrator("warning-watcher")

@@ -4572,7 +4572,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp phase_resume_wake_authorized?(state, issue_id, metadata) when is_map(metadata) do
     case Map.get(state.holds, issue_id) do
       %{reason: @phase_resume_pending_reason} = hold ->
-        phase_budget_matches_hold?(Map.get(metadata, :phase_budget), hold)
+        wake_budget_authorized?(Map.get(metadata, :phase_budget), hold)
 
       _hold ->
         false
@@ -4581,13 +4581,33 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp phase_resume_wake_authorized?(_state, _issue_id, _metadata), do: false
 
+  # A restored watcher carries no phase budget; the durable pending hold is
+  # the budget authority, so a missing metadata copy defers to the hold.
+  defp wake_budget_authorized?(nil, _hold), do: true
+
+  defp wake_budget_authorized?(phase_budget, hold),
+    do: phase_budget_matches_hold?(phase_budget, hold)
+
+  defp hold_phase_budget(%{resume_phase: phase} = hold) when is_binary(phase) do
+    %{
+      phase: phase,
+      requested_additional_input_tokens: Map.get(hold, :requested_additional_input_tokens),
+      effective_additional_input_tokens: Map.get(hold, :effective_additional_input_tokens)
+    }
+  end
+
+  defp hold_phase_budget(_hold), do: nil
+
   defp schedule_deferred_continuation(state, issue_id, terminal_status, metadata) do
+    phase_budget =
+      Map.get(metadata, :phase_budget) || hold_phase_budget(Map.get(state.holds, issue_id))
+
     do_schedule_issue_retry(state, issue_id, 1, %{
       identifier: metadata.identifier,
       worker_host: Map.get(metadata, :worker_host),
       workspace_path: Map.get(metadata, :workspace_path),
       worker_affinity: Map.get(metadata, :worker_affinity),
-      phase_budget: Map.get(metadata, :phase_budget),
+      phase_budget: phase_budget,
       delay_type: :continuation,
       error: "deferred wait terminal: #{terminal_status}"
     })
