@@ -5,8 +5,10 @@ defmodule SymphonyElixir.HoldStore do
   require Logger
 
   @filename ".symphony-holds.json"
+  @progress_filename ".symphony-progress.json"
   @version 1
   @private_file_mode 0o600
+  @terminal_watcher_states ~w(passed failed timed_out head_changed receipt_invalid cancelled)
 
   @type hold :: %{
           required(:issue_id) => String.t(),
@@ -46,6 +48,23 @@ defmodule SymphonyElixir.HoldStore do
     end
   end
 
+  @spec load_progress(Path.t()) :: {:ok, map()} | {:error, term()}
+  def load_progress(workspace_root) when is_binary(workspace_root) do
+    case progress_state_path(workspace_root) do
+      {:ok, state_path} -> load_progress_file(state_path)
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec persist_progress(Path.t(), map()) :: :ok | {:error, term()}
+  def persist_progress(workspace_root, progress) when is_binary(workspace_root) and is_map(progress) do
+    with :ok <- validate_progress_entries(progress),
+         {:ok, state_path} <- progress_state_path(workspace_root),
+         {:ok, encoded} <- Jason.encode(%{"version" => @version, "issues" => progress}) do
+      atomic_private_write(state_path, encoded <> "\n")
+    end
+  end
+
   defp load_state_file(state_path) do
     case File.lstat(state_path) do
       {:error, :enoent} ->
@@ -66,6 +85,31 @@ defmodule SymphonyElixir.HoldStore do
     with :ok <- require_private_mode(state_path, initial_stat.mode),
          {:ok, encoded} <- read_open_state_file(state_path, initial_stat) do
       decode_state(encoded, state_path)
+    end
+  end
+
+  defp load_progress_file(state_path) do
+    case File.lstat(state_path) do
+      {:error, :enoent} ->
+        {:ok, %{}}
+
+      {:ok, %File.Stat{type: :regular} = initial_stat} ->
+        with :ok <- require_private_mode(state_path, initial_stat.mode),
+             {:ok, encoded} <- read_open_state_file(state_path, initial_stat),
+             {:ok, %{"version" => @version, "issues" => issues}} when is_map(issues) <-
+               Jason.decode(encoded),
+             :ok <- validate_progress_entries(issues) do
+          {:ok, issues}
+        else
+          {:error, reason} -> {:error, {:progress_state_invalid, state_path, reason}}
+          _ -> {:error, {:progress_state_invalid, state_path, :invalid_schema}}
+        end
+
+      {:ok, %File.Stat{type: type}} ->
+        {:error, {:progress_state_invalid_file, state_path, type}}
+
+      {:error, reason} ->
+        {:error, {:progress_state_unreadable, state_path, reason}}
     end
   end
 
@@ -175,6 +219,15 @@ defmodule SymphonyElixir.HoldStore do
     case File.mkdir_p(expanded_root) do
       :ok -> {:ok, Path.join(expanded_root, @filename)}
       {:error, reason} -> {:error, {:hold_state_root_unavailable, expanded_root, reason}}
+    end
+  end
+
+  defp progress_state_path(workspace_root) do
+    expanded_root = Path.expand(workspace_root)
+
+    case File.mkdir_p(expanded_root) do
+      :ok -> {:ok, Path.join(expanded_root, @progress_filename)}
+      {:error, reason} -> {:error, {:progress_state_root_unavailable, expanded_root, reason}}
     end
   end
 
@@ -505,4 +558,131 @@ defmodule SymphonyElixir.HoldStore do
 
   defp require_boolean(value, _field) when is_boolean(value), do: :ok
   defp require_boolean(_value, field), do: {:error, {:invalid_field, field}}
+
+  defp validate_progress_entries(entries) do
+    Enum.reduce_while(entries, :ok, fn
+      {issue_id, %{"issue_id" => issue_id, "identifier" => identifier} = entry}, :ok ->
+        with :ok <- require_non_empty_string(issue_id, :issue_id),
+             :ok <- require_non_empty_string(identifier, :identifier),
+             :ok <- require_progress_map(entry, "fingerprint"),
+             :ok <- require_progress_hash(entry, "progress_fingerprint_hash"),
+             :ok <- require_progress_hash(entry, "review_fingerprint_hash"),
+             :ok <- require_progress_counter(entry, "tokens_since_progress"),
+             :ok <- require_progress_counter(entry, "model_cycles_since_progress"),
+             :ok <- require_progress_counter(entry, "review_round_count"),
+             :ok <- require_progress_counter(entry, "full_review_count"),
+             :ok <- require_progress_counter(entry, "delta_review_count"),
+             :ok <- require_progress_counter(entry, "security_review_count"),
+             :ok <- require_progress_counter(entry, "token_baseline"),
+             :ok <- require_progress_counter(entry, "cycle_baseline"),
+             :ok <- require_optional_progress_counter(entry, "last_observed_input_tokens"),
+             :ok <- require_optional_progress_counter(entry, "last_observed_model_cycles"),
+             :ok <- validate_review_overrides(Map.get(entry, "used_review_overrides", [])),
+             :ok <- validate_progress_watcher(Map.get(entry, "watcher")) do
+          {:cont, :ok}
+        else
+          _ -> {:halt, {:error, {:invalid_progress_entry, issue_id}}}
+        end
+
+      {issue_id, _entry}, :ok ->
+        {:halt, {:error, {:invalid_progress_entry, issue_id}}}
+    end)
+  end
+
+  defp require_progress_map(entry, field) do
+    case Map.get(entry, field) do
+      value when is_map(value) and map_size(value) > 0 -> :ok
+      _value -> {:error, field}
+    end
+  end
+
+  defp require_progress_hash(entry, field) do
+    case Map.get(entry, field) do
+      value when is_binary(value) ->
+        if Regex.match?(~r/\A[0-9a-f]{64}\z/i, value), do: :ok, else: {:error, field}
+
+      _value ->
+        {:error, field}
+    end
+  end
+
+  defp require_progress_counter(entry, field) do
+    case Map.fetch(entry, field) do
+      {:ok, value} when is_integer(value) and value >= 0 -> :ok
+      _value -> {:error, field}
+    end
+  end
+
+  defp require_optional_progress_counter(entry, field) do
+    case Map.fetch(entry, field) do
+      :error -> :ok
+      {:ok, value} when is_integer(value) and value >= 0 -> :ok
+      _value -> {:error, field}
+    end
+  end
+
+  defp validate_review_overrides(overrides) when is_list(overrides) do
+    if Enum.all?(overrides, &is_binary/1), do: :ok, else: {:error, :review_overrides}
+  end
+
+  defp validate_review_overrides(_overrides), do: {:error, :review_overrides}
+
+  defp validate_progress_watcher(nil), do: :ok
+
+  defp validate_progress_watcher(%{"state" => state} = watcher)
+       when state == "waiting" or state in @terminal_watcher_states do
+    with :ok <- require_non_empty_string(Map.get(watcher, "token"), :watcher_token),
+         :ok <- require_commit_sha(Map.get(watcher, "expected_head")),
+         :ok <- require_absolute_path(Map.get(watcher, "receipt_path")),
+         :ok <- require_positive_integer(Map.get(watcher, "deadline_unix_ms"), :watcher_deadline),
+         :ok <- require_non_negative_integer(Map.get(watcher, "wake_count", 0), :watcher_wake_count),
+         :ok <- require_non_empty_string(Map.get(watcher, "identifier"), :watcher_identifier),
+         :ok <- require_absolute_path(Map.get(watcher, "workspace_path")),
+         :ok <- require_optional_string(Map.get(watcher, "worker_host"), :watcher_worker_host),
+         :ok <- require_optional_string(Map.get(watcher, "last_receipt_hash"), :watcher_receipt_hash) do
+      validate_waiter_command(
+        Map.get(watcher, "waiter_command"),
+        Map.get(watcher, "workspace_path")
+      )
+    end
+  end
+
+  defp validate_progress_watcher(_watcher), do: {:error, :invalid_watcher}
+
+  defp validate_waiter_command(%{"script" => script, "args" => args}, workspace_path)
+       when is_binary(script) and is_list(args) do
+    expanded_script = Path.expand(script)
+    expanded_workspace = Path.expand(workspace_path)
+
+    if Path.type(script) == :absolute and
+         String.starts_with?(expanded_script, expanded_workspace <> "/") and
+         length(args) <= 64 and
+         Enum.all?(args, &(is_binary(&1) and byte_size(&1) <= 4_096)) do
+      :ok
+    else
+      {:error, :invalid_waiter_command}
+    end
+  end
+
+  defp validate_waiter_command(_command, _workspace_path),
+    do: {:error, :invalid_waiter_command}
+
+  defp require_commit_sha(value) when is_binary(value) do
+    if Regex.match?(~r/\A[0-9a-f]{40}\z/i, value),
+      do: :ok,
+      else: {:error, :invalid_commit_sha}
+  end
+
+  defp require_commit_sha(_value), do: {:error, :invalid_commit_sha}
+
+  defp require_absolute_path(value) when is_binary(value) do
+    if Path.type(value) == :absolute and String.trim(value) != "",
+      do: :ok,
+      else: {:error, :invalid_absolute_path}
+  end
+
+  defp require_absolute_path(_value), do: {:error, :invalid_absolute_path}
+
+  defp require_positive_integer(value, _field) when is_integer(value) and value > 0, do: :ok
+  defp require_positive_integer(_value, field), do: {:error, {:invalid_field, field}}
 end

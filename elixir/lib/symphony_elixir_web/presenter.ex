@@ -15,10 +15,12 @@ defmodule SymphonyElixirWeb.Presenter do
           generated_at: generated_at,
           counts: %{
             running: length(snapshot.running),
+            deferred: length(Map.get(snapshot, :deferred, [])),
             retrying: length(snapshot.retrying),
             held: length(Map.get(snapshot, :held, []))
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
+          deferred: Enum.map(Map.get(snapshot, :deferred, []), &deferred_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           held: Enum.map(Map.get(snapshot, :held, []), &held_entry_payload/1),
           codex_totals: snapshot.codex_totals,
@@ -38,13 +40,14 @@ defmodule SymphonyElixirWeb.Presenter do
     case Orchestrator.snapshot(orchestrator, snapshot_timeout_ms) do
       %{} = snapshot ->
         running = Enum.find(snapshot.running, &(&1.identifier == issue_identifier))
+        deferred = Enum.find(Map.get(snapshot, :deferred, []), &(&1.identifier == issue_identifier))
         retry = Enum.find(snapshot.retrying, &(&1.identifier == issue_identifier))
         hold = Enum.find(Map.get(snapshot, :held, []), &(&1.identifier == issue_identifier))
 
-        if is_nil(running) and is_nil(retry) and is_nil(hold) do
+        if is_nil(running) and is_nil(deferred) and is_nil(retry) and is_nil(hold) do
           {:error, :issue_not_found}
         else
-          {:ok, issue_payload_body(issue_identifier, running, retry, hold)}
+          {:ok, issue_payload_body(issue_identifier, running, deferred, retry, hold)}
         end
 
       _ ->
@@ -83,20 +86,36 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
-  defp issue_payload_body(issue_identifier, running, retry, hold) do
+  @spec progress_payload(String.t(), map(), GenServer.name()) :: {:ok, map()} | {:error, atom()}
+  def progress_payload(issue_identifier, attributes, orchestrator) do
+    Orchestrator.record_progress(issue_identifier, attributes, orchestrator)
+  end
+
+  @spec review_payload(String.t(), map(), GenServer.name()) :: {:ok, map()} | {:error, atom()}
+  def review_payload(issue_identifier, attributes, orchestrator) do
+    Orchestrator.authorize_review(issue_identifier, attributes, orchestrator)
+  end
+
+  @spec wait_payload(String.t(), map(), GenServer.name()) :: {:ok, map()} | {:error, atom()}
+  def wait_payload(issue_identifier, attributes, orchestrator) do
+    Orchestrator.register_deferred_wait(issue_identifier, attributes, orchestrator)
+  end
+
+  defp issue_payload_body(issue_identifier, running, deferred, retry, hold) do
     %{
       issue_identifier: issue_identifier,
-      issue_id: issue_id_from_entries(running, retry, hold),
-      status: issue_status(running, retry, hold),
+      issue_id: issue_id_from_entries(running, deferred, retry, hold),
+      status: issue_status(running, deferred, retry, hold),
       workspace: %{
-        path: workspace_path(issue_identifier, running, retry, hold),
-        host: workspace_host(running, retry, hold)
+        path: workspace_path(issue_identifier, running, deferred, retry, hold),
+        host: workspace_host(running, deferred, retry, hold)
       },
       attempts: %{
         restart_count: restart_count(retry),
         current_retry_attempt: retry_attempt(retry)
       },
       running: running && running_issue_payload(running),
+      deferred: deferred && deferred_entry_payload(deferred),
       retry: retry && retry_issue_payload(retry),
       hold: hold && held_entry_payload(hold),
       logs: %{
@@ -108,25 +127,28 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  defp issue_id_from_entries(running, retry, hold),
-    do: (running && running.issue_id) || (retry && retry.issue_id) || (hold && hold.issue_id)
+  defp issue_id_from_entries(running, deferred, retry, hold),
+    do:
+      (running && running.issue_id) || (deferred && deferred.issue_id) ||
+        (retry && retry.issue_id) || (hold && hold.issue_id)
 
   defp restart_count(retry), do: max(retry_attempt(retry) - 1, 0)
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
 
-  defp issue_status(running, _retry, %{reason: "input_token_resume_pending"})
+  defp issue_status(running, _deferred, _retry, %{reason: "input_token_resume_pending"})
        when not is_nil(running),
        do: "running"
 
-  defp issue_status(nil, retry, %{reason: "input_token_resume_pending"})
+  defp issue_status(nil, _deferred, retry, %{reason: "input_token_resume_pending"})
        when not is_nil(retry),
        do: "retrying"
 
-  defp issue_status(_running, _retry, hold) when not is_nil(hold), do: "held"
-  defp issue_status(_running, nil, nil), do: "running"
-  defp issue_status(nil, _retry, nil), do: "retrying"
-  defp issue_status(_running, _retry, nil), do: "running"
+  defp issue_status(_running, _deferred, _retry, hold) when not is_nil(hold), do: "held"
+  defp issue_status(_running, deferred, _retry, nil) when not is_nil(deferred), do: "waiting"
+  defp issue_status(_running, nil, nil, nil), do: "running"
+  defp issue_status(nil, nil, _retry, nil), do: "retrying"
+  defp issue_status(_running, _deferred, _retry, nil), do: "running"
 
   defp running_entry_payload(entry) do
     %{
@@ -151,6 +173,19 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       input_token_budget: input_token_budget(entry)
     }
+    |> Map.merge(progress_efficiency_payload(entry))
+  end
+
+  defp deferred_entry_payload(entry) do
+    %{
+      issue_id: entry.issue_id,
+      issue_identifier: entry.identifier,
+      state: entry.state,
+      worker_host: Map.get(entry, :worker_host),
+      workspace_path: Map.get(entry, :workspace_path),
+      started_at: iso8601(Map.get(entry, :started_at))
+    }
+    |> Map.merge(progress_efficiency_payload(entry))
   end
 
   defp retry_entry_payload(entry) do
@@ -195,6 +230,7 @@ defmodule SymphonyElixirWeb.Presenter do
       cleanup_pending: Map.get(entry, :cleanup_pending, false),
       held_at: iso8601(Map.get(entry, :held_at))
     }
+    |> Map.merge(progress_efficiency_payload(entry))
   end
 
   defp running_issue_payload(running) do
@@ -218,6 +254,7 @@ defmodule SymphonyElixirWeb.Presenter do
       },
       input_token_budget: input_token_budget(running)
     }
+    |> Map.merge(progress_efficiency_payload(running))
   end
 
   defp retry_issue_payload(retry) do
@@ -230,15 +267,17 @@ defmodule SymphonyElixirWeb.Presenter do
     }
   end
 
-  defp workspace_path(issue_identifier, running, retry, hold) do
+  defp workspace_path(issue_identifier, running, deferred, retry, hold) do
     (running && Map.get(running, :workspace_path)) ||
+      (deferred && Map.get(deferred, :workspace_path)) ||
       (retry && Map.get(retry, :workspace_path)) ||
       (hold && Map.get(hold, :workspace_path)) ||
       Path.join(Config.settings!().workspace.root, issue_identifier)
   end
 
-  defp workspace_host(running, retry, hold) do
+  defp workspace_host(running, deferred, retry, hold) do
     (running && Map.get(running, :worker_host)) ||
+      (deferred && Map.get(deferred, :worker_host)) ||
       (retry && Map.get(retry, :worker_host)) ||
       (hold && Map.get(hold, :worker_host))
   end
@@ -263,6 +302,19 @@ defmodule SymphonyElixirWeb.Presenter do
       resume_phase: Map.get(entry, :resume_phase),
       requested_additional_input_tokens: Map.get(entry, :requested_additional_input_tokens),
       effective_additional_input_tokens: Map.get(entry, :effective_additional_input_tokens)
+    }
+  end
+
+  defp progress_efficiency_payload(entry) do
+    %{
+      progress_fingerprint: Map.get(entry, :progress_fingerprint),
+      progress_fingerprint_hash: Map.get(entry, :progress_fingerprint_hash),
+      review_fingerprint_hash: Map.get(entry, :review_fingerprint_hash),
+      tokens_since_progress: Map.get(entry, :tokens_since_progress, 0),
+      model_cycles_since_progress: Map.get(entry, :model_cycles_since_progress, 0),
+      watcher_state: Map.get(entry, :watcher_state, "not_registered"),
+      review_round_count: Map.get(entry, :review_round_count, 0),
+      security_review_count: Map.get(entry, :security_review_count, 0)
     }
   end
 

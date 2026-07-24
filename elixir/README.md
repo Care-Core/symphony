@@ -111,6 +111,8 @@ codex:
     urgent: 80000
   input_token_warning_ratio: 0.70
   input_token_checkpoint_grace: 500000
+  no_progress_input_tokens: 1000000
+  no_progress_cycles: 6
 ---
 
 You are working on a Linear issue {{ issue.identifier }}.
@@ -163,6 +165,17 @@ Notes:
   loop, and every normal or abnormal post-dispatch exit returns to a checkpoint hold. Missing
   tracker results keep the hold. Corrupt, insecure, or unreadable hold state fails startup closed.
   Manual and token-budget stops do not mutate Linear.
+- `codex.no_progress_input_tokens` (default `1000000`) and `codex.no_progress_cycles` (default `6`)
+  form a second, always-on circuit breaker. After a machine-readable progress fingerprint is
+  registered, unchanged token growth or completed model cycles create a durable `no_progress`
+  hold. A changed implementation/evidence receipt resets both counters exactly once; replaying the
+  same receipt does not. Resuming this hold uses the same named, bounded phase authorization as
+  other token-budget holds.
+- Progress, review authorization, and deferred-wait state are atomically stored with owner-only
+  permissions in `<workspace.root>/.symphony-progress.json`. Corrupt or insecure state aborts
+  startup. A persistence failure stops a running worker with `progress_state_unavailable`; that
+  hold cannot resume in the same daemon until persistence has been recovered and startup has
+  revalidated the file.
 - If the Markdown body is blank, Symphony uses a default prompt template that includes the issue
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
@@ -285,6 +298,17 @@ Operational control endpoints:
   `validation`, `review-fix`, `hosted-closeout`, or `landing`) and a positive
   `max_additional_input_tokens`. The response reports the requested and effective allowance, the
   current issue tier limit, the attempt-local token baseline, and the reused workspace path.
+- `POST /api/v1/<issue_identifier>/progress` records a complete machine-readable fingerprint and
+  evidence receipt. Only a changed fingerprint or receipt resets no-progress counters.
+- `POST /api/v1/<issue_identifier>/review` authorizes an exact-head `full`, `delta`, or `security`
+  review after local and remote heads match the registered fingerprint. One full review and one
+  delta review are allowed per review identity; an additional round requires explicit Linear
+  comment provenance in `linear-comment:<uuid>@<updatedAt>` form. Provider and review-outcome
+  receipts do not invalidate an otherwise unchanged exact-head review.
+- `POST /api/v1/<issue_identifier>/wait` registers a bounded, worktree-local receipt watcher.
+  When the active model turn exits, the issue remains claimed in `deferred_wait` with no model
+  continuation. A terminal exact-head receipt, timeout, or head change is persisted before exactly
+  one continuation is queued; persistence uncertainty never wakes a continuation.
 - Set a non-empty `SYMPHONY_CONTROL_TOKEN` environment secret before using either endpoint and send
   it in `X-Symphony-Control-Token`. Missing configuration returns `503`; a missing or invalid token
   returns `401`. Unknown issue identifiers return `404`. Both endpoints are loopback-only and never

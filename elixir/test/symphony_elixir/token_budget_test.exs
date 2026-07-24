@@ -41,6 +41,14 @@ defmodule SymphonyElixir.TokenBudgetTest do
     write_workflow_file!(Workflow.workflow_file_path(), codex_input_token_checkpoint_grace: 0)
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.input_token_checkpoint_grace"
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_no_progress_input_tokens: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.no_progress_input_tokens"
+
+    write_workflow_file!(Workflow.workflow_file_path(), codex_no_progress_cycles: 0)
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.no_progress_cycles"
   end
 
   test "warning threshold with no live steering channel creates a durable hold" do
@@ -1312,7 +1320,7 @@ defmodule SymphonyElixir.TokenBudgetTest do
   defp start_budget_orchestrator(
          suffix,
          limit,
-         cleanup_timeout_ms \\ 100,
+         cleanup_timeout_ms \\ 1_000,
          stall_timeout_ms \\ 0
        ) do
     workspace_root =

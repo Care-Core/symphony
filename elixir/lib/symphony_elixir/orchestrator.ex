@@ -19,7 +19,13 @@ defmodule SymphonyElixir.Orchestrator do
   @default_process_cleanup_timeout_ms 2_000
   @resume_phases ~w(implementation validation review-fix hosted-closeout landing)
   @phase_resume_pending_reason "input_token_resume_pending"
-  @budget_hold_reasons ~w(input_token_limit input_token_warning_unsupported input_token_checkpoint input_token_checkpoint_grace input_token_checkpoint_failed input_token_resume_pending)
+  @budget_hold_reasons ~w(input_token_limit input_token_warning_unsupported input_token_checkpoint input_token_checkpoint_grace input_token_checkpoint_failed input_token_resume_pending no_progress progress_state_unavailable)
+  @progress_fingerprint_fields ~w(contract_revision base_sha head_sha diff_checksum matrix_checksum required_check_set latest_human_comment_checkpoint full_review_verdict hosted_receipt)
+  @review_fingerprint_fields ~w(contract_revision base_sha head_sha diff_checksum matrix_checksum required_check_set latest_human_comment_checkpoint)
+  @review_kinds ~w(full delta security)
+  @human_override_pattern ~r/\Alinear-comment:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}@[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+-]+Z\z/i
+  @terminal_watcher_states ~w(passed failed timed_out head_changed receipt_invalid cancelled)
+  @watcher_poll_interval_ms 5_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
   @empty_codex_totals %{
@@ -42,13 +48,17 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_timer_ref,
       :tick_token,
       hold_store_available: true,
+      progress_state_available: true,
       hold_state_persist_retry_timer_ref: nil,
       hold_state_persist_retry_token: nil,
       running: %{},
+      deferred: %{},
       completed: MapSet.new(),
       claimed: MapSet.new(),
       retry_attempts: %{},
       holds: %{},
+      progress: %{},
+      waiter_tasks: %{},
       codex_totals: nil,
       codex_rate_limits: nil
     ]
@@ -75,32 +85,49 @@ defmodule SymphonyElixir.Orchestrator do
     now_ms = System.monotonic_time(:millisecond)
     config = Config.settings!()
 
-    case HoldStore.load(config.workspace.root) do
-      {:ok, holds} ->
-        state = %State{
-          poll_interval_ms: config.polling.interval_ms,
-          max_concurrent_agents: config.agent.max_concurrent_agents,
-          next_poll_due_at_ms: now_ms,
-          poll_check_in_progress: false,
-          tick_timer_ref: nil,
-          tick_token: nil,
-          holds: holds,
-          claimed: holds |> Map.keys() |> MapSet.new(),
-          codex_totals: @empty_codex_totals,
-          codex_rate_limits: nil
-        }
+    with {:ok, holds} <- HoldStore.load(config.workspace.root),
+         {:ok, progress} <- HoldStore.load_progress(config.workspace.root) do
+      watcher_claims = waiting_watcher_issue_ids(progress)
 
-        if map_size(holds) > 0 do
-          Logger.info("Restored durable issue holds count=#{map_size(holds)}")
-        end
+      state = %State{
+        poll_interval_ms: config.polling.interval_ms,
+        max_concurrent_agents: config.agent.max_concurrent_agents,
+        next_poll_due_at_ms: now_ms,
+        poll_check_in_progress: false,
+        tick_timer_ref: nil,
+        tick_token: nil,
+        holds: holds,
+        progress: progress,
+        deferred: restore_deferred_watchers(progress),
+        claimed: MapSet.new(Map.keys(holds) ++ watcher_claims),
+        codex_totals: @empty_codex_totals,
+        codex_rate_limits: nil
+      }
 
-        state = maybe_pause_for_pending_cleanup(state, holds)
+      if map_size(holds) > 0 do
+        Logger.info("Restored durable issue holds count=#{map_size(holds)}")
+      end
 
-        run_terminal_workspace_cleanup(holds)
-        {:ok, schedule_tick(state, 0)}
+      state = maybe_pause_for_pending_cleanup(state, holds)
+      state = schedule_restored_watchers(state)
+
+      run_terminal_workspace_cleanup(holds)
+      {:ok, schedule_tick(state, 0)}
+    else
+      {:error, {:progress_state_invalid, _, _} = reason} ->
+        Logger.error("Failed to restore durable progress state: #{inspect(reason)}")
+        {:stop, {:progress_state_load_failed, reason}}
+
+      {:error, {:progress_state_invalid_file, _, _} = reason} ->
+        Logger.error("Failed to restore durable progress state: #{inspect(reason)}")
+        {:stop, {:progress_state_load_failed, reason}}
+
+      {:error, {:progress_state_unreadable, _, _} = reason} ->
+        Logger.error("Failed to restore durable progress state: #{inspect(reason)}")
+        {:stop, {:progress_state_load_failed, reason}}
 
       {:error, reason} ->
-        Logger.error("Failed to restore durable issue holds: #{inspect(reason)}")
+        Logger.error("Failed to restore durable issue state: #{inspect(reason)}")
         {:stop, {:hold_state_load_failed, reason}}
     end
   end
@@ -236,6 +263,8 @@ defmodule SymphonyElixir.Orchestrator do
               state
           end
 
+        state = update_no_progress_state(state, issue_id)
+
         notify_dashboard()
         {:noreply, state}
     end
@@ -314,6 +343,23 @@ defmodule SymphonyElixir.Orchestrator do
 
   def handle_info({:retry_issue, _issue_id}, state), do: {:noreply, state}
 
+  def handle_info({:poll_deferred_watcher, issue_id, watcher_token}, state) do
+    state = poll_deferred_watcher(state, issue_id, watcher_token)
+    notify_dashboard()
+    {:noreply, state}
+  end
+
+  def handle_info({:deferred_waiter_exit, issue_id, watcher_token, result}, state) do
+    state =
+      state
+      |> remove_deferred_waiter_task(issue_id, watcher_token)
+      |> poll_deferred_watcher(issue_id, watcher_token)
+      |> settle_missing_waiter_receipt(issue_id, watcher_token, result)
+
+    notify_dashboard()
+    {:noreply, state}
+  end
+
   def handle_info(msg, state) do
     Logger.debug("Orchestrator ignored message: #{inspect(msg)}")
     {:noreply, state}
@@ -333,10 +379,14 @@ defmodule SymphonyElixir.Orchestrator do
          state,
          issue_id,
          %{input_token_warning_status: "delivered"} = running_entry,
-         _session_id,
+         session_id,
          :normal
        ) do
-    hold_checkpointed_issue(state, issue_id, running_entry, "input_token_checkpoint")
+    if waiting_watcher?(state, issue_id) do
+      defer_running_issue(state, issue_id, running_entry, session_id)
+    else
+      hold_checkpointed_issue(state, issue_id, running_entry, "input_token_checkpoint")
+    end
   end
 
   defp handle_running_task_exit(
@@ -353,11 +403,15 @@ defmodule SymphonyElixir.Orchestrator do
          state,
          issue_id,
          %{resume_phase: phase} = running_entry,
-         _session_id,
+         session_id,
          :normal
        )
        when is_binary(phase) do
-    hold_checkpointed_issue(state, issue_id, running_entry, "input_token_checkpoint")
+    if waiting_watcher?(state, issue_id) do
+      defer_running_issue(state, issue_id, running_entry, session_id)
+    else
+      hold_checkpointed_issue(state, issue_id, running_entry, "input_token_checkpoint")
+    end
   end
 
   defp handle_running_task_exit(
@@ -372,17 +426,21 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_running_task_exit(state, issue_id, running_entry, session_id, :normal) do
-    Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
+    if waiting_watcher?(state, issue_id) do
+      defer_running_issue(state, issue_id, running_entry, session_id)
+    else
+      Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
-    state
-    |> complete_issue(issue_id)
-    |> schedule_issue_retry(issue_id, 1, %{
-      identifier: running_entry.identifier,
-      delay_type: :continuation,
-      worker_host: Map.get(running_entry, :worker_host),
-      workspace_path: Map.get(running_entry, :workspace_path),
-      worker_affinity: Map.get(running_entry, :worker_affinity)
-    })
+      state
+      |> complete_issue(issue_id)
+      |> schedule_issue_retry(issue_id, 1, %{
+        identifier: running_entry.identifier,
+        delay_type: :continuation,
+        worker_host: Map.get(running_entry, :worker_host),
+        workspace_path: Map.get(running_entry, :workspace_path),
+        worker_affinity: Map.get(running_entry, :worker_affinity)
+      })
+    end
   end
 
   defp handle_running_task_exit(state, issue_id, running_entry, session_id, reason) do
@@ -397,9 +455,23 @@ defmodule SymphonyElixir.Orchestrator do
     })
   end
 
+  defp defer_running_issue(state, issue_id, running_entry, session_id) do
+    Logger.info("Agent turn yielded to deferred watcher for issue_id=#{issue_id} session_id=#{session_id}; retaining claim without scheduling a model continuation")
+
+    %{state | deferred: Map.put(state.deferred, issue_id, deferred_metadata(running_entry))}
+  end
+
   @impl true
-  def terminate(_reason, %State{running: running}) do
+  def terminate(_reason, %State{running: running, waiter_tasks: waiter_tasks}) do
     terminate_codex_process_trees(Map.values(running))
+
+    Enum.each(waiter_tasks, fn {_issue_id, task} ->
+      case waiter_task_pid(task) do
+        pid when is_pid(pid) -> Process.exit(pid, :shutdown)
+        nil -> :ok
+      end
+    end)
+
     :ok
   end
 
@@ -2271,8 +2343,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp find_known_issue_id(%State{} = state, issue_identifier) do
     find_issue_id_by_identifier(state.running, issue_identifier) ||
+      find_issue_id_by_identifier(state.deferred, issue_identifier) ||
       find_issue_id_by_identifier(state.retry_attempts, issue_identifier) ||
-      find_issue_id_by_identifier(state.holds, issue_identifier)
+      find_issue_id_by_identifier(state.holds, issue_identifier) ||
+      find_progress_issue_id(state.progress, issue_identifier)
   end
 
   defp find_hold_by_identifier(holds, issue_identifier) do
@@ -2284,6 +2358,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp find_issue_id_by_identifier(entries, issue_identifier) do
     Enum.find_value(entries, fn {issue_id, entry} ->
       if same_identifier?(Map.get(entry, :identifier), issue_identifier), do: issue_id
+    end)
+  end
+
+  defp find_progress_issue_id(entries, issue_identifier) do
+    Enum.find_value(entries, fn {issue_id, entry} ->
+      if same_identifier?(Map.get(entry, "identifier"), issue_identifier), do: issue_id
     end)
   end
 
@@ -2299,6 +2379,9 @@ defmodule SymphonyElixir.Orchestrator do
         observed = Map.get(running_entry, :codex_input_tokens, 0)
         hold_running_issue(state, issue_id, running_entry, "manual_stop", nil, observed)
 
+      deferred_entry = Map.get(state.deferred, issue_id) ->
+        stop_deferred_issue(state, issue_id, deferred_entry)
+
       retry_entry = Map.get(state.retry_attempts, issue_id) ->
         stop_retrying_issue(state, issue_id, retry_entry)
 
@@ -2307,6 +2390,41 @@ defmodule SymphonyElixir.Orchestrator do
 
       hold = Map.get(state.holds, issue_id) ->
         {:ok, state, hold}
+
+      true ->
+        {:error, state, :issue_not_found}
+    end
+  end
+
+  defp stop_deferred_issue(state, issue_id, deferred_entry) do
+    stopped_state =
+      state
+      |> stop_deferred_waiter_task(issue_id)
+      |> Map.put(:deferred, Map.delete(state.deferred, issue_id))
+
+    progress = Map.fetch!(stopped_state.progress, issue_id)
+
+    cancelled_watcher =
+      progress
+      |> Map.fetch!("watcher")
+      |> Map.put("state", "cancelled")
+      |> Map.put("completed_at", DateTime.utc_now() |> DateTime.to_iso8601())
+
+    cancelled_progress =
+      progress
+      |> Map.put("watcher", cancelled_watcher)
+      |> Map.put("updated_at", DateTime.utc_now() |> DateTime.to_iso8601())
+
+    case persist_progress_map(
+           stopped_state,
+           Map.put(stopped_state.progress, issue_id, cancelled_progress),
+           issue_id
+         ) do
+      {:ok, persisted_state} ->
+        stop_retrying_issue(persisted_state, issue_id, deferred_entry)
+
+      {:error, unavailable_state} ->
+        {:error, unavailable_state, :hold_state_unavailable}
     end
   end
 
@@ -2427,6 +2545,27 @@ defmodule SymphonyElixir.Orchestrator do
     call_control(server, {:resume_issue, issue_identifier, options})
   end
 
+  @spec record_progress(String.t(), map(), GenServer.server()) ::
+          {:ok, map()} | {:error, atom()}
+  def record_progress(issue_identifier, attributes, server \\ __MODULE__)
+      when is_binary(issue_identifier) and is_map(attributes) do
+    call_control(server, {:record_progress, issue_identifier, attributes})
+  end
+
+  @spec authorize_review(String.t(), map(), GenServer.server()) ::
+          {:ok, map()} | {:error, atom()}
+  def authorize_review(issue_identifier, attributes, server \\ __MODULE__)
+      when is_binary(issue_identifier) and is_map(attributes) do
+    call_control(server, {:authorize_review, issue_identifier, attributes})
+  end
+
+  @spec register_deferred_wait(String.t(), map(), GenServer.server()) ::
+          {:ok, map()} | {:error, atom()}
+  def register_deferred_wait(issue_identifier, attributes, server \\ __MODULE__)
+      when is_binary(issue_identifier) and is_map(attributes) do
+    call_control(server, {:register_deferred_wait, issue_identifier, attributes})
+  end
+
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
 
@@ -2447,6 +2586,8 @@ defmodule SymphonyElixir.Orchestrator do
     running =
       state.running
       |> Enum.map(fn {issue_id, metadata} ->
+        progress = progress_metadata(state, issue_id)
+
         %{
           issue_id: issue_id,
           identifier: metadata.identifier,
@@ -2479,11 +2620,14 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_event: metadata.last_codex_event,
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
+        |> Map.merge(progress)
       end)
 
     held =
       state.holds
       |> Enum.map(fn {_issue_id, hold} ->
+        progress = progress_metadata(state, hold.issue_id)
+
         %{
           issue_id: hold.issue_id,
           identifier: hold.identifier,
@@ -2503,6 +2647,21 @@ defmodule SymphonyElixir.Orchestrator do
           cleanup_pending: Map.get(hold, :cleanup_pending, false),
           held_at: hold.held_at
         }
+        |> Map.merge(progress)
+      end)
+
+    deferred =
+      state.deferred
+      |> Enum.map(fn {issue_id, metadata} ->
+        %{
+          issue_id: issue_id,
+          identifier: metadata.identifier,
+          state: "deferred_wait",
+          worker_host: Map.get(metadata, :worker_host),
+          workspace_path: Map.get(metadata, :workspace_path),
+          started_at: Map.get(metadata, :started_at)
+        }
+        |> Map.merge(progress_metadata(state, issue_id))
       end)
 
     retrying =
@@ -2522,6 +2681,7 @@ defmodule SymphonyElixir.Orchestrator do
     {:reply,
      %{
        running: running,
+       deferred: deferred,
        retrying: retrying,
        held: held,
        codex_totals: state.codex_totals,
@@ -2568,7 +2728,7 @@ defmodule SymphonyElixir.Orchestrator do
         %{input_token_warning_status: "delivered"} -> false
         %{input_token_warning_status: "unsupported"} -> false
         nil -> false
-        _running_entry -> true
+        _running_entry -> not waiting_watcher?(state, issue_id)
       end
 
     {:reply, continue?, state}
@@ -2582,10 +2742,35 @@ defmodule SymphonyElixir.Orchestrator do
     handle_resume_call(issue_identifier, options, state)
   end
 
+  def handle_call({:record_progress, issue_identifier, attributes}, _from, state) do
+    case record_progress_state(state, issue_identifier, attributes) do
+      {:ok, updated_state, receipt} -> {:reply, {:ok, receipt}, updated_state}
+      {:error, reason, updated_state} -> {:reply, {:error, reason}, updated_state}
+    end
+  end
+
+  def handle_call({:authorize_review, issue_identifier, attributes}, _from, state) do
+    case authorize_review_state(state, issue_identifier, attributes) do
+      {:ok, updated_state, receipt} -> {:reply, {:ok, receipt}, updated_state}
+      {:error, reason, updated_state} -> {:reply, {:error, reason}, updated_state}
+    end
+  end
+
+  def handle_call({:register_deferred_wait, issue_identifier, attributes}, _from, state) do
+    case register_deferred_wait_state(state, issue_identifier, attributes) do
+      {:ok, updated_state, receipt} -> {:reply, {:ok, receipt}, updated_state}
+      {:error, reason, updated_state} -> {:reply, {:error, reason}, updated_state}
+    end
+  end
+
   defp handle_resume_call(issue_identifier, options, state) do
     case find_hold_by_identifier(state.holds, issue_identifier) do
       nil ->
         {:reply, {:error, :issue_not_found}, state}
+
+      {_issue_id, %{reason: "progress_state_unavailable"}}
+      when not state.progress_state_available ->
+        {:reply, {:error, :progress_state_unavailable}, state}
 
       {issue_id, hold} ->
         case authorize_hold_resume(issue_id, hold, options) do
@@ -3342,6 +3527,1215 @@ defmodule SymphonyElixir.Orchestrator do
     else
       nil
     end
+  end
+
+  defp record_progress_state(%State{progress_state_available: false} = state, _identifier, _attributes),
+    do: {:error, :progress_state_unavailable, state}
+
+  defp record_progress_state(state, issue_identifier, attributes) do
+    with issue_id when is_binary(issue_id) <- find_known_issue_id(state, issue_identifier),
+         {:ok, fingerprint} <- normalize_progress_fingerprint(option_value(attributes, :fingerprint)),
+         {:ok, progress_kind} <- normalize_progress_kind(option_value(attributes, :progress_kind)),
+         {:ok, progress_receipt} <-
+           normalize_progress_receipt(option_value(attributes, :progress_receipt)),
+         existing =
+           Map.get(state.progress, issue_id) ||
+             new_progress_entry(state, issue_id, issue_identifier),
+         :ok <- validate_review_receipt_authorization(existing, progress_kind, fingerprint) do
+      progress_hash = canonical_hash(fingerprint)
+      review_hash = canonical_hash(Map.take(fingerprint, @review_fingerprint_fields))
+      prior_progress_hash = Map.get(existing, "progress_fingerprint_hash")
+      meaningful? = progress_hash != prior_progress_hash
+
+      if meaningful? do
+        updated =
+          existing
+          |> update_review_identity(fingerprint, review_hash)
+          |> reset_no_progress_counters(state, issue_id)
+          |> Map.merge(%{
+            "fingerprint" => fingerprint,
+            "progress_fingerprint_hash" => progress_hash,
+            "review_fingerprint_hash" => review_hash,
+            "last_progress_kind" => progress_kind,
+            "last_progress_receipt" => progress_receipt,
+            "updated_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+          })
+
+        persist_progress_entry(state, issue_id, updated, %{
+          changed: true,
+          progress_fingerprint: progress_hash,
+          review_fingerprint: review_hash,
+          tokens_since_progress: 0,
+          model_cycles_since_progress: 0
+        })
+      else
+        {:ok, state,
+         %{
+           changed: false,
+           progress_fingerprint: progress_hash,
+           review_fingerprint: review_hash,
+           tokens_since_progress: Map.get(existing, "tokens_since_progress", 0),
+           model_cycles_since_progress: Map.get(existing, "model_cycles_since_progress", 0)
+         }}
+      end
+    else
+      nil -> {:error, :issue_not_found, state}
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp authorize_review_state(%State{progress_state_available: false} = state, _identifier, _attributes),
+    do: {:error, :progress_state_unavailable, state}
+
+  defp authorize_review_state(state, issue_identifier, attributes) do
+    with issue_id when is_binary(issue_id) <- find_known_issue_id(state, issue_identifier),
+         %{} = progress <- Map.get(state.progress, issue_id),
+         {:ok, kind} <- normalize_review_kind(option_value(attributes, :kind)),
+         requested_fingerprint when is_binary(requested_fingerprint) <-
+           option_value(attributes, :review_fingerprint),
+         true <- requested_fingerprint == Map.get(progress, "review_fingerprint_hash"),
+         requested_head when is_binary(requested_head) <- option_value(attributes, :requested_head),
+         true <- valid_commit_sha?(requested_head),
+         true <- fingerprint_contains_head?(Map.get(progress, "fingerprint", %{}), requested_head),
+         ^requested_head <- option_value(attributes, :observed_local_head),
+         ^requested_head <- option_value(attributes, :observed_remote_head),
+         {:ok, updated} <- increment_review_round(progress, kind, option_value(attributes, :human_override)) do
+      authorization =
+        canonical_hash(%{
+          issue_id: issue_id,
+          kind: kind,
+          review_fingerprint: requested_fingerprint,
+          requested_head: requested_head,
+          round: Map.get(updated, "review_round_count", 0),
+          issued_at: System.unique_integer([:positive, :monotonic])
+        })
+
+      updated =
+        updated
+        |> Map.put("last_review_authorization", authorization)
+        |> Map.put("last_review_authorized_head", requested_head)
+        |> Map.put("last_review_authorized_fingerprint", requested_fingerprint)
+        |> Map.put("updated_at", DateTime.utc_now() |> DateTime.to_iso8601())
+
+      persist_progress_entry(state, issue_id, updated, %{
+        authorized: true,
+        authorization: authorization,
+        kind: kind,
+        review_round_count: Map.get(updated, "review_round_count", 0),
+        security_review_count: Map.get(updated, "security_review_count", 0),
+        review_fingerprint: requested_fingerprint,
+        requested_head: requested_head
+      })
+    else
+      nil -> {:error, :issue_not_found, state}
+      false -> {:error, :review_fingerprint_mismatch, state}
+      {:error, reason} -> {:error, reason, state}
+      _ -> {:error, :stale_review_head, state}
+    end
+  end
+
+  defp register_deferred_wait_state(
+         %State{progress_state_available: false} = state,
+         _identifier,
+         _attributes
+       ),
+       do: {:error, :progress_state_unavailable, state}
+
+  defp register_deferred_wait_state(state, issue_identifier, attributes) do
+    with issue_id when is_binary(issue_id) <- find_known_issue_id(state, issue_identifier),
+         %{} = running_entry <- Map.get(state.running, issue_id),
+         %{} = progress <- Map.get(state.progress, issue_id),
+         expected_head when is_binary(expected_head) <- option_value(attributes, :expected_head),
+         true <- valid_commit_sha?(expected_head),
+         true <- fingerprint_contains_head?(Map.get(progress, "fingerprint", %{}), expected_head),
+         {:ok, receipt_path} <-
+           validate_receipt_path(
+             option_value(attributes, :receipt_path),
+             Map.get(running_entry, :workspace_path)
+           ),
+         {:ok, timeout_seconds} <-
+           validate_wait_timeout(option_value(attributes, :timeout_seconds)),
+         {:ok, waiter_command} <-
+           validate_waiter_command(attributes, Map.get(running_entry, :workspace_path), expected_head, receipt_path) do
+      watcher =
+        build_deferred_watcher(
+          issue_identifier,
+          running_entry,
+          expected_head,
+          receipt_path,
+          timeout_seconds,
+          waiter_command
+        )
+
+      persist_and_launch_deferred_waiter(state, issue_id, progress, watcher, timeout_seconds)
+    else
+      nil -> {:error, :issue_not_found, state}
+      false -> {:error, :review_fingerprint_mismatch, state}
+      {:error, reason} -> {:error, reason, state}
+      _ -> {:error, :issue_not_running, state}
+    end
+  end
+
+  defp build_deferred_watcher(
+         issue_identifier,
+         running_entry,
+         expected_head,
+         receipt_path,
+         timeout_seconds,
+         waiter_command
+       ) do
+    %{
+      "state" => "waiting",
+      "token" => :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower),
+      "expected_head" => expected_head,
+      "receipt_path" => receipt_path,
+      "registered_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
+      "deadline_unix_ms" => System.system_time(:millisecond) + timeout_seconds * 1_000,
+      "last_receipt_hash" => nil,
+      "wake_count" => 0,
+      "identifier" => issue_identifier,
+      "worker_host" => Map.get(running_entry, :worker_host),
+      "workspace_path" => Map.get(running_entry, :workspace_path),
+      "waiter_command" => waiter_command
+    }
+  end
+
+  defp persist_and_launch_deferred_waiter(state, issue_id, progress, watcher, timeout_seconds) do
+    updated =
+      progress
+      |> Map.put("watcher", watcher)
+      |> Map.put("updated_at", DateTime.utc_now() |> DateTime.to_iso8601())
+
+    receipt = %{
+      watcher_state: "waiting",
+      watcher_token: Map.fetch!(watcher, "token"),
+      expected_head: Map.fetch!(watcher, "expected_head"),
+      receipt_path: Map.fetch!(watcher, "receipt_path"),
+      timeout_seconds: timeout_seconds
+    }
+
+    case persist_progress_entry(state, issue_id, updated, receipt) do
+      {:ok, updated_state, persisted_receipt} ->
+        launch_registered_waiter(updated_state, issue_id, watcher, persisted_receipt)
+
+      error ->
+        error
+    end
+  end
+
+  defp launch_registered_waiter(state, issue_id, watcher, receipt) do
+    launched_state =
+      state
+      |> stop_deferred_waiter_task(issue_id)
+      |> launch_deferred_waiter(issue_id, watcher)
+
+    schedule_deferred_watcher_poll(issue_id, Map.fetch!(watcher, "token"))
+    {:ok, launched_state, receipt}
+  end
+
+  defp normalize_progress_fingerprint(fingerprint) when is_map(fingerprint) do
+    normalized =
+      Enum.reduce(@progress_fingerprint_fields, %{}, fn field, acc ->
+        Map.put(acc, field, Map.get(fingerprint, field, Map.get(fingerprint, String.to_atom(field))))
+      end)
+
+    with :ok <- validate_contract_revision(normalized),
+         :ok <- validate_progress_heads(normalized),
+         :ok <- validate_progress_checksums(normalized),
+         {:ok, required_checks} <- normalize_required_check_set(normalized) do
+      {:ok, Map.put(normalized, "required_check_set", required_checks)}
+    end
+  end
+
+  defp normalize_progress_fingerprint(_fingerprint),
+    do: {:error, :incomplete_progress_fingerprint}
+
+  defp validate_contract_revision(%{"contract_revision" => revision})
+       when is_binary(revision) do
+    if String.trim(revision) == "", do: {:error, :incomplete_progress_fingerprint}, else: :ok
+  end
+
+  defp validate_contract_revision(_fingerprint),
+    do: {:error, :incomplete_progress_fingerprint}
+
+  defp validate_progress_heads(fingerprint) do
+    if valid_sha_container?(fingerprint["base_sha"]) and
+         valid_sha_container?(fingerprint["head_sha"]) do
+      :ok
+    else
+      {:error, :invalid_progress_head}
+    end
+  end
+
+  defp validate_progress_checksums(fingerprint) do
+    if valid_checksum_container?(fingerprint["diff_checksum"]) and
+         valid_checksum_container?(fingerprint["matrix_checksum"]) do
+      :ok
+    else
+      {:error, :invalid_progress_checksum}
+    end
+  end
+
+  defp normalize_required_check_set(%{"required_check_set" => checks}) when is_list(checks) do
+    if Enum.all?(checks, &(is_binary(&1) and String.trim(&1) != "")) do
+      {:ok, checks |> Enum.uniq() |> Enum.sort()}
+    else
+      {:error, :invalid_required_check_set}
+    end
+  end
+
+  defp normalize_required_check_set(_fingerprint),
+    do: {:error, :invalid_required_check_set}
+
+  defp normalize_progress_kind(kind)
+       when kind in [
+              "git",
+              "workpad_checkpoint",
+              "validation_receipt",
+              "review_receipt",
+              "human_direction",
+              "provider_transition"
+            ],
+       do: {:ok, kind}
+
+  defp normalize_progress_kind(kind) when is_atom(kind), do: normalize_progress_kind(Atom.to_string(kind))
+  defp normalize_progress_kind(_kind), do: {:error, :invalid_progress_kind}
+
+  defp normalize_progress_receipt(receipt) when is_binary(receipt) do
+    if String.trim(receipt) == "", do: {:error, :invalid_progress_receipt}, else: {:ok, receipt}
+  end
+
+  defp normalize_progress_receipt(_receipt), do: {:error, :invalid_progress_receipt}
+
+  defp normalize_review_kind(kind) when kind in @review_kinds, do: {:ok, kind}
+  defp normalize_review_kind(kind) when is_atom(kind), do: normalize_review_kind(Atom.to_string(kind))
+  defp normalize_review_kind(_kind), do: {:error, :invalid_review_kind}
+
+  defp increment_review_round(progress, kind, override) do
+    with :ok <- validate_review_override(progress, override) do
+      do_increment_review_round(progress, kind, override)
+    end
+  end
+
+  defp do_increment_review_round(progress, "full", override) do
+    if Map.get(progress, "full_review_count", 0) == 0 or valid_human_override?(override) do
+      {:ok,
+       progress
+       |> Map.update("full_review_count", 1, &(&1 + 1))
+       |> Map.update("review_round_count", 1, &(&1 + 1))
+       |> maybe_record_review_override(override)}
+    else
+      {:error, :full_review_already_completed}
+    end
+  end
+
+  defp do_increment_review_round(progress, "delta", override) do
+    cond do
+      Map.get(progress, "full_review_count", 0) == 0 ->
+        {:error, :full_review_required}
+
+      Map.get(progress, "delta_review_count", 0) == 0 or valid_human_override?(override) ->
+        {:ok,
+         progress
+         |> Map.update("delta_review_count", 1, &(&1 + 1))
+         |> Map.update("review_round_count", 1, &(&1 + 1))
+         |> maybe_record_review_override(override)}
+
+      true ->
+        {:error, :delta_review_already_completed}
+    end
+  end
+
+  defp do_increment_review_round(progress, "security", override) do
+    if Map.get(progress, "security_review_count", 0) == 0 or valid_human_override?(override) do
+      {:ok,
+       progress
+       |> Map.update("security_review_count", 1, &(&1 + 1))
+       |> maybe_record_review_override(override)}
+    else
+      {:error, :security_review_already_completed}
+    end
+  end
+
+  defp valid_human_override?(override),
+    do: is_binary(override) and Regex.match?(@human_override_pattern, override)
+
+  defp validate_review_override(progress, override) do
+    case Map.get(progress, "used_review_overrides", []) do
+      overrides when is_list(overrides) ->
+        if valid_human_override?(override) and override in overrides do
+          {:error, :review_override_already_used}
+        else
+          :ok
+        end
+
+      _invalid ->
+        {:error, :review_override_state_invalid}
+    end
+  end
+
+  defp maybe_record_review_override(progress, override) do
+    if valid_human_override?(override) do
+      progress
+      |> Map.put("review_override", override)
+      |> Map.update("used_review_overrides", [override], fn overrides ->
+        [override | overrides] |> Enum.uniq()
+      end)
+    else
+      progress
+    end
+  end
+
+  defp validate_review_receipt_authorization(progress, "review_receipt", fingerprint) do
+    authorized_head = Map.get(progress, "last_review_authorized_head")
+    authorized_fingerprint = Map.get(progress, "last_review_authorized_fingerprint")
+    receipt_fingerprint = canonical_hash(Map.take(fingerprint, @review_fingerprint_fields))
+
+    if is_binary(authorized_head) and is_binary(authorized_fingerprint) and
+         fingerprint_contains_head?(fingerprint, authorized_head) and
+         receipt_fingerprint == authorized_fingerprint do
+      :ok
+    else
+      {:error, :review_authorization_mismatch}
+    end
+  end
+
+  defp validate_review_receipt_authorization(_progress, _kind, _fingerprint), do: :ok
+
+  defp update_review_identity(existing, fingerprint, review_hash) do
+    prior_fingerprint = Map.get(existing, "fingerprint", %{})
+    prior_review_hash = Map.get(existing, "review_fingerprint_hash")
+
+    cond do
+      is_nil(prior_review_hash) ->
+        initialize_review_counts(existing)
+
+      prior_review_hash == review_hash ->
+        existing
+
+      contract_or_matrix_changed?(prior_fingerprint, fingerprint) ->
+        initialize_review_counts(existing)
+
+      Map.get(existing, "full_review_count", 0) > 0 ->
+        existing
+        |> Map.put("delta_review_count", 0)
+        |> Map.put("review_round_count", Map.get(existing, "full_review_count", 0))
+        |> Map.put("security_review_count", 0)
+
+      true ->
+        initialize_review_counts(existing)
+    end
+  end
+
+  defp contract_or_matrix_changed?(prior, current) do
+    Map.get(prior, "contract_revision") != Map.get(current, "contract_revision") or
+      Map.get(prior, "matrix_checksum") != Map.get(current, "matrix_checksum")
+  end
+
+  defp initialize_review_counts(entry) do
+    entry
+    |> Map.put("full_review_count", 0)
+    |> Map.put("delta_review_count", 0)
+    |> Map.put("security_review_count", 0)
+    |> Map.put("review_round_count", 0)
+    |> Map.delete("review_override")
+  end
+
+  defp new_progress_entry(state, issue_id, issue_identifier) do
+    workspace_path =
+      state.running
+      |> Map.get(issue_id, %{})
+      |> Map.get(:workspace_path)
+
+    %{
+      "issue_id" => issue_id,
+      "identifier" => issue_identifier,
+      "workspace_path" => workspace_path,
+      "fingerprint" => %{},
+      "tokens_since_progress" => 0,
+      "model_cycles_since_progress" => 0,
+      "review_round_count" => 0,
+      "full_review_count" => 0,
+      "delta_review_count" => 0,
+      "security_review_count" => 0,
+      "watcher" => nil
+    }
+  end
+
+  defp progress_baselines(state, issue_id) do
+    case Map.get(state.running, issue_id) do
+      nil -> {0, 0}
+      running -> {Map.get(running, :codex_input_tokens, 0), Map.get(running, :turn_count, 0)}
+    end
+  end
+
+  defp reset_no_progress_counters(progress, state, issue_id) do
+    {token_baseline, cycle_baseline} = progress_baselines(state, issue_id)
+
+    progress
+    |> Map.put("token_baseline", token_baseline)
+    |> Map.put("cycle_baseline", cycle_baseline)
+    |> Map.put("last_observed_input_tokens", token_baseline)
+    |> Map.put("last_observed_model_cycles", cycle_baseline)
+    |> Map.put("tokens_since_progress", 0)
+    |> Map.put("model_cycles_since_progress", 0)
+  end
+
+  defp persist_progress_entry(state, issue_id, entry, receipt) do
+    progress = Map.put(state.progress, issue_id, entry)
+
+    case HoldStore.persist_progress(Config.settings!().workspace.root, progress) do
+      :ok ->
+        {:ok, %{state | progress: progress, progress_state_available: true}, receipt}
+
+      {:error, reason} ->
+        Logger.error("Failed to persist progress state issue_id=#{issue_id} reason=#{inspect(reason)}; refusing progress/review/watcher transition")
+
+        unavailable_state =
+          state
+          |> Map.put(:progress_state_available, false)
+          |> hold_progress_persistence_failure(issue_id)
+
+        {:error, :progress_state_unavailable, unavailable_state}
+    end
+  end
+
+  defp persist_progress_map(state, progress, issue_id) do
+    case HoldStore.persist_progress(Config.settings!().workspace.root, progress) do
+      :ok ->
+        {:ok, %{state | progress: progress, progress_state_available: true}}
+
+      {:error, reason} ->
+        Logger.error("Failed to persist progress state issue_id=#{issue_id} reason=#{inspect(reason)}; refusing progress/watcher transition")
+
+        unavailable_state =
+          state
+          |> Map.put(:progress_state_available, false)
+          |> hold_progress_persistence_failure(issue_id)
+
+        {:error, unavailable_state}
+    end
+  end
+
+  defp hold_progress_persistence_failure(state, issue_id) do
+    case Map.get(state.running, issue_id) do
+      nil ->
+        state
+
+      running ->
+        observed = Map.get(running, :codex_input_tokens, 0)
+
+        case hold_token_budget_issue(
+               state,
+               issue_id,
+               running,
+               "progress_state_unavailable",
+               nil,
+               observed
+             ) do
+          {:ok, held_state, _hold} -> held_state
+          {:error, held_state, _reason} -> held_state
+        end
+    end
+  end
+
+  defp update_no_progress_state(state, issue_id) do
+    with %{} = running <- Map.get(state.running, issue_id),
+         %{} = progress <- Map.get(state.progress, issue_id),
+         true <- is_binary(Map.get(progress, "progress_fingerprint_hash")) do
+      {tokens, cycles, observed_tokens, observed_cycles} = no_progress_counts(running, progress)
+
+      state
+      |> persist_no_progress_counts(
+        issue_id,
+        progress,
+        tokens,
+        cycles,
+        observed_tokens,
+        observed_cycles
+      )
+      |> maybe_hold_no_progress(issue_id, running, tokens, cycles)
+    else
+      _ -> state
+    end
+  end
+
+  defp no_progress_counts(running, progress) do
+    observed_tokens = Map.get(running, :codex_input_tokens, 0)
+    observed_cycles = Map.get(running, :turn_count, 0)
+    accumulated_tokens = Map.get(progress, "tokens_since_progress", 0)
+    accumulated_cycles = Map.get(progress, "model_cycles_since_progress", 0)
+
+    prior_tokens =
+      Map.get(
+        progress,
+        "last_observed_input_tokens",
+        Map.get(progress, "token_baseline", 0) + accumulated_tokens
+      )
+
+    prior_cycles =
+      Map.get(
+        progress,
+        "last_observed_model_cycles",
+        Map.get(progress, "cycle_baseline", 0) + accumulated_cycles
+      )
+
+    tokens = accumulated_tokens + counter_delta(observed_tokens, prior_tokens)
+    cycles = accumulated_cycles + counter_delta(observed_cycles, prior_cycles)
+
+    {tokens, cycles, observed_tokens, observed_cycles}
+  end
+
+  defp counter_delta(current, prior) when current >= prior, do: current - prior
+  defp counter_delta(current, _prior), do: current
+
+  defp persist_no_progress_counts(
+         state,
+         issue_id,
+         progress,
+         tokens,
+         cycles,
+         observed_tokens,
+         observed_cycles
+       ) do
+    updated =
+      progress
+      |> Map.put("tokens_since_progress", tokens)
+      |> Map.put("model_cycles_since_progress", cycles)
+      |> Map.put("last_observed_input_tokens", observed_tokens)
+      |> Map.put("last_observed_model_cycles", observed_cycles)
+
+    if updated == progress do
+      state
+    else
+      persist_no_progress_update(state, issue_id, updated)
+    end
+  end
+
+  defp persist_no_progress_update(state, issue_id, updated) do
+    case persist_progress_map(state, Map.put(state.progress, issue_id, updated), issue_id) do
+      {:ok, updated_state} -> updated_state
+      {:error, unavailable_state} -> unavailable_state
+    end
+  end
+
+  defp maybe_hold_no_progress(
+         %State{progress_state_available: false} = state,
+         _issue_id,
+         _running,
+         _tokens,
+         _cycles
+       ),
+       do: state
+
+  defp maybe_hold_no_progress(state, issue_id, running, tokens, cycles) do
+    settings = Config.settings!().codex
+
+    if tokens >= settings.no_progress_input_tokens or cycles >= settings.no_progress_cycles do
+      hold_no_progress_issue(state, issue_id, running, settings.no_progress_input_tokens)
+    else
+      state
+    end
+  end
+
+  defp hold_no_progress_issue(state, issue_id, running, limit) do
+    observed = Map.get(running, :codex_input_tokens, 0)
+
+    case hold_token_budget_issue(state, issue_id, running, "no_progress", limit, observed) do
+      {:ok, held_state, _hold} -> held_state
+      {:error, held_state, _reason} -> held_state
+    end
+  end
+
+  defp waiting_watcher?(state, issue_id) do
+    get_in(state.progress, [issue_id, "watcher", "state"]) == "waiting"
+  end
+
+  defp waiting_watcher_issue_ids(progress) do
+    progress
+    |> Enum.flat_map(fn {issue_id, entry} ->
+      if get_in(entry, ["watcher", "state"]) == "waiting", do: [issue_id], else: []
+    end)
+  end
+
+  defp restore_deferred_watchers(progress) do
+    Enum.reduce(progress, %{}, fn {issue_id, entry}, acc ->
+      case Map.get(entry, "watcher") do
+        %{"state" => "waiting"} = watcher ->
+          Map.put(acc, issue_id, %{
+            identifier: Map.get(watcher, "identifier") || Map.get(entry, "identifier"),
+            worker_host: Map.get(watcher, "worker_host"),
+            workspace_path: Map.get(watcher, "workspace_path") || Map.get(entry, "workspace_path"),
+            worker_affinity: if(is_nil(Map.get(watcher, "worker_host")), do: :local),
+            started_at: DateTime.utc_now()
+          })
+
+        _ ->
+          acc
+      end
+    end)
+  end
+
+  defp schedule_restored_watchers(state) do
+    Enum.reduce(waiting_watcher_issue_ids(state.progress), state, fn issue_id, state_acc ->
+      restore_deferred_watcher(state_acc, issue_id)
+    end)
+  end
+
+  defp restore_deferred_watcher(state, issue_id) do
+    watcher = get_in(state.progress, [issue_id, "watcher"])
+    watcher_token = Map.fetch!(watcher, "token")
+    polled_state = poll_deferred_watcher(state, issue_id, watcher_token)
+
+    if waiting_watcher?(polled_state, issue_id) do
+      launch_restored_waiter(polled_state, issue_id, watcher)
+    else
+      polled_state
+    end
+  end
+
+  defp launch_restored_waiter(state, issue_id, watcher) do
+    launch_deferred_waiter(state, issue_id, watcher)
+  end
+
+  defp deferred_metadata(running_entry) do
+    %{
+      identifier: running_entry.identifier,
+      worker_host: Map.get(running_entry, :worker_host),
+      workspace_path: Map.get(running_entry, :workspace_path),
+      worker_affinity: Map.get(running_entry, :worker_affinity),
+      phase_budget: deferred_phase_budget(running_entry),
+      started_at: Map.get(running_entry, :started_at)
+    }
+  end
+
+  defp deferred_phase_budget(%{resume_phase: phase} = running_entry) when is_binary(phase) do
+    %{
+      phase: phase,
+      requested_additional_input_tokens: Map.get(running_entry, :requested_additional_input_tokens),
+      effective_additional_input_tokens: Map.get(running_entry, :effective_additional_input_tokens)
+    }
+  end
+
+  defp deferred_phase_budget(_running_entry), do: nil
+
+  defp launch_deferred_waiter(state, issue_id, watcher) do
+    %{"script" => script, "args" => args} = Map.fetch!(watcher, "waiter_command")
+    workspace_path = Map.fetch!(watcher, "workspace_path")
+    watcher_token = Map.fetch!(watcher, "token")
+    deadline_unix_ms = Map.fetch!(watcher, "deadline_unix_ms")
+    remaining_ms = max(deadline_unix_ms - System.system_time(:millisecond), 1)
+    orchestrator = self()
+
+    {:ok, task_pid} =
+      Task.start(fn ->
+        result =
+          ProcessTree.run(script, args,
+            cd: workspace_path,
+            timeout_ms: remaining_ms,
+            max_output_bytes: 4_096
+          )
+
+        send(orchestrator, {:deferred_waiter_exit, issue_id, watcher_token, summarize_waiter_result(result)})
+      end)
+
+    task = %{pid: task_pid, token: watcher_token}
+    %{state | waiter_tasks: Map.put(state.waiter_tasks, issue_id, task)}
+  end
+
+  defp summarize_waiter_result({:ok, %{status: status}}), do: {:exit_status, status}
+  defp summarize_waiter_result({:error, {:timeout, _timeout_ms, _output}}), do: :timed_out
+  defp summarize_waiter_result({:error, _reason}), do: :launch_failed
+
+  defp remove_deferred_waiter_task(state, issue_id, watcher_token) do
+    case Map.get(state.waiter_tasks, issue_id) do
+      %{token: ^watcher_token} ->
+        %{state | waiter_tasks: Map.delete(state.waiter_tasks, issue_id)}
+
+      pid when is_pid(pid) ->
+        if get_in(state.progress, [issue_id, "watcher", "token"]) == watcher_token do
+          %{state | waiter_tasks: Map.delete(state.waiter_tasks, issue_id)}
+        else
+          state
+        end
+
+      _task ->
+        state
+    end
+  end
+
+  defp stop_deferred_waiter_task(state, issue_id) do
+    case Map.pop(state.waiter_tasks, issue_id) do
+      {nil, _waiter_tasks} ->
+        state
+
+      {task, waiter_tasks} ->
+        shutdown_waiter_pid(waiter_task_pid(task))
+        %{state | waiter_tasks: waiter_tasks}
+    end
+  end
+
+  defp shutdown_waiter_pid(pid) when is_pid(pid) do
+    if Process.alive?(pid), do: Process.exit(pid, :shutdown)
+    :ok
+  end
+
+  defp shutdown_waiter_pid(nil), do: :ok
+
+  defp waiter_task_pid(pid) when is_pid(pid), do: pid
+  defp waiter_task_pid(%{pid: pid}) when is_pid(pid), do: pid
+  defp waiter_task_pid(_task), do: nil
+
+  defp settle_missing_waiter_receipt(state, issue_id, watcher_token, result) do
+    watcher = get_in(state.progress, [issue_id, "watcher"])
+
+    if is_map(watcher) and Map.get(watcher, "state") == "waiting" and
+         Map.get(watcher, "token") == watcher_token do
+      status = if result == :timed_out, do: "timed_out", else: "receipt_invalid"
+
+      settle_deferred_watcher(state, issue_id, watcher, %{
+        "type" => "terminal",
+        "status" => status,
+        "reason" => inspect(result),
+        "expectedHead" => Map.get(watcher, "expected_head"),
+        "observedHead" => Map.get(watcher, "expected_head")
+      })
+    else
+      state
+    end
+  end
+
+  defp poll_deferred_watcher(state, issue_id, watcher_token) do
+    watcher = get_in(state.progress, [issue_id, "watcher"])
+
+    cond do
+      not active_watcher?(watcher, watcher_token) ->
+        state
+
+      watcher_expired?(watcher) ->
+        settle_deferred_watcher(state, issue_id, watcher, timed_out_waiter_receipt(watcher))
+
+      true ->
+        poll_active_watcher(state, issue_id, watcher, watcher_token)
+    end
+  end
+
+  defp active_watcher?(watcher, watcher_token) do
+    is_map(watcher) and Map.get(watcher, "state") == "waiting" and
+      Map.get(watcher, "token") == watcher_token
+  end
+
+  defp watcher_expired?(watcher) do
+    System.system_time(:millisecond) >= Map.get(watcher, "deadline_unix_ms", 0)
+  end
+
+  defp poll_active_watcher(state, issue_id, watcher, watcher_token) do
+    case read_last_receipt(Map.fetch!(watcher, "receipt_path")) do
+      {:ok, receipt, signature} ->
+        handle_watcher_receipt(state, issue_id, watcher, watcher_token, receipt, signature)
+
+      :missing ->
+        schedule_deferred_watcher_poll(issue_id, watcher_token)
+        state
+
+      {:error, reason} ->
+        settle_deferred_watcher(
+          state,
+          issue_id,
+          watcher,
+          invalid_waiter_receipt(watcher, inspect(reason), nil)
+        )
+    end
+  end
+
+  defp handle_watcher_receipt(state, issue_id, watcher, watcher_token, receipt, signature) do
+    updated_state =
+      if signature == Map.get(watcher, "last_receipt_hash") do
+        state
+      else
+        record_watcher_receipt_transition(state, issue_id, watcher, receipt, signature)
+      end
+
+    if waiting_watcher?(updated_state, issue_id) do
+      schedule_deferred_watcher_poll(issue_id, watcher_token)
+    end
+
+    updated_state
+  end
+
+  defp schedule_deferred_watcher_poll(issue_id, watcher_token) do
+    Process.send_after(
+      self(),
+      {:poll_deferred_watcher, issue_id, watcher_token},
+      @watcher_poll_interval_ms
+    )
+  end
+
+  defp timed_out_waiter_receipt(watcher) do
+    %{
+      "type" => "terminal",
+      "status" => "timed_out",
+      "expectedHead" => Map.get(watcher, "expected_head"),
+      "observedHead" => Map.get(watcher, "expected_head")
+    }
+  end
+
+  defp invalid_waiter_receipt(watcher, reason, observed_head) do
+    %{
+      "type" => "terminal",
+      "status" => "receipt_invalid",
+      "reason" => reason,
+      "expectedHead" => Map.get(watcher, "expected_head"),
+      "observedHead" => observed_head
+    }
+  end
+
+  defp read_last_receipt(path) when is_binary(path) do
+    case File.read(path) do
+      {:ok, encoded} ->
+        decode_last_receipt(encoded)
+
+      {:error, :enoent} ->
+        :missing
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp decode_last_receipt(encoded) do
+    encoded
+    |> String.split("\n", trim: true)
+    |> List.last()
+    |> decode_receipt_line()
+  end
+
+  defp decode_receipt_line(nil), do: :missing
+
+  defp decode_receipt_line(line) do
+    case Jason.decode(line) do
+      {:ok, %{} = receipt} -> {:ok, receipt, canonical_hash(receipt)}
+      {:ok, _other} -> {:error, :invalid_receipt}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp record_watcher_receipt_transition(state, issue_id, watcher, receipt, signature) do
+    if Map.get(receipt, "type") == "terminal" do
+      settle_deferred_watcher(state, issue_id, watcher, receipt)
+    else
+      progress = Map.fetch!(state.progress, issue_id)
+      updated_watcher = Map.put(watcher, "last_receipt_hash", signature)
+      required_check_signature = required_check_signature(progress, receipt)
+
+      updated =
+        if required_check_signature != Map.get(progress, "last_required_check_signature") do
+          fingerprint =
+            progress
+            |> Map.get("fingerprint", %{})
+            |> Map.put("hosted_receipt", %{
+              "state" => "provider_transition",
+              "required_check_signature" => required_check_signature
+            })
+
+          progress
+          |> reset_no_progress_counters(state, issue_id)
+          |> Map.put("watcher", updated_watcher)
+          |> Map.put("fingerprint", fingerprint)
+          |> Map.put("progress_fingerprint_hash", canonical_hash(fingerprint))
+          |> Map.put("last_required_check_signature", required_check_signature)
+          |> Map.put("last_progress_kind", "provider_transition")
+          |> Map.put("last_progress_receipt", required_check_signature)
+          |> Map.put("updated_at", DateTime.utc_now() |> DateTime.to_iso8601())
+        else
+          progress
+          |> Map.put("watcher", updated_watcher)
+          |> Map.put("updated_at", DateTime.utc_now() |> DateTime.to_iso8601())
+        end
+
+      case persist_progress_map(state, Map.put(state.progress, issue_id, updated), issue_id) do
+        {:ok, updated_state} -> updated_state
+        {:error, unavailable_state} -> unavailable_state
+      end
+    end
+  end
+
+  defp settle_deferred_watcher(state, issue_id, watcher, receipt) do
+    expected_head = Map.get(watcher, "expected_head")
+    status = Map.get(receipt, "status", "receipt_invalid")
+    receipt_expected_head = Map.get(receipt, "expectedHead")
+    observed_head = Map.get(receipt, "observedHead")
+
+    valid_terminal? =
+      status in @terminal_watcher_states and
+        receipt_expected_head == expected_head and
+        (status == "head_changed" or observed_head == expected_head)
+
+    terminal_status = if valid_terminal?, do: status, else: "receipt_invalid"
+    progress = Map.fetch!(state.progress, issue_id)
+
+    updated_watcher =
+      watcher
+      |> Map.put("state", terminal_status)
+      |> Map.put("wake_count", 1)
+      |> Map.put("terminal_receipt", receipt)
+      |> Map.put("completed_at", DateTime.utc_now() |> DateTime.to_iso8601())
+
+    fingerprint =
+      progress
+      |> Map.get("fingerprint", %{})
+      |> Map.put("hosted_receipt", %{
+        "state" => terminal_status,
+        "expected_head" => expected_head,
+        "observed_head" => observed_head,
+        "receipt_path" => Map.get(watcher, "receipt_path")
+      })
+
+    updated =
+      progress
+      |> Map.put("watcher", updated_watcher)
+      |> Map.put("fingerprint", fingerprint)
+      |> Map.put("progress_fingerprint_hash", canonical_hash(fingerprint))
+      |> Map.put("last_progress_receipt", canonical_hash(receipt))
+      |> Map.put("updated_at", DateTime.utc_now() |> DateTime.to_iso8601())
+      |> maybe_reset_for_terminal_provider_transition(state, issue_id, terminal_status)
+
+    case persist_progress_map(state, Map.put(state.progress, issue_id, updated), issue_id) do
+      {:error, unavailable_state} ->
+        unavailable_state
+
+      {:ok, persisted_state} ->
+        stopped_state = stop_deferred_waiter_task(persisted_state, issue_id)
+        {metadata, deferred} = Map.pop(stopped_state.deferred, issue_id)
+        wake_deferred_issue_once(%{stopped_state | deferred: deferred}, issue_id, terminal_status, metadata)
+    end
+  end
+
+  defp required_check_signature(progress, receipt) do
+    required_checks = get_in(progress, ["fingerprint", "required_check_set"]) || []
+    check_rollup = get_in(receipt, ["provider", "statusCheckRollup"]) || []
+
+    required_checks
+    |> Enum.flat_map(fn required_name ->
+      matches = Enum.filter(check_rollup, &(provider_check_name(&1) == required_name))
+
+      case matches do
+        [] -> [%{"name" => required_name, "state" => "MISSING"}]
+        checks -> Enum.map(checks, &provider_check_state/1)
+      end
+    end)
+    |> Enum.sort_by(&canonical_hash/1)
+    |> canonical_hash()
+  end
+
+  defp provider_check_name(check),
+    do: Map.get(check, "name") || Map.get(check, "context") || Map.get(check, "workflowName")
+
+  defp provider_check_state(check) do
+    %{
+      "name" => provider_check_name(check),
+      "state" => Map.get(check, "state"),
+      "status" => Map.get(check, "status"),
+      "conclusion" => Map.get(check, "conclusion")
+    }
+  end
+
+  defp maybe_reset_for_terminal_provider_transition(progress, state, issue_id, terminal_status)
+       when terminal_status in ["passed", "head_changed"] do
+    progress
+    |> reset_no_progress_counters(state, issue_id)
+    |> Map.put("last_progress_kind", "provider_transition")
+  end
+
+  defp maybe_reset_for_terminal_provider_transition(progress, _state, _issue_id, _terminal_status),
+    do: progress
+
+  defp wake_deferred_issue_once(state, issue_id, terminal_status, metadata) do
+    cond do
+      Map.has_key?(state.running, issue_id) ->
+        state
+
+      phase_resume_wake_authorized?(state, issue_id, metadata) ->
+        schedule_deferred_continuation(state, issue_id, terminal_status, metadata)
+
+      Map.has_key?(state.holds, issue_id) ->
+        state
+
+      is_map(metadata) ->
+        schedule_deferred_continuation(state, issue_id, terminal_status, metadata)
+
+      true ->
+        state
+    end
+  end
+
+  defp phase_resume_wake_authorized?(state, issue_id, metadata) when is_map(metadata) do
+    case Map.get(state.holds, issue_id) do
+      %{reason: @phase_resume_pending_reason} = hold ->
+        wake_budget_authorized?(Map.get(metadata, :phase_budget), hold)
+
+      _hold ->
+        false
+    end
+  end
+
+  defp phase_resume_wake_authorized?(_state, _issue_id, _metadata), do: false
+
+  # A restored watcher carries no phase budget; the durable pending hold is
+  # the budget authority, so a missing metadata copy defers to the hold.
+  defp wake_budget_authorized?(nil, _hold), do: true
+
+  defp wake_budget_authorized?(phase_budget, hold),
+    do: phase_budget_matches_hold?(phase_budget, hold)
+
+  defp hold_phase_budget(%{resume_phase: phase} = hold) when is_binary(phase) do
+    %{
+      phase: phase,
+      requested_additional_input_tokens: Map.get(hold, :requested_additional_input_tokens),
+      effective_additional_input_tokens: Map.get(hold, :effective_additional_input_tokens)
+    }
+  end
+
+  defp hold_phase_budget(_hold), do: nil
+
+  defp schedule_deferred_continuation(state, issue_id, terminal_status, metadata) do
+    phase_budget =
+      Map.get(metadata, :phase_budget) || hold_phase_budget(Map.get(state.holds, issue_id))
+
+    do_schedule_issue_retry(state, issue_id, 1, %{
+      identifier: metadata.identifier,
+      worker_host: Map.get(metadata, :worker_host),
+      workspace_path: Map.get(metadata, :workspace_path),
+      worker_affinity: Map.get(metadata, :worker_affinity),
+      phase_budget: phase_budget,
+      delay_type: :continuation,
+      error: "deferred wait terminal: #{terminal_status}"
+    })
+  end
+
+  defp validate_receipt_path(path, workspace_path)
+       when is_binary(path) and is_binary(workspace_path) do
+    expanded_path = Path.expand(path)
+    expanded_workspace = Path.expand(workspace_path)
+
+    if Path.type(path) == :absolute and
+         (expanded_path == expanded_workspace or
+            String.starts_with?(expanded_path, expanded_workspace <> "/")) do
+      {:ok, expanded_path}
+    else
+      {:error, :invalid_receipt_path}
+    end
+  end
+
+  defp validate_receipt_path(_path, _workspace_path), do: {:error, :invalid_receipt_path}
+
+  defp validate_waiter_command(attributes, workspace_path, expected_head, receipt_path)
+       when is_binary(workspace_path) do
+    script = option_value(attributes, :waiter_script)
+    args = option_value(attributes, :waiter_args)
+
+    with {:ok, expanded_script} <- validate_worktree_regular_file(script, workspace_path),
+         true <- is_list(args) and length(args) <= 64,
+         true <- Enum.all?(args, &(is_binary(&1) and byte_size(&1) <= 4_096)),
+         true <- "--collect-terminal" in args,
+         ^expected_head <- named_waiter_argument(args, "--head"),
+         ^receipt_path <- named_waiter_argument(args, "--output") do
+      {:ok, %{"script" => expanded_script, "args" => args}}
+    else
+      {:error, reason} -> {:error, reason}
+      _ -> {:error, :invalid_waiter_command}
+    end
+  end
+
+  defp validate_waiter_command(_attributes, _workspace_path, _expected_head, _receipt_path),
+    do: {:error, :invalid_waiter_command}
+
+  defp validate_worktree_regular_file(path, workspace_path)
+       when is_binary(path) and is_binary(workspace_path) do
+    expanded_path = Path.expand(path)
+    expanded_workspace = Path.expand(workspace_path)
+
+    inside_workspace? =
+      expanded_path != expanded_workspace and
+        String.starts_with?(expanded_path, expanded_workspace <> "/")
+
+    case File.lstat(expanded_path) do
+      {:ok, %File.Stat{type: :regular}} when inside_workspace? -> {:ok, expanded_path}
+      _ -> {:error, :invalid_waiter_command}
+    end
+  end
+
+  defp validate_worktree_regular_file(_path, _workspace_path),
+    do: {:error, :invalid_waiter_command}
+
+  defp named_waiter_argument(args, flag) do
+    case Enum.find_index(args, &(&1 == flag)) do
+      nil -> nil
+      index -> Enum.at(args, index + 1)
+    end
+  end
+
+  defp validate_wait_timeout(seconds)
+       when is_integer(seconds) and seconds > 0 and seconds <= 86_400,
+       do: {:ok, seconds}
+
+  defp validate_wait_timeout(_seconds), do: {:error, :invalid_wait_timeout}
+
+  defp valid_commit_sha?(value),
+    do: is_binary(value) and Regex.match?(~r/\A[0-9a-f]{40}\z/i, value)
+
+  defp valid_sha_container?(value) when is_binary(value), do: valid_commit_sha?(value)
+
+  defp valid_sha_container?(value) when is_map(value) and map_size(value) > 0,
+    do: Enum.all?(value, fn {_key, sha} -> valid_commit_sha?(sha) end)
+
+  defp valid_sha_container?(_value), do: false
+
+  defp valid_checksum_container?(value) when is_binary(value), do: String.trim(value) != ""
+
+  defp valid_checksum_container?(value) when is_map(value) and map_size(value) > 0,
+    do: Enum.all?(value, fn {_key, checksum} -> is_binary(checksum) and String.trim(checksum) != "" end)
+
+  defp valid_checksum_container?(_value), do: false
+
+  defp fingerprint_contains_head?(fingerprint, head) do
+    case Map.get(fingerprint, "head_sha") do
+      ^head -> true
+      heads when is_map(heads) -> head in Map.values(heads)
+      _ -> false
+    end
+  end
+
+  defp canonical_hash(value) do
+    value
+    |> canonical_term()
+    |> :erlang.term_to_binary()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  defp canonical_term(value) when is_map(value) do
+    value
+    |> Enum.map(fn {key, nested} -> {to_string(key), canonical_term(nested)} end)
+    |> Enum.sort()
+  end
+
+  defp canonical_term(value) when is_list(value), do: Enum.map(value, &canonical_term/1)
+  defp canonical_term(value), do: value
+
+  defp progress_metadata(state, issue_id) do
+    progress = Map.get(state.progress, issue_id, %{})
+
+    %{
+      progress_fingerprint: Map.get(progress, "fingerprint"),
+      progress_fingerprint_hash: Map.get(progress, "progress_fingerprint_hash"),
+      review_fingerprint_hash: Map.get(progress, "review_fingerprint_hash"),
+      tokens_since_progress: Map.get(progress, "tokens_since_progress", 0),
+      model_cycles_since_progress: Map.get(progress, "model_cycles_since_progress", 0),
+      watcher_state: get_in(progress, ["watcher", "state"]) || "not_registered",
+      review_round_count: Map.get(progress, "review_round_count", 0),
+      security_review_count: Map.get(progress, "security_review_count", 0)
+    }
   end
 
   defp running_seconds(%DateTime{} = started_at, %DateTime{} = now) do
