@@ -6,6 +6,7 @@ defmodule SymphonyElixir.HoldStoreTest do
   alias SymphonyElixir.HoldStore
 
   @state_filename ".symphony-holds.json"
+  @progress_filename ".symphony-progress.json"
 
   test "load returns an empty store when no state file exists" do
     workspace_root = workspace_root("missing")
@@ -43,6 +44,54 @@ defmodule SymphonyElixir.HoldStoreTest do
            } = state_path |> File.read!() |> Jason.decode!()
 
     assert {:ok, ^holds} = HoldStore.load(workspace_root)
+  end
+
+  test "progress persistence is private, restart-safe, and rejects unsafe watcher state" do
+    workspace_root = workspace_root("progress-round-trip")
+    progress_path = Path.join(workspace_root, @progress_filename)
+
+    entry = %{
+      "issue_id" => "issue-a",
+      "identifier" => "SYM-1",
+      "workspace_path" => "/tmp/SYM-1",
+      "fingerprint" => %{"head_sha" => "0123456789abcdef0123456789abcdef01234567"},
+      "progress_fingerprint_hash" => String.duplicate("a", 64),
+      "review_fingerprint_hash" => String.duplicate("b", 64),
+      "tokens_since_progress" => 10,
+      "model_cycles_since_progress" => 2,
+      "review_round_count" => 1,
+      "full_review_count" => 1,
+      "delta_review_count" => 0,
+      "security_review_count" => 0,
+      "token_baseline" => 100,
+      "cycle_baseline" => 4,
+      "watcher" => nil
+    }
+
+    progress = %{"issue-a" => entry}
+
+    assert :ok = HoldStore.persist_progress(workspace_root, progress)
+    assert Bitwise.band(File.stat!(progress_path).mode, 0o777) == 0o600
+    assert {:ok, ^progress} = HoldStore.load_progress(workspace_root)
+
+    for invalid_entry <- [
+          Map.put(entry, "tokens_since_progress", -1),
+          Map.put(entry, "model_cycles_since_progress", -1),
+          Map.put(entry, "review_round_count", -1),
+          Map.delete(entry, "progress_fingerprint_hash"),
+          Map.put(entry, "review_fingerprint_hash", "not-a-hash"),
+          Map.put(entry, "watcher", %{"state" => "waiting"}),
+          Map.put(entry, "watcher", %{"state" => "unknown"})
+        ] do
+      write_state!(
+        workspace_root,
+        @progress_filename,
+        Jason.encode!(%{"version" => 1, "issues" => %{"issue-a" => invalid_entry}})
+      )
+
+      assert {:error, {:progress_state_invalid, ^progress_path, {:invalid_progress_entry, "issue-a"}}} =
+               HoldStore.load_progress(workspace_root)
+    end
   end
 
   test "load defaults cleanup proof for legacy holds" do

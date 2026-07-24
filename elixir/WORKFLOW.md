@@ -36,6 +36,8 @@ codex:
   #   expensive: 120000
   # input_token_warning_ratio: 0.70
   # input_token_checkpoint_grace: 500000
+  # no_progress_input_tokens: 1000000
+  # no_progress_cycles: 6
   approval_policy: never
   thread_sandbox: workspace-write
   turn_sandbox_policy:

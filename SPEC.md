@@ -258,6 +258,9 @@ Fields:
 - `poll_interval_ms` (current effective poll interval)
 - `max_concurrent_agents` (current effective global concurrency limit)
 - `running` (map `issue_id -> running entry`)
+- `deferred` (map `issue_id -> deferred wait metadata`)
+  - A deferred issue remains claimed while a durable external-receipt watcher runs outside model
+    turns. It must not also be running or retry queued.
 - `claimed` (set of issue IDs reserved/running/retrying)
 - `retry_attempts` (map `issue_id -> RetryEntry`)
 - `holds` (map `issue_id -> HoldEntry`)
@@ -265,6 +268,11 @@ Fields:
     input tokens, tracker state at hold time, workspace/worker metadata, and hold timestamp.
   - The map is restored from an atomically replaced owner-only file under the configured workspace
     root. Corrupt, insecure, or unreadable hold state aborts startup rather than dropping holds.
+- `progress` (map `issue_id -> ProgressEntry`)
+  - Stores the implementation/evidence fingerprint, exact-head review identity and round counts,
+    no-progress token/cycle baselines, and optional deferred watcher.
+  - The map is restored from a separate atomically replaced owner-only file. Corrupt, insecure, or
+    unreadable progress state aborts startup; write uncertainty must prevent further model work.
 - `completed` (set of issue IDs; bookkeeping only, not dispatch gating)
 - `codex_totals` (aggregate tokens + runtime seconds)
 - `codex_rate_limits` (latest rate-limit snapshot from agent events)
@@ -450,6 +458,12 @@ fields locally if they want stricter startup checks.
   - Default: `500000`.
   - Maximum additional input tokens permitted after the warning is first observed while the active
     turn finishes its current atomic operation and writes a resumable checkpoint.
+- `no_progress_input_tokens` (positive integer)
+  - Default: `1000000`.
+  - Maximum cumulative input-token growth after the latest changed progress fingerprint/receipt.
+- `no_progress_cycles` (positive integer)
+  - Default: `6`.
+  - Maximum completed model cycles after the latest changed progress fingerprint/receipt.
 - `approval_policy` (Codex `AskForApproval` value)
   - Default: implementation-defined.
 - `thread_sandbox` (Codex `SandboxMode` value)
@@ -605,6 +619,8 @@ This section is intentionally redundant so a coding agent can implement the conf
   labels are matched case-insensitively and the smallest applicable limit wins
 - `codex.input_token_warning_ratio`: number greater than `0` and less than `1`, default `0.70`
 - `codex.input_token_checkpoint_grace`: positive integer, default `500000`
+- `codex.no_progress_input_tokens`: positive integer, default `1000000`
+- `codex.no_progress_cycles`: positive integer, default `6`
 - `runner.capability_preflight` (extension): boolean, default `false`; when enabled, startup must
   complete the local runner capability contract before polling or claims
 - `runner.source_repo` (extension): absolute path or `$VAR`; working directory for the review
@@ -664,6 +680,11 @@ claim state.
    - Claim removed because issue is terminal, non-active, missing, or retry path completed without
      re-dispatch.
 
+6. `DeferredWaiting`
+   - The worker has exited normally after registering a bounded, exact-head receipt watcher.
+   - The issue remains claimed but consumes no model turns and has no retry timer.
+   - A terminal receipt or timeout is persisted before exactly one continuation is scheduled.
+
 Important nuance:
 
 - A successful worker exit does not mean the issue is done forever.
@@ -677,6 +698,9 @@ Important nuance:
 - Once the worker exits normally, the orchestrator still schedules a short continuation retry
   (about 1 second) so it can re-check whether the issue remains active and needs another worker
   session.
+- If the turn registered a deferred watcher, normal worker exit enters `DeferredWaiting` instead.
+  Unchanged provider state must not schedule a continuation. A restart restores the watcher from
+  durable state; an invalid receipt or persistence failure fails closed.
 
 ### 7.2 Run Attempt Lifecycle
 
@@ -1688,6 +1712,23 @@ Minimum endpoints:
   - Reject a missing/invalid phase or allowance with `422`; reject an unverifiable current issue
     tier with `503` and keep the hold.
   - Return `404 issue_not_found` when the identifier is not currently held.
+
+- `POST /api/v1/<issue_identifier>/progress`
+  - Register a complete progress fingerprint plus a typed evidence receipt. Replaying the same
+    fingerprint and receipt must not reset no-progress counters.
+
+- `POST /api/v1/<issue_identifier>/review`
+  - Authorize an exact-head review only when the requested, locally observed, remotely observed,
+    and registered fingerprint heads agree.
+  - Preserve one full-review authorization across provider-only and review-outcome receipts. Allow
+    at most one full plus one delta authorization per review identity unless explicit human-comment
+    provenance authorizes another round.
+
+- `POST /api/v1/<issue_identifier>/wait`
+  - Register a positive bounded timeout and an absolute receipt path inside the running issue's
+    workspace.
+  - Persist terminal exact-head truth before waking exactly one continuation; do not wake on
+    unchanged provider receipts or persistence uncertainty.
 
 Control endpoint requests received from a non-loopback peer must be rejected. The implementation
 must require a non-empty environment-backed control secret for loopback control requests; missing
