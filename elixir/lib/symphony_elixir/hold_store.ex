@@ -8,7 +8,7 @@ defmodule SymphonyElixir.HoldStore do
   @progress_filename ".symphony-progress.json"
   @version 1
   @private_file_mode 0o600
-  @terminal_watcher_states ~w(passed failed timed_out head_changed receipt_invalid)
+  @terminal_watcher_states ~w(passed failed timed_out head_changed receipt_invalid cancelled)
 
   @type hold :: %{
           required(:issue_id) => String.t(),
@@ -575,6 +575,9 @@ defmodule SymphonyElixir.HoldStore do
              :ok <- require_progress_counter(entry, "security_review_count"),
              :ok <- require_progress_counter(entry, "token_baseline"),
              :ok <- require_progress_counter(entry, "cycle_baseline"),
+             :ok <- require_optional_progress_counter(entry, "last_observed_input_tokens"),
+             :ok <- require_optional_progress_counter(entry, "last_observed_model_cycles"),
+             :ok <- validate_review_overrides(Map.get(entry, "used_review_overrides", [])),
              :ok <- validate_progress_watcher(Map.get(entry, "watcher")) do
           {:cont, :ok}
         else
@@ -609,6 +612,20 @@ defmodule SymphonyElixir.HoldStore do
       _value -> {:error, field}
     end
   end
+
+  defp require_optional_progress_counter(entry, field) do
+    case Map.fetch(entry, field) do
+      :error -> :ok
+      {:ok, value} when is_integer(value) and value >= 0 -> :ok
+      _value -> {:error, field}
+    end
+  end
+
+  defp validate_review_overrides(overrides) when is_list(overrides) do
+    if Enum.all?(overrides, &is_binary/1), do: :ok, else: {:error, :review_overrides}
+  end
+
+  defp validate_review_overrides(_overrides), do: {:error, :review_overrides}
 
   defp validate_progress_watcher(nil), do: :ok
 

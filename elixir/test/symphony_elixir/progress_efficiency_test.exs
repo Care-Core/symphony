@@ -125,8 +125,14 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
     assert {:error, :delta_review_already_completed} =
              authorize_review(pid, issue, review_hash, "delta")
 
+    human_override =
+      "linear-comment:12345678-1234-1234-1234-123456789abc@2026-07-24T12:34:56.000Z"
+
     assert {:ok, %{kind: "delta", review_round_count: 3}} =
-             authorize_review(pid, issue, review_hash, "delta", human_override: "linear-comment:12345678-1234-1234-1234-123456789abc@2026-07-24T12:34:56.000Z")
+             authorize_review(pid, issue, review_hash, "delta", human_override: human_override)
+
+    assert {:error, :review_override_already_used} =
+             authorize_review(pid, issue, review_hash, "delta", human_override: human_override)
 
     assert {:ok, %{kind: "security", security_review_count: 1}} =
              authorize_review(pid, issue, review_hash, "security")
@@ -180,6 +186,38 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
              )
   end
 
+  test "review receipt acceptance is bound to the authorized exact head" do
+    {pid, issue, _worker_pid, _workspace_root, _workspace} =
+      start_progress_orchestrator("review-receipt-head")
+
+    authorized_fingerprint = progress_fingerprint(head: @next_head, diff_checksum: "diff-2")
+
+    assert {:ok, %{review_fingerprint: review_hash}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(authorized_fingerprint, "head-2"),
+               pid
+             )
+
+    assert {:ok, %{kind: "full"}} =
+             authorize_review(pid, issue, review_hash, "full",
+               requested_head: @next_head,
+               observed_local_head: @next_head,
+               observed_remote_head: @next_head
+             )
+
+    stale_receipt_fingerprint =
+      progress_fingerprint()
+      |> Map.put(:full_review_verdict, "pass")
+
+    assert {:error, :review_authorization_mismatch} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(stale_receipt_fingerprint, "review-head-a", progress_kind: "review_receipt"),
+               pid
+             )
+  end
+
   test "meaningful progress resets the token breaker and unchanged growth creates a durable hold" do
     {pid, issue, worker_pid, _workspace_root, _workspace} =
       start_progress_orchestrator("token-breaker",
@@ -206,10 +244,16 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
       )
     end)
 
+    validation_fingerprint =
+      Map.put(fingerprint, :hosted_receipt, %{
+        "state" => "validation_complete",
+        "receipt" => "validation-receipt-1"
+      })
+
     assert {:ok, %{changed: true, tokens_since_progress: 0}} =
              Orchestrator.record_progress(
                issue.identifier,
-               progress_attributes(fingerprint, "validation-receipt-1", progress_kind: "validation_receipt"),
+               progress_attributes(validation_fingerprint, "validation-receipt-1", progress_kind: "validation_receipt"),
                pid
              )
 
@@ -232,6 +276,75 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
     end)
 
     refute Process.alive?(worker_pid)
+  end
+
+  test "changed receipt text without a changed fingerprint does not reset the breaker" do
+    {pid, issue, _worker_pid, _workspace_root, _workspace} =
+      start_progress_orchestrator("receipt-bytes",
+        codex_input_token_limit: 1_000,
+        codex_no_progress_input_tokens: 100,
+        codex_no_progress_cycles: 10
+      )
+
+    fingerprint = progress_fingerprint()
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(fingerprint, "checkpoint-1"),
+               pid
+             )
+
+    send_token_update(pid, issue.id, 50)
+
+    assert_eventually(fn ->
+      match?(
+        [%{tokens_since_progress: 50}],
+        Orchestrator.snapshot(pid, 1_000).running
+      )
+    end)
+
+    assert {:ok, %{changed: false, tokens_since_progress: 50}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(fingerprint, "novel-free-form-receipt"),
+               pid
+             )
+  end
+
+  test "no-progress tokens accumulate across attempts" do
+    {pid, issue, _worker_pid, _workspace_root, _workspace} =
+      start_progress_orchestrator("cross-attempt-breaker",
+        codex_input_token_limit: 1_000,
+        codex_no_progress_input_tokens: 100,
+        codex_no_progress_cycles: 10
+      )
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    send_token_update(pid, issue.id, 60)
+
+    assert_eventually(fn ->
+      match?(
+        [%{tokens_since_progress: 60}],
+        Orchestrator.snapshot(pid, 1_000).running
+      )
+    end)
+
+    begin_new_attempt(pid, issue.id)
+    send_token_update(pid, issue.id, 40)
+
+    assert_eventually(fn ->
+      match?(
+        [%{reason: "no_progress", limit: 100}],
+        Orchestrator.snapshot(pid, 1_000).held
+      )
+    end)
   end
 
   test "completed model cycles create the same no-progress hold without token growth" do
@@ -402,6 +515,154 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
     assert get_in(state.progress, [issue.id, "watcher", "wake_count"]) == 1
   end
 
+  test "a phase-resume session enters deferred waiting and wakes once with its bounded authority" do
+    {pid, issue, worker_pid, _workspace_root, workspace} =
+      start_progress_orchestrator("phase-resume-watcher")
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    phase_budget = %{
+      phase: "review-fix",
+      requested_additional_input_tokens: 600,
+      effective_additional_input_tokens: 600
+    }
+
+    put_phase_resume_state(pid, issue, phase_budget)
+
+    receipt_path = Path.join(workspace, "output/phase-resume-checks.jsonl")
+    File.mkdir_p!(Path.dirname(receipt_path))
+
+    assert {:ok, %{watcher_token: watcher_token}} =
+             Orchestrator.register_deferred_wait(
+               issue.identifier,
+               deferred_wait_attributes(workspace, receipt_path),
+               pid
+             )
+
+    send(worker_pid, :finish)
+
+    assert_eventually(fn ->
+      state = :sys.get_state(pid)
+
+      Map.has_key?(state.deferred, issue.id) and
+        get_in(state.holds, [issue.id, :reason]) == "input_token_resume_pending"
+    end)
+
+    write_receipt(receipt_path, terminal_receipt("passed"))
+    send(pid, {:poll_deferred_watcher, issue.id, watcher_token})
+
+    assert_eventually(fn ->
+      state = :sys.get_state(pid)
+
+      state.deferred == %{} and
+        get_in(state.retry_attempts, [issue.id, :phase_budget]) == phase_budget and
+        get_in(state.progress, [issue.id, "watcher", "wake_count"]) == 1
+    end)
+  end
+
+  test "a warning-delivered session enters deferred waiting and wakes once" do
+    {pid, issue, worker_pid, _workspace_root, workspace} =
+      start_progress_orchestrator("warning-watcher")
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    update_running_entry(pid, issue.id, %{input_token_warning_status: "delivered"})
+
+    receipt_path = Path.join(workspace, "output/warning-checks.jsonl")
+    File.mkdir_p!(Path.dirname(receipt_path))
+
+    assert {:ok, %{watcher_token: watcher_token}} =
+             Orchestrator.register_deferred_wait(
+               issue.identifier,
+               deferred_wait_attributes(workspace, receipt_path),
+               pid
+             )
+
+    send(worker_pid, :finish)
+
+    assert_eventually(fn ->
+      state = :sys.get_state(pid)
+      Map.has_key?(state.deferred, issue.id) and not Map.has_key?(state.holds, issue.id)
+    end)
+
+    write_receipt(receipt_path, terminal_receipt("passed"))
+    send(pid, {:poll_deferred_watcher, issue.id, watcher_token})
+
+    assert_eventually(fn ->
+      state = :sys.get_state(pid)
+
+      state.deferred == %{} and map_size(state.retry_attempts) == 1 and
+        get_in(state.progress, [issue.id, "watcher", "wake_count"]) == 1
+    end)
+  end
+
+  test "stopping a deferred issue cancels its waiter and creates a durable hold" do
+    {pid, issue, worker_pid, _workspace_root, workspace} =
+      start_progress_orchestrator("stop-deferred")
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    receipt_path = Path.join(workspace, "output/stop-checks.jsonl")
+
+    assert {:ok, %{watcher_state: "waiting"}} =
+             Orchestrator.register_deferred_wait(
+               issue.identifier,
+               deferred_wait_attributes(workspace, receipt_path),
+               pid
+             )
+
+    old_waiter_pid = waiter_task_pid(:sys.get_state(pid), issue.id)
+    send(worker_pid, :finish)
+
+    assert_eventually(fn ->
+      Map.has_key?(:sys.get_state(pid).deferred, issue.id)
+    end)
+
+    assert {:ok, %{reason: "manual_stop"}} = Orchestrator.stop_issue(issue.identifier, pid)
+
+    state = :sys.get_state(pid)
+    assert state.deferred == %{}
+    assert state.waiter_tasks == %{}
+    assert get_in(state.progress, [issue.id, "watcher", "state"]) == "cancelled"
+    refute Process.alive?(old_waiter_pid)
+  end
+
+  test "stopping a progress-only identifier returns a clean error without crashing" do
+    {pid, issue, worker_pid, _workspace_root, _workspace} =
+      start_progress_orchestrator("stop-progress-only")
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    Process.exit(worker_pid, :kill)
+
+    :sys.replace_state(pid, fn state ->
+      %{state | running: %{}, deferred: %{}, retry_attempts: %{}, holds: %{}}
+    end)
+
+    assert {:error, :issue_not_found} = Orchestrator.stop_issue(issue.identifier, pid)
+    assert Process.alive?(pid)
+  end
+
   test "a waiting watcher survives restart and terminal receipt persistence precedes its one wake" do
     {pid, issue, worker_pid, _workspace_root, workspace} =
       start_progress_orchestrator("watcher-restart")
@@ -549,6 +810,12 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
                pid
              )
 
+    send_token_update(pid, issue.id, 60)
+
+    assert_eventually(fn ->
+      get_in(:sys.get_state(pid).progress, [issue.id, "tokens_since_progress"]) == 60
+    end)
+
     receipt_path = Path.join(workspace, "output/checks.jsonl")
 
     assert {:ok, %{watcher_token: watcher_token}} =
@@ -581,8 +848,152 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
       map_size(state.retry_attempts) == 1 and
         get_in(state.progress, [issue.id, "watcher", "state"]) == "timed_out" and
         get_in(state.progress, [issue.id, "watcher", "wake_count"]) == 1 and
+        get_in(state.progress, [issue.id, "tokens_since_progress"]) == 60 and
         get_in(state.progress, [issue.id, "fingerprint", "hosted_receipt", "state"]) ==
           "timed_out"
+    end)
+  end
+
+  test "unchanged provider polls do not reset counters but required-check changes do" do
+    {pid, issue, _worker_pid, _workspace_root, workspace} =
+      start_progress_orchestrator("provider-semantics",
+        codex_input_token_limit: 1_000,
+        codex_no_progress_input_tokens: 1_000,
+        codex_no_progress_cycles: 10
+      )
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    receipt_path = Path.join(workspace, "output/provider-checks.jsonl")
+    File.mkdir_p!(Path.dirname(receipt_path))
+
+    assert {:ok, %{watcher_token: watcher_token}} =
+             Orchestrator.register_deferred_wait(
+               issue.identifier,
+               deferred_wait_attributes(workspace, receipt_path),
+               pid
+             )
+
+    write_receipt(receipt_path, provider_receipt(1, "PENDING"))
+    send(pid, {:poll_deferred_watcher, issue.id, watcher_token})
+
+    assert_eventually(fn ->
+      get_in(:sys.get_state(pid).progress, [issue.id, "last_required_check_signature"]) != nil
+    end)
+
+    send_token_update(pid, issue.id, 50)
+
+    assert_eventually(fn ->
+      get_in(:sys.get_state(pid).progress, [issue.id, "tokens_since_progress"]) == 50
+    end)
+
+    write_receipt(receipt_path, provider_receipt(2, "PENDING"))
+    send(pid, {:poll_deferred_watcher, issue.id, watcher_token})
+    Process.sleep(25)
+
+    assert get_in(:sys.get_state(pid).progress, [issue.id, "tokens_since_progress"]) == 50
+
+    write_receipt(receipt_path, provider_receipt(3, "SUCCESS"))
+    send(pid, {:poll_deferred_watcher, issue.id, watcher_token})
+
+    assert_eventually(fn ->
+      get_in(:sys.get_state(pid).progress, [issue.id, "tokens_since_progress"]) == 0
+    end)
+  end
+
+  test "re-registering a wait stops the old waiter and an old exit cannot delete the replacement" do
+    {pid, issue, _worker_pid, _workspace_root, workspace} =
+      start_progress_orchestrator("replace-waiter")
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    first_receipt_path = Path.join(workspace, "output/first-checks.jsonl")
+
+    assert {:ok, %{watcher_token: first_token}} =
+             Orchestrator.register_deferred_wait(
+               issue.identifier,
+               deferred_wait_attributes(workspace, first_receipt_path),
+               pid
+             )
+
+    first_waiter_pid = waiter_task_pid(:sys.get_state(pid), issue.id)
+    second_receipt_path = Path.join(workspace, "output/second-checks.jsonl")
+
+    assert {:ok, %{watcher_token: second_token}} =
+             Orchestrator.register_deferred_wait(
+               issue.identifier,
+               deferred_wait_attributes(workspace, second_receipt_path),
+               pid
+             )
+
+    refute first_token == second_token
+    refute Process.alive?(first_waiter_pid)
+    second_waiter_pid = waiter_task_pid(:sys.get_state(pid), issue.id)
+    assert Process.alive?(second_waiter_pid)
+
+    send(pid, {:deferred_waiter_exit, issue.id, first_token, :launch_failed})
+    Process.sleep(25)
+
+    state = :sys.get_state(pid)
+    assert waiter_task_pid(state, issue.id) == second_waiter_pid
+    assert get_in(state.progress, [issue.id, "watcher", "token"]) == second_token
+    assert get_in(state.progress, [issue.id, "watcher", "state"]) == "waiting"
+  end
+
+  test "a suppressed terminal wake still removes stale deferred metadata" do
+    {pid, issue, worker_pid, _workspace_root, workspace} =
+      start_progress_orchestrator("suppressed-wake")
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    receipt_path = Path.join(workspace, "output/suppressed-checks.jsonl")
+    File.mkdir_p!(Path.dirname(receipt_path))
+
+    assert {:ok, %{watcher_token: watcher_token}} =
+             Orchestrator.register_deferred_wait(
+               issue.identifier,
+               deferred_wait_attributes(workspace, receipt_path),
+               pid
+             )
+
+    send(worker_pid, :finish)
+
+    assert_eventually(fn ->
+      Map.has_key?(:sys.get_state(pid).deferred, issue.id)
+    end)
+
+    :sys.replace_state(pid, fn state ->
+      hold = %{
+        issue_id: issue.id,
+        identifier: issue.identifier,
+        reason: "manual_stop",
+        cleanup_pending: false
+      }
+
+      %{state | holds: Map.put(state.holds, issue.id, hold)}
+    end)
+
+    write_receipt(receipt_path, terminal_receipt("passed"))
+    send(pid, {:poll_deferred_watcher, issue.id, watcher_token})
+
+    assert_eventually(fn ->
+      state = :sys.get_state(pid)
+      state.deferred == %{} and state.retry_attempts == %{}
     end)
   end
 
@@ -761,10 +1172,13 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
     assert [%{reason: "input_token_resume_pending", resume_phase: "implementation"}] =
              Orchestrator.snapshot(pid, 1_000).held
 
+    provider_fingerprint =
+      Map.put(fingerprint, :hosted_receipt, %{"state" => "provider_transition"})
+
     assert {:ok, %{changed: true}} =
              Orchestrator.record_progress(
                issue.identifier,
-               progress_attributes(fingerprint, "provider-transition", progress_kind: "provider_transition"),
+               progress_attributes(provider_fingerprint, "provider-transition", progress_kind: "provider_transition"),
                pid
              )
 
@@ -992,6 +1406,103 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
          timestamp: DateTime.utc_now()
        }}
     )
+  end
+
+  defp begin_new_attempt(pid, issue_id) do
+    update_running_entry(pid, issue_id, %{
+      codex_input_tokens: 0,
+      codex_output_tokens: 0,
+      codex_total_tokens: 0,
+      codex_last_reported_input_tokens: 0,
+      codex_last_reported_output_tokens: 0,
+      codex_last_reported_total_tokens: 0,
+      turn_count: 0,
+      started_at: DateTime.utc_now()
+    })
+  end
+
+  defp put_phase_resume_state(pid, issue, phase_budget) do
+    :sys.replace_state(pid, fn state ->
+      running_entry =
+        state.running
+        |> Map.fetch!(issue.id)
+        |> Map.merge(%{
+          resume_phase: phase_budget.phase,
+          requested_additional_input_tokens: phase_budget.requested_additional_input_tokens,
+          effective_additional_input_tokens: phase_budget.effective_additional_input_tokens
+        })
+
+      hold = %{
+        issue_id: issue.id,
+        identifier: issue.identifier,
+        reason: "input_token_resume_pending",
+        resume_phase: phase_budget.phase,
+        requested_additional_input_tokens: phase_budget.requested_additional_input_tokens,
+        effective_additional_input_tokens: phase_budget.effective_additional_input_tokens,
+        cleanup_pending: false
+      }
+
+      %{
+        state
+        | running: Map.put(state.running, issue.id, running_entry),
+          holds: Map.put(state.holds, issue.id, hold)
+      }
+    end)
+  end
+
+  defp update_running_entry(pid, issue_id, updates) do
+    :sys.replace_state(pid, fn state ->
+      running_entry = state.running |> Map.fetch!(issue_id) |> Map.merge(updates)
+      %{state | running: Map.put(state.running, issue_id, running_entry)}
+    end)
+  end
+
+  defp waiter_task_pid(state, issue_id) do
+    case Map.fetch!(state.waiter_tasks, issue_id) do
+      pid when is_pid(pid) -> pid
+      %{pid: pid} when is_pid(pid) -> pid
+    end
+  end
+
+  defp terminal_receipt(status) do
+    %{
+      "type" => "terminal",
+      "status" => status,
+      "expectedHead" => @head,
+      "observedHead" => @head,
+      "polls" => 2
+    }
+  end
+
+  defp provider_receipt(poll, build_state) do
+    %{
+      "type" => "provider",
+      "poll" => poll,
+      "observedAt" => "2026-07-24T00:00:0#{poll}Z",
+      "provider" => %{
+        "headRefOid" => @head,
+        "statusCheckRollup" => [
+          %{
+            "name" => "Build Check",
+            "conclusion" => if(build_state == "SUCCESS", do: "SUCCESS", else: nil),
+            "state" => build_state,
+            "status" => if(build_state == "SUCCESS", do: "COMPLETED", else: "IN_PROGRESS")
+          },
+          %{
+            "name" => "Test & Lint",
+            "conclusion" => nil,
+            "state" => "PENDING",
+            "status" => "IN_PROGRESS"
+          },
+          %{
+            "name" => "non-required-#{poll}",
+            "conclusion" => nil,
+            "state" => "PENDING",
+            "status" => "IN_PROGRESS"
+          }
+        ]
+      }
+    }
   end
 
   defp send_session_started(pid, issue_id, session_id) do

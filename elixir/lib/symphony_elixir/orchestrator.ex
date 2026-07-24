@@ -24,7 +24,7 @@ defmodule SymphonyElixir.Orchestrator do
   @review_fingerprint_fields ~w(contract_revision base_sha head_sha diff_checksum matrix_checksum required_check_set latest_human_comment_checkpoint)
   @review_kinds ~w(full delta security)
   @human_override_pattern ~r/\Alinear-comment:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}@[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+-]+Z\z/i
-  @terminal_watcher_states ~w(passed failed timed_out head_changed receipt_invalid)
+  @terminal_watcher_states ~w(passed failed timed_out head_changed receipt_invalid cancelled)
   @watcher_poll_interval_ms 5_000
   # Slightly above the dashboard render interval so "checking now…" can render.
   @poll_transition_render_delay_ms 20
@@ -352,7 +352,7 @@ defmodule SymphonyElixir.Orchestrator do
   def handle_info({:deferred_waiter_exit, issue_id, watcher_token, result}, state) do
     state =
       state
-      |> remove_deferred_waiter_task(issue_id)
+      |> remove_deferred_waiter_task(issue_id, watcher_token)
       |> poll_deferred_watcher(issue_id, watcher_token)
       |> settle_missing_waiter_receipt(issue_id, watcher_token, result)
 
@@ -379,10 +379,14 @@ defmodule SymphonyElixir.Orchestrator do
          state,
          issue_id,
          %{input_token_warning_status: "delivered"} = running_entry,
-         _session_id,
+         session_id,
          :normal
        ) do
-    hold_checkpointed_issue(state, issue_id, running_entry, "input_token_checkpoint")
+    if waiting_watcher?(state, issue_id) do
+      defer_running_issue(state, issue_id, running_entry, session_id)
+    else
+      hold_checkpointed_issue(state, issue_id, running_entry, "input_token_checkpoint")
+    end
   end
 
   defp handle_running_task_exit(
@@ -399,11 +403,15 @@ defmodule SymphonyElixir.Orchestrator do
          state,
          issue_id,
          %{resume_phase: phase} = running_entry,
-         _session_id,
+         session_id,
          :normal
        )
        when is_binary(phase) do
-    hold_checkpointed_issue(state, issue_id, running_entry, "input_token_checkpoint")
+    if waiting_watcher?(state, issue_id) do
+      defer_running_issue(state, issue_id, running_entry, session_id)
+    else
+      hold_checkpointed_issue(state, issue_id, running_entry, "input_token_checkpoint")
+    end
   end
 
   defp handle_running_task_exit(
@@ -419,9 +427,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_running_task_exit(state, issue_id, running_entry, session_id, :normal) do
     if waiting_watcher?(state, issue_id) do
-      Logger.info("Agent turn yielded to deferred watcher for issue_id=#{issue_id} session_id=#{session_id}; retaining claim without scheduling a model continuation")
-
-      %{state | deferred: Map.put(state.deferred, issue_id, deferred_metadata(running_entry))}
+      defer_running_issue(state, issue_id, running_entry, session_id)
     else
       Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
@@ -449,10 +455,23 @@ defmodule SymphonyElixir.Orchestrator do
     })
   end
 
+  defp defer_running_issue(state, issue_id, running_entry, session_id) do
+    Logger.info("Agent turn yielded to deferred watcher for issue_id=#{issue_id} session_id=#{session_id}; retaining claim without scheduling a model continuation")
+
+    %{state | deferred: Map.put(state.deferred, issue_id, deferred_metadata(running_entry))}
+  end
+
   @impl true
   def terminate(_reason, %State{running: running, waiter_tasks: waiter_tasks}) do
     terminate_codex_process_trees(Map.values(running))
-    Enum.each(waiter_tasks, fn {_issue_id, pid} -> Process.exit(pid, :shutdown) end)
+
+    Enum.each(waiter_tasks, fn {_issue_id, task} ->
+      case waiter_task_pid(task) do
+        pid when is_pid(pid) -> Process.exit(pid, :shutdown)
+        nil -> :ok
+      end
+    end)
+
     :ok
   end
 
@@ -2360,6 +2379,9 @@ defmodule SymphonyElixir.Orchestrator do
         observed = Map.get(running_entry, :codex_input_tokens, 0)
         hold_running_issue(state, issue_id, running_entry, "manual_stop", nil, observed)
 
+      deferred_entry = Map.get(state.deferred, issue_id) ->
+        stop_deferred_issue(state, issue_id, deferred_entry)
+
       retry_entry = Map.get(state.retry_attempts, issue_id) ->
         stop_retrying_issue(state, issue_id, retry_entry)
 
@@ -2368,6 +2390,41 @@ defmodule SymphonyElixir.Orchestrator do
 
       hold = Map.get(state.holds, issue_id) ->
         {:ok, state, hold}
+
+      true ->
+        {:error, state, :issue_not_found}
+    end
+  end
+
+  defp stop_deferred_issue(state, issue_id, deferred_entry) do
+    stopped_state =
+      state
+      |> stop_deferred_waiter_task(issue_id)
+      |> Map.put(:deferred, Map.delete(state.deferred, issue_id))
+
+    progress = Map.fetch!(stopped_state.progress, issue_id)
+
+    cancelled_watcher =
+      progress
+      |> Map.fetch!("watcher")
+      |> Map.put("state", "cancelled")
+      |> Map.put("completed_at", DateTime.utc_now() |> DateTime.to_iso8601())
+
+    cancelled_progress =
+      progress
+      |> Map.put("watcher", cancelled_watcher)
+      |> Map.put("updated_at", DateTime.utc_now() |> DateTime.to_iso8601())
+
+    case persist_progress_map(
+           stopped_state,
+           Map.put(stopped_state.progress, issue_id, cancelled_progress),
+           issue_id
+         ) do
+      {:ok, persisted_state} ->
+        stop_retrying_issue(persisted_state, issue_id, deferred_entry)
+
+      {:error, unavailable_state} ->
+        {:error, unavailable_state, :hold_state_unavailable}
     end
   end
 
@@ -3480,35 +3537,28 @@ defmodule SymphonyElixir.Orchestrator do
          {:ok, fingerprint} <- normalize_progress_fingerprint(option_value(attributes, :fingerprint)),
          {:ok, progress_kind} <- normalize_progress_kind(option_value(attributes, :progress_kind)),
          {:ok, progress_receipt} <-
-           normalize_progress_receipt(option_value(attributes, :progress_receipt)) do
-      existing =
-        Map.get(state.progress, issue_id) ||
-          new_progress_entry(state, issue_id, issue_identifier)
-
+           normalize_progress_receipt(option_value(attributes, :progress_receipt)),
+         existing =
+           Map.get(state.progress, issue_id) ||
+             new_progress_entry(state, issue_id, issue_identifier),
+         :ok <- validate_review_receipt_authorization(existing, progress_kind, fingerprint) do
       progress_hash = canonical_hash(fingerprint)
       review_hash = canonical_hash(Map.take(fingerprint, @review_fingerprint_fields))
       prior_progress_hash = Map.get(existing, "progress_fingerprint_hash")
-      prior_receipt = Map.get(existing, "last_progress_receipt")
-      meaningful? = progress_hash != prior_progress_hash or progress_receipt != prior_receipt
+      meaningful? = progress_hash != prior_progress_hash
 
       if meaningful? do
-        {token_baseline, cycle_baseline} = progress_baselines(state, issue_id)
-        updated_at = DateTime.utc_now() |> DateTime.to_iso8601()
-
         updated =
           existing
           |> update_review_identity(fingerprint, review_hash)
+          |> reset_no_progress_counters(state, issue_id)
           |> Map.merge(%{
             "fingerprint" => fingerprint,
             "progress_fingerprint_hash" => progress_hash,
             "review_fingerprint_hash" => review_hash,
             "last_progress_kind" => progress_kind,
             "last_progress_receipt" => progress_receipt,
-            "token_baseline" => token_baseline,
-            "cycle_baseline" => cycle_baseline,
-            "tokens_since_progress" => 0,
-            "model_cycles_since_progress" => 0,
-            "updated_at" => updated_at
+            "updated_at" => DateTime.utc_now() |> DateTime.to_iso8601()
           })
 
         persist_progress_entry(state, issue_id, updated, %{
@@ -3563,6 +3613,8 @@ defmodule SymphonyElixir.Orchestrator do
       updated =
         updated
         |> Map.put("last_review_authorization", authorization)
+        |> Map.put("last_review_authorized_head", requested_head)
+        |> Map.put("last_review_authorized_fingerprint", requested_fingerprint)
         |> Map.put("updated_at", DateTime.utc_now() |> DateTime.to_iso8601())
 
       persist_progress_entry(state, issue_id, updated, %{
@@ -3672,7 +3724,11 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp launch_registered_waiter(state, issue_id, watcher, receipt) do
-    launched_state = launch_deferred_waiter(state, issue_id, watcher)
+    launched_state =
+      state
+      |> stop_deferred_waiter_task(issue_id)
+      |> launch_deferred_waiter(issue_id, watcher)
+
     schedule_deferred_watcher_poll(issue_id, Map.fetch!(watcher, "token"))
     {:ok, launched_state, receipt}
   end
@@ -3755,7 +3811,13 @@ defmodule SymphonyElixir.Orchestrator do
   defp normalize_review_kind(kind) when is_atom(kind), do: normalize_review_kind(Atom.to_string(kind))
   defp normalize_review_kind(_kind), do: {:error, :invalid_review_kind}
 
-  defp increment_review_round(progress, "full", override) do
+  defp increment_review_round(progress, kind, override) do
+    with :ok <- validate_review_override(progress, override) do
+      do_increment_review_round(progress, kind, override)
+    end
+  end
+
+  defp do_increment_review_round(progress, "full", override) do
     if Map.get(progress, "full_review_count", 0) == 0 or valid_human_override?(override) do
       {:ok,
        progress
@@ -3767,7 +3829,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp increment_review_round(progress, "delta", override) do
+  defp do_increment_review_round(progress, "delta", override) do
     cond do
       Map.get(progress, "full_review_count", 0) == 0 ->
         {:error, :full_review_required}
@@ -3784,7 +3846,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp increment_review_round(progress, "security", override) do
+  defp do_increment_review_round(progress, "security", override) do
     if Map.get(progress, "security_review_count", 0) == 0 or valid_human_override?(override) do
       {:ok,
        progress
@@ -3798,13 +3860,47 @@ defmodule SymphonyElixir.Orchestrator do
   defp valid_human_override?(override),
     do: is_binary(override) and Regex.match?(@human_override_pattern, override)
 
+  defp validate_review_override(progress, override) do
+    case Map.get(progress, "used_review_overrides", []) do
+      overrides when is_list(overrides) ->
+        if valid_human_override?(override) and override in overrides do
+          {:error, :review_override_already_used}
+        else
+          :ok
+        end
+
+      _invalid ->
+        {:error, :review_override_state_invalid}
+    end
+  end
+
   defp maybe_record_review_override(progress, override) do
     if valid_human_override?(override) do
-      Map.put(progress, "review_override", override)
+      progress
+      |> Map.put("review_override", override)
+      |> Map.update("used_review_overrides", [override], fn overrides ->
+        [override | overrides] |> Enum.uniq()
+      end)
     else
       progress
     end
   end
+
+  defp validate_review_receipt_authorization(progress, "review_receipt", fingerprint) do
+    authorized_head = Map.get(progress, "last_review_authorized_head")
+    authorized_fingerprint = Map.get(progress, "last_review_authorized_fingerprint")
+    receipt_fingerprint = canonical_hash(Map.take(fingerprint, @review_fingerprint_fields))
+
+    if is_binary(authorized_head) and is_binary(authorized_fingerprint) and
+         fingerprint_contains_head?(fingerprint, authorized_head) and
+         receipt_fingerprint == authorized_fingerprint do
+      :ok
+    else
+      {:error, :review_authorization_mismatch}
+    end
+  end
+
+  defp validate_review_receipt_authorization(_progress, _kind, _fingerprint), do: :ok
 
   defp update_review_identity(existing, fingerprint, review_hash) do
     prior_fingerprint = Map.get(existing, "fingerprint", %{})
@@ -3873,6 +3969,18 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp reset_no_progress_counters(progress, state, issue_id) do
+    {token_baseline, cycle_baseline} = progress_baselines(state, issue_id)
+
+    progress
+    |> Map.put("token_baseline", token_baseline)
+    |> Map.put("cycle_baseline", cycle_baseline)
+    |> Map.put("last_observed_input_tokens", token_baseline)
+    |> Map.put("last_observed_model_cycles", cycle_baseline)
+    |> Map.put("tokens_since_progress", 0)
+    |> Map.put("model_cycles_since_progress", 0)
+  end
+
   defp persist_progress_entry(state, issue_id, entry, receipt) do
     progress = Map.put(state.progress, issue_id, entry)
 
@@ -3935,10 +4043,17 @@ defmodule SymphonyElixir.Orchestrator do
     with %{} = running <- Map.get(state.running, issue_id),
          %{} = progress <- Map.get(state.progress, issue_id),
          true <- is_binary(Map.get(progress, "progress_fingerprint_hash")) do
-      {tokens, cycles} = no_progress_counts(running, progress)
+      {tokens, cycles, observed_tokens, observed_cycles} = no_progress_counts(running, progress)
 
       state
-      |> persist_no_progress_counts(issue_id, progress, tokens, cycles)
+      |> persist_no_progress_counts(
+        issue_id,
+        progress,
+        tokens,
+        cycles,
+        observed_tokens,
+        observed_cycles
+      )
       |> maybe_hold_no_progress(issue_id, running, tokens, cycles)
     else
       _ -> state
@@ -3946,26 +4061,49 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp no_progress_counts(running, progress) do
-    tokens =
-      max(
-        Map.get(running, :codex_input_tokens, 0) - Map.get(progress, "token_baseline", 0),
-        0
+    observed_tokens = Map.get(running, :codex_input_tokens, 0)
+    observed_cycles = Map.get(running, :turn_count, 0)
+    accumulated_tokens = Map.get(progress, "tokens_since_progress", 0)
+    accumulated_cycles = Map.get(progress, "model_cycles_since_progress", 0)
+
+    prior_tokens =
+      Map.get(
+        progress,
+        "last_observed_input_tokens",
+        Map.get(progress, "token_baseline", 0) + accumulated_tokens
       )
 
-    cycles =
-      max(
-        Map.get(running, :turn_count, 0) - Map.get(progress, "cycle_baseline", 0),
-        0
+    prior_cycles =
+      Map.get(
+        progress,
+        "last_observed_model_cycles",
+        Map.get(progress, "cycle_baseline", 0) + accumulated_cycles
       )
 
-    {tokens, cycles}
+    tokens = accumulated_tokens + counter_delta(observed_tokens, prior_tokens)
+    cycles = accumulated_cycles + counter_delta(observed_cycles, prior_cycles)
+
+    {tokens, cycles, observed_tokens, observed_cycles}
   end
 
-  defp persist_no_progress_counts(state, issue_id, progress, tokens, cycles) do
+  defp counter_delta(current, prior) when current >= prior, do: current - prior
+  defp counter_delta(current, _prior), do: current
+
+  defp persist_no_progress_counts(
+         state,
+         issue_id,
+         progress,
+         tokens,
+         cycles,
+         observed_tokens,
+         observed_cycles
+       ) do
     updated =
       progress
       |> Map.put("tokens_since_progress", tokens)
       |> Map.put("model_cycles_since_progress", cycles)
+      |> Map.put("last_observed_input_tokens", observed_tokens)
+      |> Map.put("last_observed_model_cycles", observed_cycles)
 
     if updated == progress do
       state
@@ -4066,9 +4204,20 @@ defmodule SymphonyElixir.Orchestrator do
       worker_host: Map.get(running_entry, :worker_host),
       workspace_path: Map.get(running_entry, :workspace_path),
       worker_affinity: Map.get(running_entry, :worker_affinity),
+      phase_budget: deferred_phase_budget(running_entry),
       started_at: Map.get(running_entry, :started_at)
     }
   end
+
+  defp deferred_phase_budget(%{resume_phase: phase} = running_entry) when is_binary(phase) do
+    %{
+      phase: phase,
+      requested_additional_input_tokens: Map.get(running_entry, :requested_additional_input_tokens),
+      effective_additional_input_tokens: Map.get(running_entry, :effective_additional_input_tokens)
+    }
+  end
+
+  defp deferred_phase_budget(_running_entry), do: nil
 
   defp launch_deferred_waiter(state, issue_id, watcher) do
     %{"script" => script, "args" => args} = Map.fetch!(watcher, "waiter_command")
@@ -4090,27 +4239,52 @@ defmodule SymphonyElixir.Orchestrator do
         send(orchestrator, {:deferred_waiter_exit, issue_id, watcher_token, summarize_waiter_result(result)})
       end)
 
-    %{state | waiter_tasks: Map.put(state.waiter_tasks, issue_id, task_pid)}
+    task = %{pid: task_pid, token: watcher_token}
+    %{state | waiter_tasks: Map.put(state.waiter_tasks, issue_id, task)}
   end
 
   defp summarize_waiter_result({:ok, %{status: status}}), do: {:exit_status, status}
   defp summarize_waiter_result({:error, {:timeout, _timeout_ms, _output}}), do: :timed_out
   defp summarize_waiter_result({:error, _reason}), do: :launch_failed
 
-  defp remove_deferred_waiter_task(state, issue_id) do
-    %{state | waiter_tasks: Map.delete(state.waiter_tasks, issue_id)}
+  defp remove_deferred_waiter_task(state, issue_id, watcher_token) do
+    case Map.get(state.waiter_tasks, issue_id) do
+      %{token: ^watcher_token} ->
+        %{state | waiter_tasks: Map.delete(state.waiter_tasks, issue_id)}
+
+      pid when is_pid(pid) ->
+        if get_in(state.progress, [issue_id, "watcher", "token"]) == watcher_token do
+          %{state | waiter_tasks: Map.delete(state.waiter_tasks, issue_id)}
+        else
+          state
+        end
+
+      _task ->
+        state
+    end
   end
 
   defp stop_deferred_waiter_task(state, issue_id) do
     case Map.pop(state.waiter_tasks, issue_id) do
-      {pid, waiter_tasks} when is_pid(pid) ->
-        if Process.alive?(pid), do: Process.exit(pid, :shutdown)
-        %{state | waiter_tasks: waiter_tasks}
-
       {nil, _waiter_tasks} ->
         state
+
+      {task, waiter_tasks} ->
+        shutdown_waiter_pid(waiter_task_pid(task))
+        %{state | waiter_tasks: waiter_tasks}
     end
   end
+
+  defp shutdown_waiter_pid(pid) when is_pid(pid) do
+    if Process.alive?(pid), do: Process.exit(pid, :shutdown)
+    :ok
+  end
+
+  defp shutdown_waiter_pid(nil), do: :ok
+
+  defp waiter_task_pid(pid) when is_pid(pid), do: pid
+  defp waiter_task_pid(%{pid: pid}) when is_pid(pid), do: pid
+  defp waiter_task_pid(_task), do: nil
 
   defp settle_missing_waiter_receipt(state, issue_id, watcher_token, result) do
     watcher = get_in(state.progress, [issue_id, "watcher"])
@@ -4251,29 +4425,33 @@ defmodule SymphonyElixir.Orchestrator do
       settle_deferred_watcher(state, issue_id, watcher, receipt)
     else
       progress = Map.fetch!(state.progress, issue_id)
-
       updated_watcher = Map.put(watcher, "last_receipt_hash", signature)
-
-      fingerprint =
-        progress
-        |> Map.get("fingerprint", %{})
-        |> Map.put("hosted_receipt", %{
-          "state" => "provider_transition",
-          "signature" => signature,
-          "poll" => Map.get(receipt, "poll"),
-          "observed_at" => Map.get(receipt, "observedAt")
-        })
+      required_check_signature = required_check_signature(progress, receipt)
 
       updated =
-        progress
-        |> Map.put("watcher", updated_watcher)
-        |> Map.put("fingerprint", fingerprint)
-        |> Map.put("progress_fingerprint_hash", canonical_hash(fingerprint))
-        |> Map.put("last_progress_kind", "provider_transition")
-        |> Map.put("last_progress_receipt", signature)
-        |> Map.put("tokens_since_progress", 0)
-        |> Map.put("model_cycles_since_progress", 0)
-        |> Map.put("updated_at", DateTime.utc_now() |> DateTime.to_iso8601())
+        if required_check_signature != Map.get(progress, "last_required_check_signature") do
+          fingerprint =
+            progress
+            |> Map.get("fingerprint", %{})
+            |> Map.put("hosted_receipt", %{
+              "state" => "provider_transition",
+              "required_check_signature" => required_check_signature
+            })
+
+          progress
+          |> reset_no_progress_counters(state, issue_id)
+          |> Map.put("watcher", updated_watcher)
+          |> Map.put("fingerprint", fingerprint)
+          |> Map.put("progress_fingerprint_hash", canonical_hash(fingerprint))
+          |> Map.put("last_required_check_signature", required_check_signature)
+          |> Map.put("last_progress_kind", "provider_transition")
+          |> Map.put("last_progress_receipt", required_check_signature)
+          |> Map.put("updated_at", DateTime.utc_now() |> DateTime.to_iso8601())
+        else
+          progress
+          |> Map.put("watcher", updated_watcher)
+          |> Map.put("updated_at", DateTime.utc_now() |> DateTime.to_iso8601())
+        end
 
       case persist_progress_map(state, Map.put(state.progress, issue_id, updated), issue_id) do
         {:ok, updated_state} -> updated_state
@@ -4318,46 +4496,101 @@ defmodule SymphonyElixir.Orchestrator do
       |> Map.put("watcher", updated_watcher)
       |> Map.put("fingerprint", fingerprint)
       |> Map.put("progress_fingerprint_hash", canonical_hash(fingerprint))
-      |> Map.put("last_progress_kind", "provider_transition")
       |> Map.put("last_progress_receipt", canonical_hash(receipt))
-      |> Map.put("tokens_since_progress", 0)
-      |> Map.put("model_cycles_since_progress", 0)
       |> Map.put("updated_at", DateTime.utc_now() |> DateTime.to_iso8601())
+      |> maybe_reset_for_terminal_provider_transition(state, issue_id, terminal_status)
 
     case persist_progress_map(state, Map.put(state.progress, issue_id, updated), issue_id) do
       {:error, unavailable_state} ->
         unavailable_state
 
       {:ok, persisted_state} ->
-        persisted_state
-        |> stop_deferred_waiter_task(issue_id)
-        |> wake_deferred_issue_once(issue_id, terminal_status)
+        stopped_state = stop_deferred_waiter_task(persisted_state, issue_id)
+        {metadata, deferred} = Map.pop(stopped_state.deferred, issue_id)
+        wake_deferred_issue_once(%{stopped_state | deferred: deferred}, issue_id, terminal_status, metadata)
     end
   end
 
-  defp wake_deferred_issue_once(state, issue_id, terminal_status) do
-    cond do
-      Map.has_key?(state.holds, issue_id) ->
-        state
+  defp required_check_signature(progress, receipt) do
+    required_checks = get_in(progress, ["fingerprint", "required_check_set"]) || []
+    check_rollup = get_in(receipt, ["provider", "statusCheckRollup"]) || []
 
+    required_checks
+    |> Enum.flat_map(fn required_name ->
+      matches = Enum.filter(check_rollup, &(provider_check_name(&1) == required_name))
+
+      case matches do
+        [] -> [%{"name" => required_name, "state" => "MISSING"}]
+        checks -> Enum.map(checks, &provider_check_state/1)
+      end
+    end)
+    |> Enum.sort_by(&canonical_hash/1)
+    |> canonical_hash()
+  end
+
+  defp provider_check_name(check),
+    do: Map.get(check, "name") || Map.get(check, "context") || Map.get(check, "workflowName")
+
+  defp provider_check_state(check) do
+    %{
+      "name" => provider_check_name(check),
+      "state" => Map.get(check, "state"),
+      "status" => Map.get(check, "status"),
+      "conclusion" => Map.get(check, "conclusion")
+    }
+  end
+
+  defp maybe_reset_for_terminal_provider_transition(progress, state, issue_id, terminal_status)
+       when terminal_status in ["passed", "head_changed"] do
+    progress
+    |> reset_no_progress_counters(state, issue_id)
+    |> Map.put("last_progress_kind", "provider_transition")
+  end
+
+  defp maybe_reset_for_terminal_provider_transition(progress, _state, _issue_id, _terminal_status),
+    do: progress
+
+  defp wake_deferred_issue_once(state, issue_id, terminal_status, metadata) do
+    cond do
       Map.has_key?(state.running, issue_id) ->
         state
 
-      metadata = Map.get(state.deferred, issue_id) ->
+      phase_resume_wake_authorized?(state, issue_id, metadata) ->
+        schedule_deferred_continuation(state, issue_id, terminal_status, metadata)
+
+      Map.has_key?(state.holds, issue_id) ->
         state
-        |> Map.put(:deferred, Map.delete(state.deferred, issue_id))
-        |> do_schedule_issue_retry(issue_id, 1, %{
-          identifier: metadata.identifier,
-          worker_host: Map.get(metadata, :worker_host),
-          workspace_path: Map.get(metadata, :workspace_path),
-          worker_affinity: Map.get(metadata, :worker_affinity),
-          delay_type: :continuation,
-          error: "deferred wait terminal: #{terminal_status}"
-        })
+
+      is_map(metadata) ->
+        schedule_deferred_continuation(state, issue_id, terminal_status, metadata)
 
       true ->
         state
     end
+  end
+
+  defp phase_resume_wake_authorized?(state, issue_id, metadata) when is_map(metadata) do
+    case Map.get(state.holds, issue_id) do
+      %{reason: @phase_resume_pending_reason} = hold ->
+        phase_budget_matches_hold?(Map.get(metadata, :phase_budget), hold)
+
+      _hold ->
+        false
+    end
+  end
+
+  defp phase_resume_wake_authorized?(_state, _issue_id, _metadata), do: false
+
+  defp schedule_deferred_continuation(state, issue_id, terminal_status, metadata) do
+    do_schedule_issue_retry(state, issue_id, 1, %{
+      identifier: metadata.identifier,
+      worker_host: Map.get(metadata, :worker_host),
+      workspace_path: Map.get(metadata, :workspace_path),
+      worker_affinity: Map.get(metadata, :worker_affinity),
+      phase_budget: Map.get(metadata, :phase_budget),
+      delay_type: :continuation,
+      error: "deferred wait terminal: #{terminal_status}"
+    })
   end
 
   defp validate_receipt_path(path, workspace_path)
