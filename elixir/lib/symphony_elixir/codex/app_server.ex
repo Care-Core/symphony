@@ -9,6 +9,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
+  @token_warning_steer_id "symphony-token-budget-warning"
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @type session :: %{
@@ -42,7 +43,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
          {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
-      metadata = port_metadata(port, worker_host)
+      metadata = port |> port_metadata(worker_host) |> Map.put(:codex_app_server_port, port)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
            {:ok, thread_id} <-
@@ -145,6 +146,20 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec stop_session(session()) :: :ok
   def stop_session(%{port: port}) when is_port(port) do
     stop_port(port)
+  end
+
+  @spec steer_turn(port(), String.t(), String.t(), String.t()) :: :ok | {:error, term()}
+  def steer_turn(port, thread_id, turn_id, instruction)
+      when is_port(port) and is_binary(thread_id) and is_binary(turn_id) and is_binary(instruction) do
+    safe_send_message(port, %{
+      "method" => "turn/steer",
+      "id" => @token_warning_steer_id,
+      "params" => %{
+        "threadId" => thread_id,
+        "expectedTurnId" => turn_id,
+        "input" => [%{"type" => "text", "text" => instruction}]
+      }
+    })
   end
 
   defp validate_workspace_cwd(workspace, nil) when is_binary(workspace) do
@@ -1030,6 +1045,13 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp send_message(port, message) do
     line = Jason.encode!(message) <> "\n"
     Port.command(port, line)
+  end
+
+  defp safe_send_message(port, message) do
+    send_message(port, message)
+    :ok
+  rescue
+    error in ArgumentError -> {:error, {:port_unavailable, error.message}}
   end
 
   defp needs_input?("mcpServer/elicitation/request", payload) when is_map(payload), do: true
