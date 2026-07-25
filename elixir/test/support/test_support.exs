@@ -114,6 +114,10 @@ defmodule SymphonyElixir.TestSupport do
           codex_turn_timeout_ms: 3_600_000,
           codex_read_timeout_ms: 5_000,
           codex_stall_timeout_ms: 300_000,
+          codex_input_token_limit: nil,
+          codex_input_token_limits_by_label: %{},
+          codex_input_token_warning_ratio: 0.70,
+          codex_input_token_checkpoint_grace: 500_000,
           hook_after_create: nil,
           hook_before_run: nil,
           hook_after_run: nil,
@@ -152,6 +156,10 @@ defmodule SymphonyElixir.TestSupport do
     codex_turn_timeout_ms = Keyword.get(config, :codex_turn_timeout_ms)
     codex_read_timeout_ms = Keyword.get(config, :codex_read_timeout_ms)
     codex_stall_timeout_ms = Keyword.get(config, :codex_stall_timeout_ms)
+    codex_input_token_limit = Keyword.get(config, :codex_input_token_limit)
+    codex_input_token_limits_by_label = Keyword.get(config, :codex_input_token_limits_by_label)
+    codex_input_token_warning_ratio = Keyword.get(config, :codex_input_token_warning_ratio)
+    codex_input_token_checkpoint_grace = Keyword.get(config, :codex_input_token_checkpoint_grace)
     hook_after_create = Keyword.get(config, :hook_after_create)
     hook_before_run = Keyword.get(config, :hook_before_run)
     hook_after_run = Keyword.get(config, :hook_after_run)
@@ -194,6 +202,10 @@ defmodule SymphonyElixir.TestSupport do
         "  turn_timeout_ms: #{yaml_value(codex_turn_timeout_ms)}",
         "  read_timeout_ms: #{yaml_value(codex_read_timeout_ms)}",
         "  stall_timeout_ms: #{yaml_value(codex_stall_timeout_ms)}",
+        "  input_token_limit: #{yaml_value(codex_input_token_limit)}",
+        "  input_token_limits_by_label: #{yaml_value(codex_input_token_limits_by_label)}",
+        "  input_token_warning_ratio: #{yaml_value(codex_input_token_warning_ratio)}",
+        "  input_token_checkpoint_grace: #{yaml_value(codex_input_token_checkpoint_grace)}",
         hooks_yaml(hook_after_create, hook_before_run, hook_after_run, hook_before_remove, hook_timeout_ms),
         observability_yaml(observability_enabled, observability_refresh_ms, observability_render_interval_ms),
         server_yaml(server_port, server_host),

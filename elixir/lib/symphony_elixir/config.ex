@@ -55,6 +55,28 @@ defmodule SymphonyElixir.Config do
 
   def max_concurrent_agents_for_state(_state_name), do: settings!().agent.max_concurrent_agents
 
+  @spec input_token_limit_for_issue(map()) :: pos_integer() | nil
+  def input_token_limit_for_issue(issue) when is_map(issue) do
+    codex = settings!().codex
+
+    label_limits =
+      issue
+      |> Map.get(:labels, [])
+      |> List.wrap()
+      |> Enum.flat_map(fn label ->
+        case Map.get(codex.input_token_limits_by_label, normalize_label(label)) do
+          limit when is_integer(limit) and limit > 0 -> [limit]
+          _ -> []
+        end
+      end)
+
+    [codex.input_token_limit | label_limits]
+    |> Enum.filter(&(is_integer(&1) and &1 > 0))
+    |> Enum.min(fn -> nil end)
+  end
+
+  def input_token_limit_for_issue(_issue), do: settings!().codex.input_token_limit
+
   @spec codex_turn_sandbox_policy(Path.t() | nil) :: map()
   def codex_turn_sandbox_policy(workspace \\ nil) do
     case Schema.resolve_runtime_turn_sandbox_policy(settings!(), workspace) do
@@ -122,6 +144,14 @@ defmodule SymphonyElixir.Config do
       Tracker.validate_config(settings.tracker)
     end
   end
+
+  defp normalize_label(label) when is_binary(label) do
+    label
+    |> String.trim()
+    |> String.downcase()
+  end
+
+  defp normalize_label(label), do: label |> to_string() |> normalize_label()
 
   defp format_config_error(reason) do
     case reason do
