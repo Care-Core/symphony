@@ -6,12 +6,77 @@ defmodule SymphonyElixir.HoldStoreTest do
   alias SymphonyElixir.HoldStore
 
   @state_filename ".symphony-holds.json"
+  @progress_filename ".symphony-progress.json"
 
   test "load returns an empty store when no state file exists" do
     workspace_root = workspace_root("missing")
 
     assert {:ok, %{}} = HoldStore.load(workspace_root)
     assert File.dir?(workspace_root)
+  end
+
+  test "progress store rejects an unavailable root" do
+    workspace_root = workspace_root("progress-root-file")
+    File.write!(workspace_root, "not a directory")
+
+    assert {:error, {:progress_state_root_unavailable, ^workspace_root, reason}} =
+             HoldStore.load_progress(workspace_root)
+
+    assert reason in [:eexist, :enotdir]
+  end
+
+  test "progress store rejects corrupt, invalid-schema, and non-regular state files" do
+    workspace_root = workspace_root("progress-invalid-files")
+    state_path = progress_state_path(workspace_root)
+
+    write_state!(workspace_root, @progress_filename, "not-json")
+
+    assert {:error, {:progress_state_invalid, ^state_path, %Jason.DecodeError{}}} =
+             HoldStore.load_progress(workspace_root)
+
+    write_state!(workspace_root, @progress_filename, Jason.encode!(%{"version" => 2, "issues" => %{}}))
+
+    assert {:error, {:progress_state_invalid, ^state_path, :invalid_schema}} =
+             HoldStore.load_progress(workspace_root)
+
+    File.rm!(state_path)
+    File.mkdir!(state_path)
+
+    assert {:error, {:progress_state_invalid_file, ^state_path, :directory}} =
+             HoldStore.load_progress(workspace_root)
+  end
+
+  test "progress store reports an unreadable state path" do
+    workspace_root = workspace_root("progress-unreadable")
+    state_path = progress_state_path(workspace_root)
+    File.mkdir_p!(workspace_root)
+    File.chmod!(workspace_root, 0o000)
+
+    try do
+      assert {:error, {:progress_state_unreadable, ^state_path, :eacces}} =
+               HoldStore.load_progress(workspace_root)
+    after
+      File.chmod!(workspace_root, 0o700)
+    end
+  end
+
+  test "progress store rejects every invalid entry shape" do
+    workspace_root = workspace_root("progress-invalid-entries")
+    valid_entry = progress_entry()
+
+    invalid_entries = [
+      %{"issue-a" => Map.put(valid_entry, "issue_id", "issue-b")},
+      %{"issue-a" => Map.put(valid_entry, "fingerprint", %{})},
+      %{"issue-a" => Map.put(valid_entry, "progress_fingerprint_hash", nil)},
+      %{"issue-a" => Map.put(valid_entry, "review_round_count", -1)},
+      %{"issue-a" => Map.put(valid_entry, "used_review_overrides", "not-a-list")},
+      %{"issue-a" => Map.put(valid_entry, "watcher", "waiting")}
+    ]
+
+    for entries <- invalid_entries do
+      assert {:error, {:invalid_progress_entry, "issue-a"}} =
+               HoldStore.persist_progress(workspace_root, entries)
+    end
   end
 
   test "persist writes a private, stably ordered store that load decodes" do
@@ -688,6 +753,7 @@ defmodule SymphonyElixir.HoldStoreTest do
   end
 
   defp state_path(workspace_root), do: Path.join(workspace_root, @state_filename)
+  defp progress_state_path(workspace_root), do: Path.join(workspace_root, @progress_filename)
 
   defp write_json_state!(workspace_root, payload) do
     write_state!(workspace_root, Jason.encode!(payload))
@@ -724,6 +790,24 @@ defmodule SymphonyElixir.HoldStoreTest do
       "input_token_tier_limit" => 750,
       "cleanup_pending" => false,
       "held_at" => "2026-07-21T12:00:00.000000Z"
+    }
+  end
+
+  defp progress_entry do
+    hash = String.duplicate("a", 64)
+
+    %{
+      "issue_id" => "issue-a",
+      "identifier" => "SYM-1",
+      "fingerprint" => %{"head_sha" => String.duplicate("1", 40)},
+      "progress_fingerprint_hash" => hash,
+      "review_fingerprint_hash" => hash,
+      "review_round_count" => 0,
+      "full_review_count" => 0,
+      "delta_review_count" => 0,
+      "security_review_count" => 0,
+      "used_review_overrides" => [],
+      "watcher" => nil
     }
   end
 
