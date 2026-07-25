@@ -36,6 +36,7 @@ defmodule SymphonyElixir.Orchestrator do
       :poll_check_in_progress,
       :tick_timer_ref,
       :tick_token,
+      :agent_runner,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
@@ -93,6 +94,7 @@ defmodule SymphonyElixir.Orchestrator do
       poll_check_in_progress: false,
       tick_timer_ref: nil,
       tick_token: nil,
+      agent_runner: Keyword.get(opts, :agent_runner, &AgentRunner.run/3),
       task_supervisor: Keyword.get(opts, :task_supervisor, SymphonyElixir.TaskSupervisor),
       holds: holds,
       claimed: MapSet.new(Map.keys(holds)),
@@ -1149,10 +1151,16 @@ defmodule SymphonyElixir.Orchestrator do
     |> MapSet.new()
   end
 
-  defp dispatch_issue(%State{} = state, issue, attempt \\ nil, preferred_worker_host \\ nil) do
+  defp dispatch_issue(
+         %State{} = state,
+         issue,
+         attempt \\ nil,
+         preferred_worker_host \\ nil,
+         phase_budget \\ nil
+       ) do
     case refresh_issue_for_dispatch(issue) do
       {:ok, %Issue{} = refreshed_issue} ->
-        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host)
+        do_dispatch_issue(state, refreshed_issue, attempt, preferred_worker_host, phase_budget)
 
       {:skip, _reason} ->
         state
@@ -1182,7 +1190,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host) do
+  defp do_dispatch_issue(%State{} = state, issue, attempt, preferred_worker_host, phase_budget) do
     recipient = self()
 
     case select_worker_host(state, preferred_worker_host) do
@@ -1191,13 +1199,25 @@ defmodule SymphonyElixir.Orchestrator do
         state
 
       worker_host ->
-        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host)
+        spawn_issue_on_worker_host(state, issue, attempt, recipient, worker_host, phase_budget)
     end
   end
 
-  defp spawn_issue_on_worker_host(%State{} = state, issue, attempt, recipient, worker_host) do
+  defp spawn_issue_on_worker_host(
+         %State{} = state,
+         issue,
+         attempt,
+         recipient,
+         worker_host,
+         phase_budget
+       ) do
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           AgentRunner.run(issue, recipient, attempt: attempt, worker_host: worker_host)
+           state.agent_runner.(issue, recipient,
+             attempt: attempt,
+             worker_host: worker_host,
+             resume_phase: phase_budget_value(phase_budget, :phase),
+             max_additional_input_tokens: phase_budget_value(phase_budget, :effective_additional_input_tokens)
+           )
          end) do
       {:ok, pid} ->
         ref = Process.monitor(pid)
@@ -1223,6 +1243,18 @@ defmodule SymphonyElixir.Orchestrator do
             codex_last_reported_input_tokens: 0,
             codex_last_reported_output_tokens: 0,
             codex_last_reported_total_tokens: 0,
+            input_token_limit: phase_budget_limit(phase_budget) || Config.input_token_limit_for_issue(issue),
+            input_token_tier_limit: Config.input_token_limit_for_issue(issue),
+            input_token_warning_ratio: Config.settings!().codex.input_token_warning_ratio,
+            input_token_checkpoint_grace: Config.settings!().codex.input_token_checkpoint_grace,
+            input_token_warning_sent: false,
+            input_token_warning_status: nil,
+            input_token_warning_threshold: nil,
+            input_token_warning_observed_at: nil,
+            resume_phase: phase_budget_value(phase_budget, :phase),
+            requested_additional_input_tokens: phase_budget_value(phase_budget, :requested_additional_input_tokens),
+            effective_additional_input_tokens: phase_budget_value(phase_budget, :effective_additional_input_tokens),
+            attempt_input_token_baseline: 0,
             turn_count: 0,
             retry_attempt: normalize_retry_attempt(attempt),
             started_at: DateTime.utc_now()
@@ -1243,7 +1275,8 @@ defmodule SymphonyElixir.Orchestrator do
           identifier: issue.identifier,
           issue_url: issue.url,
           error: "failed to spawn agent: #{inspect(reason)}",
-          worker_host: worker_host
+          worker_host: worker_host,
+          phase_budget: phase_budget
         })
     end
   end
@@ -1278,6 +1311,37 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
+    if retry_authorized?(state, issue_id, metadata) do
+      do_schedule_issue_retry(state, issue_id, attempt, metadata)
+    else
+      state
+    end
+  end
+
+  defp retry_authorized?(state, issue_id, metadata) do
+    case Map.get(state.holds, issue_id) do
+      nil ->
+        true
+
+      %{reason: @phase_resume_pending_reason} = hold ->
+        phase_budget_matches_hold?(Map.get(metadata, :phase_budget), hold)
+
+      _hold ->
+        false
+    end
+  end
+
+  defp phase_budget_matches_hold?(phase_budget, hold) when is_map(phase_budget) do
+    Map.get(phase_budget, :phase) == Map.get(hold, :resume_phase) and
+      Map.get(phase_budget, :requested_additional_input_tokens) ==
+        Map.get(hold, :requested_additional_input_tokens) and
+      Map.get(phase_budget, :effective_additional_input_tokens) ==
+        Map.get(hold, :effective_additional_input_tokens)
+  end
+
+  defp phase_budget_matches_hold?(_phase_budget, _hold), do: false
+
+  defp do_schedule_issue_retry(%State{} = state, issue_id, attempt, metadata) do
     previous_retry = Map.get(state.retry_attempts, issue_id, %{attempt: 0})
     next_attempt = if is_integer(attempt), do: attempt, else: previous_retry.attempt + 1
     delay_ms = retry_delay(next_attempt, metadata)
@@ -1427,12 +1491,20 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_active_retry(state, issue, attempt, metadata) do
-    if retry_candidate_issue?(issue, terminal_state_set()) and
+    if retry_authorized?(state, issue.id, metadata) and
+         retry_candidate_issue?(issue, terminal_state_set()) and
          dispatch_slots_available?(issue, state) and
          worker_slots_available?(state, metadata[:worker_host]) do
       case refresh_issue_for_dispatch(issue) do
         {:ok, %Issue{} = refreshed_issue} ->
-          {:noreply, do_dispatch_issue(state, refreshed_issue, attempt, metadata[:worker_host])}
+          {:noreply,
+           do_dispatch_issue(
+             state,
+             refreshed_issue,
+             attempt,
+             metadata[:worker_host],
+             metadata[:phase_budget]
+           )}
 
         {:skip, :missing} ->
           {:noreply, release_issue_claim(state, issue.id)}
@@ -1499,6 +1571,16 @@ defmodule SymphonyElixir.Orchestrator do
       _ -> nil
     end
   end
+
+  defp phase_budget_limit(phase_budget) when is_map(phase_budget),
+    do: Map.get(phase_budget, :effective_additional_input_tokens)
+
+  defp phase_budget_limit(_phase_budget), do: nil
+
+  defp phase_budget_value(phase_budget, key) when is_map(phase_budget),
+    do: Map.get(phase_budget, key)
+
+  defp phase_budget_value(_phase_budget, _key), do: nil
 
   defp pick_retry_identifier(issue_id, previous_retry, metadata) do
     metadata[:identifier] || Map.get(previous_retry, :identifier) || issue_id

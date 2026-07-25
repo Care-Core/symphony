@@ -332,6 +332,139 @@ defmodule SymphonyElixir.TokenBudgetTest do
     refute Orchestrator.should_dispatch_issue_for_test(issue, :sys.get_state(pid))
   end
 
+  test "a restored bounded resume rejects stale retry authority" do
+    {pid, server, issue, worker_pid, _workspace_root} =
+      start_budget_orchestrator("resume-restart-authority", 100)
+
+    workspace = Path.join(Config.settings!().workspace.root, issue.identifier)
+    put_running_entry(pid, issue, worker_pid, input_token_limit: 100, workspace_path: workspace)
+    send_token_update(pid, issue.id, 100)
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [
+      %{issue | state: "Todo", labels: ["Symphony Normal"], dispatchable: true}
+    ])
+
+    assert {:ok, %{phase: "validation", effective_additional_input_tokens: 50}} =
+             Orchestrator.resume_issue(
+               issue.identifier,
+               %{phase: "validation", max_additional_input_tokens: 50},
+               server
+             )
+
+    :ok = GenServer.stop(pid)
+    {restarted_pid, _restarted_server} = start_replacement_orchestrator()
+    restarted_state = :sys.get_state(restarted_pid)
+
+    assert restarted_state.retry_attempts == %{}
+    assert restarted_state.holds[issue.id].reason == "input_token_resume_pending"
+
+    task_supervisor = start_supervised!(Task.Supervisor)
+    test_pid = self()
+
+    agent_runner = fn _dispatched_issue, _recipient, _opts ->
+      send(test_pid, :stale_retry_dispatched)
+      Process.sleep(:infinity)
+    end
+
+    stale_phase_budget = %{
+      phase: "implementation",
+      requested_additional_input_tokens: 50,
+      effective_additional_input_tokens: 50
+    }
+
+    state = %{
+      restarted_state
+      | task_supervisor: task_supervisor,
+        agent_runner: agent_runner,
+        max_concurrent_agents: 1
+    }
+
+    updated_state =
+      Orchestrator.handle_retry_issue_lookup_for_test(
+        %{issue | dispatchable: true},
+        state,
+        issue.id,
+        1,
+        %{identifier: issue.identifier, phase_budget: stale_phase_budget}
+      )
+
+    assert updated_state.running == %{}
+    assert updated_state.holds == restarted_state.holds
+    refute_receive :stale_retry_dispatched
+  end
+
+  test "retry dispatch carries the bounded phase budget into the running attempt" do
+    workspace_root =
+      Path.join(System.tmp_dir!(), "symphony-budget-dispatch-#{System.unique_integer([:positive])}")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: workspace_root,
+      codex_input_token_limit: 100
+    )
+
+    issue = %Issue{
+      id: "issue-resume-dispatch",
+      identifier: "MT-RESUME-DISPATCH",
+      title: "Bounded resume dispatch",
+      state: "In Progress",
+      dispatchable: true,
+      labels: []
+    }
+
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    {:ok, task_supervisor} = Task.Supervisor.start_link()
+    test_pid = self()
+
+    agent_runner = fn dispatched_issue, recipient, opts ->
+      send(test_pid, {:agent_runner_opts, dispatched_issue, recipient, opts})
+      Process.sleep(:infinity)
+    end
+
+    on_exit(fn ->
+      if Process.alive?(task_supervisor), do: Process.exit(task_supervisor, :shutdown)
+      File.rm_rf(workspace_root)
+    end)
+
+    phase_budget = %{
+      phase: "validation",
+      requested_additional_input_tokens: 200,
+      effective_additional_input_tokens: 100,
+      attempt_input_token_baseline: 0,
+      current_issue_tier_limit: 100
+    }
+
+    state =
+      %Orchestrator.State{
+        task_supervisor: task_supervisor,
+        max_concurrent_agents: 1,
+        claimed: MapSet.new([issue.id])
+      }
+      |> Map.put(:agent_runner, agent_runner)
+
+    updated_state =
+      Orchestrator.handle_retry_issue_lookup_for_test(issue, state, issue.id, 1, %{
+        identifier: issue.identifier,
+        phase_budget: phase_budget
+      })
+
+    assert %{
+             input_token_limit: 100,
+             input_token_tier_limit: 100,
+             resume_phase: "validation",
+             requested_additional_input_tokens: 200,
+             effective_additional_input_tokens: 100,
+             attempt_input_token_baseline: 0,
+             retry_attempt: 1
+           } = updated_state.running[issue.id]
+
+    assert_receive {:agent_runner_opts, ^issue, recipient, opts}, 1_000
+    assert is_pid(recipient)
+    assert opts[:attempt] == 1
+    assert opts[:resume_phase] == "validation"
+    assert opts[:max_additional_input_tokens] == 100
+  end
+
   defp start_budget_orchestrator(suffix, limit) do
     workspace_root =
       Path.join(System.tmp_dir!(), "symphony-budget-#{suffix}-#{System.unique_integer([:positive])}")
