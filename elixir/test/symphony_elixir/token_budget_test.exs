@@ -465,6 +465,66 @@ defmodule SymphonyElixir.TokenBudgetTest do
     assert opts[:max_additional_input_tokens] == 100
   end
 
+  test "manual stop durably holds a running issue and preserves its workspace" do
+    {pid, server, issue, worker_pid, workspace_root} =
+      start_budget_orchestrator("manual-stop", 100)
+
+    workspace = Path.join(workspace_root, issue.identifier)
+    marker = Path.join(workspace, "preserve-manual")
+    File.mkdir_p!(workspace)
+    File.write!(marker, "kept")
+    put_running_entry(pid, issue, worker_pid, workspace_path: workspace)
+
+    assert {:ok, hold} = Orchestrator.stop_issue(issue.identifier, server)
+    assert hold.reason == "manual_stop"
+    assert hold.cleanup_pending == false
+    assert Orchestrator.snapshot(server, 1_000).running == []
+    assert Orchestrator.snapshot(server, 1_000).retrying == []
+    refute Process.alive?(worker_pid)
+    assert File.read!(marker) == "kept"
+
+    issue_id = issue.id
+    assert {:ok, %{^issue_id => persisted_hold}} = SymphonyElixir.HoldStore.load(workspace_root)
+    assert persisted_hold.reason == "manual_stop"
+    assert persisted_hold.workspace_path == workspace
+  end
+
+  test "manual stop durably replaces a scheduled retry with a hold" do
+    {pid, server, issue, _worker_pid, workspace_root} =
+      start_budget_orchestrator("manual-retry-stop", 100)
+
+    retry_timer = Process.send_after(pid, :unused_retry_timer, 60_000)
+
+    :sys.replace_state(pid, fn state ->
+      retry = %{
+        identifier: issue.identifier,
+        attempt: 2,
+        due_at_ms: System.monotonic_time(:millisecond) + 60_000,
+        timer_ref: retry_timer,
+        worker_host: nil,
+        workspace_path: "/tmp/#{issue.identifier}"
+      }
+
+      %{
+        state
+        | running: %{},
+          retry_attempts: %{issue.id => retry},
+          claimed: MapSet.put(state.claimed, issue.id)
+      }
+    end)
+
+    assert {:ok, hold} = Orchestrator.stop_issue(issue.identifier, server)
+    assert hold.reason == "manual_stop"
+    assert hold.cleanup_pending == false
+    assert Orchestrator.snapshot(server, 1_000).retrying == []
+    assert [%{identifier: identifier, reason: "manual_stop"}] = Orchestrator.snapshot(server, 1_000).held
+    assert identifier == issue.identifier
+
+    issue_id = issue.id
+    assert {:ok, %{^issue_id => persisted_hold}} = SymphonyElixir.HoldStore.load(workspace_root)
+    assert persisted_hold.workspace_path == "/tmp/#{issue.identifier}"
+  end
+
   defp start_budget_orchestrator(suffix, limit) do
     workspace_root =
       Path.join(System.tmp_dir!(), "symphony-budget-#{suffix}-#{System.unique_integer([:positive])}")

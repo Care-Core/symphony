@@ -57,6 +57,30 @@ defmodule SymphonyElixir.ExtensionsTest do
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
+
+    def handle_call({:stop_issue, identifier}, _from, state) do
+      result =
+        case Keyword.get(state, :stop, {:error, :issue_not_found}) do
+          stop when is_function(stop, 1) -> stop.(identifier)
+          stop -> stop
+        end
+
+      {:reply, result, state}
+    end
+
+    def handle_call({:resume_issue, identifier, options}, _from, state) do
+      if test_pid = Keyword.get(state, :test_pid) do
+        send(test_pid, {:resume_issue_called, identifier, options})
+      end
+
+      result =
+        case Keyword.get(state, :resume, {:error, :issue_not_found}) do
+          resume when is_function(resume, 1) -> resume.(options)
+          resume -> resume
+        end
+
+      {:reply, result, state}
+    end
   end
 
   setup do
@@ -75,9 +99,16 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   setup do
     endpoint_config = Application.get_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, [])
+    control_token = System.get_env("SYMPHONY_CONTROL_TOKEN")
 
     on_exit(fn ->
       Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, endpoint_config)
+
+      if is_nil(control_token) do
+        System.delete_env("SYMPHONY_CONTROL_TOKEN")
+      else
+        System.put_env("SYMPHONY_CONTROL_TOKEN", control_token)
+      end
     end)
 
     :ok
@@ -262,7 +293,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
+             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1, "held" => 0},
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -308,6 +339,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at")
                }
              ],
+             "held" => [],
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -343,6 +375,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              },
              "retry" => nil,
              "blocked" => nil,
+             "hold" => nil,
              "logs" => %{"codex_session_logs" => []},
              "recent_events" => [],
              "last_error" => nil,
@@ -376,6 +409,67 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "phoenix observability api projects durable held issues in state and issue views" do
+    held_at = DateTime.utc_now()
+
+    hold = %{
+      issue_id: "issue-held",
+      identifier: "MT-HELD",
+      reason: "manual_stop",
+      limit: nil,
+      observed_tokens: 42,
+      issue_state: "In Progress",
+      worker_host: "dm-dev2",
+      workspace_path: "/workspaces/MT-HELD",
+      cleanup_pending: false,
+      held_at: held_at
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :HeldObservabilityApiOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: Map.put(static_snapshot(), :held, [hold])
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+
+    assert state_payload["counts"]["held"] == 1
+
+    assert state_payload["held"] == [
+             %{
+               "issue_id" => "issue-held",
+               "issue_identifier" => "MT-HELD",
+               "reason" => "manual_stop",
+               "limit" => nil,
+               "observed_tokens" => 42,
+               "issue_state" => "In Progress",
+               "worker_host" => "dm-dev2",
+               "workspace_path" => "/workspaces/MT-HELD",
+               "cleanup_pending" => false,
+               "held_at" => held_at |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+             }
+           ]
+
+    assert %{
+             "issue_id" => "issue-held",
+             "issue_identifier" => "MT-HELD",
+             "status" => "held",
+             "workspace" => %{"host" => "dm-dev2", "path" => "/workspaces/MT-HELD"},
+             "running" => nil,
+             "retry" => nil,
+             "blocked" => nil,
+             "hold" => %{
+               "reason" => "manual_stop",
+               "observed_tokens" => 42,
+               "cleanup_pending" => false
+             }
+           } = json_response(get(build_conn(), "/api/v1/MT-HELD"), 200)
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -412,6 +506,267 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "message" => "Orchestrator is unavailable"
                }
              }
+  end
+
+  test "phoenix control api requires an env-backed token and loopback access" do
+    unknown_name = Module.concat(__MODULE__, :UnknownControlApiOrchestrator)
+
+    {:ok, _pid} = StaticOrchestrator.start_link(name: unknown_name, snapshot: static_snapshot())
+    start_test_endpoint(orchestrator: unknown_name, snapshot_timeout_ms: 50)
+    System.delete_env("SYMPHONY_CONTROL_TOKEN")
+
+    assert json_response(post(build_conn(), "/api/v1/UNKNOWN/stop", %{}), 503)["error"]["code"] ==
+             "control_token_not_configured"
+
+    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+
+    assert json_response(post(build_conn(), "/api/v1/UNKNOWN/stop", %{}), 401)["error"]["code"] ==
+             "invalid_control_token"
+
+    authorized_conn =
+      build_conn()
+      |> Plug.Conn.put_req_header("x-symphony-control-token", "test-control-token")
+
+    assert json_response(post(authorized_conn, "/api/v1/UNKNOWN/stop", %{}), 404)["error"]["code"] ==
+             "issue_not_found"
+
+    remote_conn =
+      build_conn()
+      |> Plug.Conn.put_req_header("x-symphony-control-token", "test-control-token")
+      |> then(&%{&1 | remote_ip: {10, 0, 0, 1}})
+
+    assert json_response(post(remote_conn, "/api/v1/UNKNOWN/resume", %{}), 403)["error"]["code"] ==
+             "loopback_only"
+  end
+
+  test "phoenix stop api returns a durable held receipt" do
+    orchestrator_name = Module.concat(__MODULE__, :StopControlApiOrchestrator)
+
+    hold = %{
+      issue_id: "issue-control",
+      identifier: "MT-CONTROL",
+      reason: "manual_stop",
+      limit: nil,
+      observed_tokens: 42,
+      issue_state: "In Progress",
+      worker_host: nil,
+      workspace_path: "/tmp/MT-CONTROL",
+      cleanup_pending: true,
+      held_at: DateTime.utc_now()
+    }
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        stop: {:ok, hold}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+
+    stop_payload =
+      build_conn()
+      |> Plug.Conn.put_req_header("x-symphony-control-token", "test-control-token")
+      |> post("/api/v1/MT-CONTROL/stop", %{})
+      |> json_response(200)
+
+    assert stop_payload["status"] == "held"
+    assert stop_payload["issue_identifier"] == "MT-CONTROL"
+    assert stop_payload["hold"]["reason"] == "manual_stop"
+    assert stop_payload["hold"]["observed_tokens"] == 42
+    assert stop_payload["hold"]["cleanup_pending"] == true
+  end
+
+  test "phoenix resume api forwards a bounded phase and returns its effective receipt" do
+    orchestrator_name = Module.concat(__MODULE__, :BoundedResumeControlApiOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        test_pid: self(),
+        snapshot: static_snapshot(),
+        resume:
+          {:ok,
+           %{
+             issue_id: "issue-control",
+             identifier: "MT-CONTROL",
+             resumed: true,
+             phase: "validation",
+             requested_additional_input_tokens: 1_500,
+             effective_additional_input_tokens: 1_000,
+             current_issue_tier_limit: 1_000,
+             attempt_input_token_baseline: 0,
+             workspace_path: "/tmp/MT-CONTROL"
+           }}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+
+    resume_payload =
+      build_conn()
+      |> Plug.Conn.put_req_header("x-symphony-control-token", "test-control-token")
+      |> post("/api/v1/MT-CONTROL/resume", %{
+        "phase" => "validation",
+        "max_additional_input_tokens" => 1_500,
+        "ignored" => "not-forwarded"
+      })
+      |> json_response(200)
+
+    assert_received {:resume_issue_called, "MT-CONTROL",
+                     %{
+                       "phase" => "validation",
+                       "max_additional_input_tokens" => 1_500
+                     }}
+
+    assert resume_payload == %{
+             "issue_id" => "issue-control",
+             "issue_identifier" => "MT-CONTROL",
+             "status" => "resumed",
+             "hold" => nil,
+             "resume_phase" => "validation",
+             "requested_additional_input_tokens" => 1_500,
+             "effective_additional_input_tokens" => 1_000,
+             "current_issue_tier_limit" => 1_000,
+             "attempt_input_token_baseline" => 0,
+             "workspace_path" => "/tmp/MT-CONTROL"
+           }
+  end
+
+  test "phoenix resume api maps cleanup and hold persistence failures to safe responses" do
+    orchestrator_name = Module.concat(__MODULE__, :FailedResumeControlApiOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        resume: fn options ->
+          case options do
+            %{"phase" => "validation"} -> {:error, :cleanup_failed}
+            _ -> {:error, :hold_state_unavailable}
+          end
+        end
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+
+    control_conn = fn ->
+      build_conn()
+      |> Plug.Conn.put_req_header("x-symphony-control-token", "test-control-token")
+    end
+
+    cleanup_payload =
+      control_conn.()
+      |> post("/api/v1/MT-CONTROL/resume", %{"phase" => "validation"})
+      |> json_response(503)
+
+    assert cleanup_payload["error"] == %{
+             "code" => "cleanup_failed",
+             "message" => "Cleanup could not be confirmed; the hold remains active"
+           }
+
+    hold_payload =
+      control_conn.()
+      |> post("/api/v1/MT-CONTROL/resume", %{})
+      |> json_response(503)
+
+    assert hold_payload["error"] == %{
+             "code" => "hold_state_unavailable",
+             "message" => "Durable hold state is unavailable"
+           }
+  end
+
+  test "phoenix stop api maps cleanup and hold persistence failures to safe responses" do
+    orchestrator_name = Module.concat(__MODULE__, :FailedStopControlApiOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        stop: fn
+          "MT-CLEANUP" -> {:error, :cleanup_failed}
+          "MT-HOLD" -> {:error, :hold_state_unavailable}
+        end
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+
+    control_conn = fn ->
+      build_conn()
+      |> Plug.Conn.put_req_header("x-symphony-control-token", "test-control-token")
+    end
+
+    cleanup_payload =
+      control_conn.()
+      |> post("/api/v1/MT-CLEANUP/stop", %{})
+      |> json_response(503)
+
+    assert cleanup_payload["error"] == %{
+             "code" => "cleanup_failed",
+             "message" => "The remote run could not be confirmed stopped"
+           }
+
+    hold_payload =
+      control_conn.()
+      |> post("/api/v1/MT-HOLD/stop", %{})
+      |> json_response(503)
+
+    assert hold_payload["error"] == %{
+             "code" => "hold_state_unavailable",
+             "message" => "Durable hold state is unavailable"
+           }
+  end
+
+  test "phoenix resume api rejects missing invalid and unverifiable phase budgets" do
+    orchestrator_name = Module.concat(__MODULE__, :RejectedBudgetResumeControlApiOrchestrator)
+
+    resume = fn options ->
+      case options do
+        %{"phase" => "unknown"} ->
+          {:error, :invalid_resume_phase}
+
+        %{"phase" => "validation", "max_additional_input_tokens" => "many"} ->
+          {:error, :invalid_max_additional_input_tokens}
+
+        %{"phase" => "validation", "max_additional_input_tokens" => 100} ->
+          {:error, :tracker_unavailable}
+
+        %{"phase" => "validation"} ->
+          {:error, :max_additional_input_tokens_required}
+
+        _ ->
+          {:error, :resume_phase_required}
+      end
+    end
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: static_snapshot(),
+        resume: resume
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+
+    for {body, expected_code, expected_status} <- [
+          {%{}, "resume_phase_required", 422},
+          {%{"phase" => "unknown"}, "invalid_resume_phase", 422},
+          {%{"phase" => "validation"}, "max_additional_input_tokens_required", 422},
+          {%{"phase" => "validation", "max_additional_input_tokens" => "many"}, "invalid_max_additional_input_tokens", 422},
+          {%{"phase" => "validation", "max_additional_input_tokens" => 100}, "tracker_unavailable", 503}
+        ] do
+      payload =
+        build_conn()
+        |> Plug.Conn.put_req_header("x-symphony-control-token", "test-control-token")
+        |> post("/api/v1/MT-CONTROL/resume", body)
+        |> json_response(expected_status)
+
+      assert payload["error"]["code"] == expected_code
+    end
   end
 
   test "phoenix observability api preserves snapshot timeout behavior" do
@@ -610,7 +965,13 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1}
+
+    assert response.body["counts"] == %{
+             "running" => 1,
+             "retrying" => 1,
+             "blocked" => 1,
+             "held" => 0
+           }
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200

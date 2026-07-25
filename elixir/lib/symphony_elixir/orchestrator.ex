@@ -1721,6 +1721,16 @@ defmodule SymphonyElixir.Orchestrator do
   @spec resume_issue(String.t()) :: {:ok, map()} | {:error, atom()}
   def resume_issue(issue_identifier), do: resume_issue(issue_identifier, %{}, __MODULE__)
 
+  @spec stop_issue(String.t()) :: {:ok, map()} | {:error, atom()}
+  def stop_issue(issue_identifier), do: stop_issue(issue_identifier, __MODULE__)
+
+  @spec stop_issue(String.t(), GenServer.server()) :: {:ok, map()} | {:error, atom()}
+  def stop_issue(issue_identifier, server) when is_binary(issue_identifier) do
+    GenServer.call(server, {:stop_issue, issue_identifier})
+  catch
+    :exit, _ -> {:error, :unavailable}
+  end
+
   @spec resume_issue(String.t(), GenServer.server()) :: {:ok, map()} | {:error, atom()}
   def resume_issue(issue_identifier, server) when is_binary(issue_identifier) do
     resume_issue(issue_identifier, %{}, server)
@@ -1848,6 +1858,19 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  def handle_call({:stop_issue, issue_identifier}, _from, state) do
+    case find_known_issue_id(state, issue_identifier) do
+      nil ->
+        {:reply, {:error, :issue_not_found}, state}
+
+      issue_id ->
+        case stop_known_issue(state, issue_id) do
+          {:ok, updated_state, hold} -> {:reply, {:ok, hold}, updated_state}
+          {:error, updated_state, reason} -> {:reply, {:error, reason}, updated_state}
+        end
+    end
+  end
+
   def handle_call(:request_refresh, _from, state) do
     now_ms = System.monotonic_time(:millisecond)
     already_due? = is_integer(state.next_poll_due_at_ms) and state.next_poll_due_at_ms <= now_ms
@@ -1863,8 +1886,142 @@ defmodule SymphonyElixir.Orchestrator do
      }, state}
   end
 
+  defp find_known_issue_id(%State{} = state, issue_identifier) do
+    find_issue_id_by_identifier(state.running, issue_identifier) ||
+      find_issue_id_by_identifier(state.retry_attempts, issue_identifier) ||
+      find_issue_id_by_identifier(state.holds, issue_identifier)
+  end
+
   defp find_hold_by_identifier(holds, issue_identifier) do
-    Enum.find(holds, fn {_issue_id, hold} -> hold.identifier == issue_identifier end)
+    Enum.find(holds, fn {_issue_id, hold} ->
+      same_identifier?(Map.get(hold, :identifier), issue_identifier)
+    end)
+  end
+
+  defp find_issue_id_by_identifier(entries, issue_identifier) do
+    Enum.find_value(entries, fn {issue_id, entry} ->
+      if same_identifier?(Map.get(entry, :identifier), issue_identifier), do: issue_id
+    end)
+  end
+
+  defp same_identifier?(left, right) when is_binary(left) and is_binary(right) do
+    String.downcase(left) == String.downcase(right)
+  end
+
+  defp same_identifier?(_left, _right), do: false
+
+  defp stop_known_issue(%State{} = state, issue_id) do
+    cond do
+      running_entry = Map.get(state.running, issue_id) ->
+        stop_running_issue(state, issue_id, running_entry)
+
+      retry_entry = Map.get(state.retry_attempts, issue_id) ->
+        stop_retrying_issue(state, issue_id, retry_entry)
+
+      hold = Map.get(state.holds, issue_id) ->
+        {:ok, state, hold}
+
+      true ->
+        {:error, state, :issue_not_found}
+    end
+  end
+
+  defp stop_running_issue(%State{hold_store_available: false} = state, _issue_id, _running_entry) do
+    {:error, state, :hold_state_unavailable}
+  end
+
+  defp stop_running_issue(state, issue_id, running_entry) do
+    pending_hold =
+      issue_id
+      |> build_input_token_budget_hold(
+        running_entry,
+        "manual_stop",
+        Map.get(running_entry, :codex_input_tokens, 0)
+      )
+      |> Map.merge(%{limit: nil, cleanup_pending: true})
+
+    held_state = %{
+      state
+      | holds: Map.put(state.holds, issue_id, pending_hold),
+        claimed: MapSet.put(state.claimed, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+
+    case persist_holds(held_state) do
+      :ok -> finish_running_manual_stop(held_state, issue_id, pending_hold)
+      {:error, _reason} -> {:error, state, :hold_state_unavailable}
+    end
+  end
+
+  defp finish_running_manual_stop(held_state, issue_id, pending_hold) do
+    stopped_state =
+      held_state
+      |> terminate_running_issue(issue_id, false)
+      |> Map.update!(:claimed, &MapSet.put(&1, issue_id))
+
+    hold = Map.put(pending_hold, :cleanup_pending, false)
+    cleaned_state = %{stopped_state | holds: Map.put(stopped_state.holds, issue_id, hold)}
+
+    case persist_holds(cleaned_state) do
+      :ok ->
+        {:ok, cleaned_state, hold}
+
+      {:error, _reason} ->
+        unavailable_state = %{
+          stopped_state
+          | holds: Map.put(stopped_state.holds, issue_id, pending_hold),
+            hold_store_available: false
+        }
+
+        {:error, unavailable_state, :hold_state_unavailable}
+    end
+  end
+
+  defp stop_retrying_issue(%State{hold_store_available: false} = state, _issue_id, _retry_entry) do
+    {:error, state, :hold_state_unavailable}
+  end
+
+  defp stop_retrying_issue(state, issue_id, retry_entry) do
+    hold = %{
+      issue_id: issue_id,
+      identifier: retry_entry.identifier,
+      reason: "manual_stop",
+      limit: nil,
+      observed_tokens: 0,
+      issue_state: Map.get(retry_entry, :issue_state),
+      worker_host: Map.get(retry_entry, :worker_host),
+      workspace_path: Map.get(retry_entry, :workspace_path),
+      codex_app_server_pid: nil,
+      cleanup_pending: false,
+      held_at: DateTime.utc_now()
+    }
+
+    held_state = %{
+      state
+      | holds: Map.put(state.holds, issue_id, hold),
+        claimed: MapSet.put(state.claimed, issue_id),
+        retry_attempts: Map.delete(state.retry_attempts, issue_id)
+    }
+
+    case persist_holds(held_state) do
+      :ok ->
+        cancel_retry_timer(retry_entry)
+        {:ok, held_state, hold}
+
+      {:error, _reason} ->
+        {:error, state, :hold_state_unavailable}
+    end
+  end
+
+  defp persist_holds(%State{} = state) do
+    HoldStore.persist(Config.settings!().workspace.root, state.holds)
+  end
+
+  defp cancel_retry_timer(retry_entry) do
+    case Map.get(retry_entry, :timer_ref) do
+      timer_ref when is_reference(timer_ref) -> Process.cancel_timer(timer_ref)
+      _ -> :ok
+    end
   end
 
   defp authorize_resume(state, issue_id, hold, options) do
