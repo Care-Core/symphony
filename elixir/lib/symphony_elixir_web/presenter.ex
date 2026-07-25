@@ -106,6 +106,21 @@ defmodule SymphonyElixirWeb.Presenter do
     end
   end
 
+  @spec progress_payload(String.t(), map(), GenServer.name()) :: {:ok, map()} | {:error, atom()}
+  def progress_payload(issue_identifier, attributes, orchestrator) do
+    Orchestrator.record_progress(issue_identifier, attributes, orchestrator)
+  end
+
+  @spec review_payload(String.t(), map(), GenServer.name()) :: {:ok, map()} | {:error, atom()}
+  def review_payload(issue_identifier, attributes, orchestrator) do
+    Orchestrator.authorize_review(issue_identifier, attributes, orchestrator)
+  end
+
+  @spec wait_payload(String.t(), map(), GenServer.name()) :: {:ok, map()} | {:error, atom()}
+  def wait_payload(issue_identifier, attributes, orchestrator) do
+    Orchestrator.register_deferred_wait(issue_identifier, attributes, orchestrator)
+  end
+
   defp issue_payload_body(issue_identifier, running, retry, blocked, hold) do
     %{
       issue_identifier: issue_identifier,

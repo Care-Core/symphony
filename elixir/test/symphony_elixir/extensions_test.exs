@@ -81,6 +81,26 @@ defmodule SymphonyElixir.ExtensionsTest do
 
       {:reply, result, state}
     end
+
+    def handle_call({:record_progress, identifier, attributes}, _from, state) do
+      control_result(state, :progress, :record_progress_called, identifier, attributes)
+    end
+
+    def handle_call({:authorize_review, identifier, attributes}, _from, state) do
+      control_result(state, :review, :authorize_review_called, identifier, attributes)
+    end
+
+    def handle_call({:register_deferred_wait, identifier, attributes}, _from, state) do
+      control_result(state, :wait, :register_deferred_wait_called, identifier, attributes)
+    end
+
+    defp control_result(state, result_key, message, identifier, attributes) do
+      if test_pid = Keyword.get(state, :test_pid) do
+        send(test_pid, {message, identifier, attributes})
+      end
+
+      {:reply, Keyword.get(state, result_key, {:error, :issue_not_found}), state}
+    end
   end
 
   setup do
@@ -634,6 +654,138 @@ defmodule SymphonyElixir.ExtensionsTest do
            }
   end
 
+  test "phoenix control api forwards bounded progress, review, and deferred-wait transitions" do
+    orchestrator_name = Module.concat(__MODULE__, :ProgressControlApiOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        test_pid: self(),
+        snapshot: static_snapshot(),
+        progress:
+          {:ok,
+           %{
+             changed: true,
+             progress_fingerprint: "progress-hash",
+             review_fingerprint: "review-hash"
+           }},
+        review:
+          {:ok,
+           %{
+             authorized: true,
+             kind: "full",
+             review_round_count: 1,
+             review_fingerprint: "review-hash"
+           }},
+        wait:
+          {:ok,
+           %{
+             watcher_state: "waiting",
+             expected_head: "0123456789abcdef0123456789abcdef01234567",
+             timeout_seconds: 1_200
+           }}
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+
+    control_conn = fn ->
+      build_conn()
+      |> Plug.Conn.put_req_header("x-symphony-control-token", "test-control-token")
+    end
+
+    fingerprint = %{
+      "contract_revision" => "v2",
+      "head_sha" => "0123456789abcdef0123456789abcdef01234567"
+    }
+
+    progress_payload =
+      control_conn.()
+      |> post("/api/v1/MT-CONTROL/progress", %{
+        "fingerprint" => fingerprint,
+        "progress_kind" => "workpad_checkpoint",
+        "progress_receipt" => "linear-comment-1",
+        "ignored" => "not-forwarded"
+      })
+      |> json_response(200)
+
+    assert progress_payload == %{
+             "changed" => true,
+             "progress_fingerprint" => "progress-hash",
+             "review_fingerprint" => "review-hash"
+           }
+
+    assert_received {:record_progress_called, "MT-CONTROL",
+                     %{
+                       "fingerprint" => ^fingerprint,
+                       "progress_kind" => "workpad_checkpoint",
+                       "progress_receipt" => "linear-comment-1"
+                     }}
+
+    head = "0123456789abcdef0123456789abcdef01234567"
+
+    review_payload =
+      control_conn.()
+      |> post("/api/v1/MT-CONTROL/review", %{
+        "kind" => "full",
+        "review_fingerprint" => "review-hash",
+        "requested_head" => head,
+        "observed_local_head" => head,
+        "observed_remote_head" => head
+      })
+      |> json_response(200)
+
+    assert review_payload["authorized"] == true
+    assert review_payload["review_round_count"] == 1
+
+    assert_received {:authorize_review_called, "MT-CONTROL",
+                     %{
+                       "kind" => "full",
+                       "review_fingerprint" => "review-hash",
+                       "requested_head" => ^head,
+                       "observed_local_head" => ^head,
+                       "observed_remote_head" => ^head
+                     }}
+
+    wait_payload =
+      control_conn.()
+      |> post("/api/v1/MT-CONTROL/wait", %{
+        "expected_head" => head,
+        "receipt_path" => "/tmp/MT-CONTROL/output/checks.jsonl",
+        "timeout_seconds" => 1_200,
+        "waiter_script" => "/tmp/MT-CONTROL/scripts/symphony/wait-for-pr-checks.mjs",
+        "waiter_args" => [
+          "--collect-terminal",
+          "--head",
+          head,
+          "--output",
+          "/tmp/MT-CONTROL/output/checks.jsonl"
+        ]
+      })
+      |> json_response(200)
+
+    assert wait_payload == %{
+             "watcher_state" => "waiting",
+             "expected_head" => head,
+             "timeout_seconds" => 1_200
+           }
+
+    assert_received {:register_deferred_wait_called, "MT-CONTROL",
+                     %{
+                       "expected_head" => ^head,
+                       "receipt_path" => "/tmp/MT-CONTROL/output/checks.jsonl",
+                       "timeout_seconds" => 1_200,
+                       "waiter_script" => "/tmp/MT-CONTROL/scripts/symphony/wait-for-pr-checks.mjs",
+                       "waiter_args" => [
+                         "--collect-terminal",
+                         "--head",
+                         ^head,
+                         "--output",
+                         "/tmp/MT-CONTROL/output/checks.jsonl"
+                       ]
+                     }}
+  end
+
   test "phoenix resume api maps cleanup and hold persistence failures to safe responses" do
     orchestrator_name = Module.concat(__MODULE__, :FailedResumeControlApiOrchestrator)
 
@@ -644,6 +796,7 @@ defmodule SymphonyElixir.ExtensionsTest do
         resume: fn options ->
           case options do
             %{"phase" => "validation"} -> {:error, :cleanup_failed}
+            %{"phase" => "review-fix"} -> {:error, :progress_state_unavailable}
             _ -> {:error, :hold_state_unavailable}
           end
         end
@@ -675,6 +828,16 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert hold_payload["error"] == %{
              "code" => "hold_state_unavailable",
              "message" => "Durable hold state is unavailable"
+           }
+
+    progress_payload =
+      control_conn.()
+      |> post("/api/v1/MT-CONTROL/resume", %{"phase" => "review-fix"})
+      |> json_response(503)
+
+    assert progress_payload["error"] == %{
+             "code" => "progress_state_unavailable",
+             "message" => "Durable progress state is unavailable"
            }
   end
 

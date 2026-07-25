@@ -103,6 +103,9 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
       {:error, :tracker_unavailable} ->
         error_response(conn, 503, "tracker_unavailable", "Current issue tier could not be verified; the hold remains active")
 
+      {:error, :progress_state_unavailable} ->
+        error_response(conn, 503, "progress_state_unavailable", "Durable progress state is unavailable")
+
       {:error, :loopback_only} ->
         error_response(conn, 403, "loopback_only", "Control endpoints are available only on loopback")
 
@@ -112,6 +115,41 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
       {:error, :invalid_control_token} ->
         error_response(conn, 401, "invalid_control_token", "Invalid control token")
     end
+  end
+
+  @spec progress(Conn.t(), map()) :: Conn.t()
+  def progress(conn, %{"issue_identifier" => issue_identifier} = params) do
+    attributes = Map.take(params, ["fingerprint", "progress_kind", "progress_receipt"])
+    controlled_transition(conn, fn -> Presenter.progress_payload(issue_identifier, attributes, orchestrator()) end)
+  end
+
+  @spec review(Conn.t(), map()) :: Conn.t()
+  def review(conn, %{"issue_identifier" => issue_identifier} = params) do
+    attributes =
+      Map.take(params, [
+        "kind",
+        "review_fingerprint",
+        "requested_head",
+        "observed_local_head",
+        "observed_remote_head",
+        "human_override"
+      ])
+
+    controlled_transition(conn, fn -> Presenter.review_payload(issue_identifier, attributes, orchestrator()) end)
+  end
+
+  @spec wait(Conn.t(), map()) :: Conn.t()
+  def wait(conn, %{"issue_identifier" => issue_identifier} = params) do
+    attributes =
+      Map.take(params, [
+        "expected_head",
+        "receipt_path",
+        "timeout_seconds",
+        "waiter_script",
+        "waiter_args"
+      ])
+
+    controlled_transition(conn, fn -> Presenter.wait_payload(issue_identifier, attributes, orchestrator()) end)
   end
 
   @spec method_not_allowed(Conn.t(), map()) :: Conn.t()
@@ -128,6 +166,34 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     conn
     |> put_status(status)
     |> json(%{error: %{code: code, message: message}})
+  end
+
+  defp controlled_transition(conn, transition) do
+    with :ok <- require_control_access(conn),
+         {:ok, payload} <- transition.() do
+      json(conn, payload)
+    else
+      {:error, :issue_not_found} ->
+        error_response(conn, 404, "issue_not_found", "Issue not found")
+
+      {:error, :unavailable} ->
+        error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+
+      {:error, :progress_state_unavailable} ->
+        error_response(conn, 503, "progress_state_unavailable", "Durable progress state is unavailable")
+
+      {:error, :loopback_only} ->
+        error_response(conn, 403, "loopback_only", "Control endpoints are available only on loopback")
+
+      {:error, :control_token_not_configured} ->
+        error_response(conn, 503, "control_token_not_configured", "Control token is not configured")
+
+      {:error, :invalid_control_token} ->
+        error_response(conn, 401, "invalid_control_token", "Invalid control token")
+
+      {:error, reason} ->
+        error_response(conn, 422, Atom.to_string(reason), "Progress transition rejected: #{reason}")
+    end
   end
 
   defp orchestrator do
