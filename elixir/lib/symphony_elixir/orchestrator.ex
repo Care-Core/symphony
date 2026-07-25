@@ -1277,7 +1277,10 @@ defmodule SymphonyElixir.Orchestrator do
              attempt: attempt,
              worker_host: worker_host,
              resume_phase: phase_budget_value(phase_budget, :phase),
-             max_additional_input_tokens: phase_budget_value(phase_budget, :effective_additional_input_tokens)
+             max_additional_input_tokens: phase_budget_value(phase_budget, :effective_additional_input_tokens),
+             continue_after_turn: fn issue_id ->
+               continue_after_turn?(recipient, issue_id)
+             end
            )
          end) do
       {:ok, pid} ->
@@ -2788,6 +2791,10 @@ defmodule SymphonyElixir.Orchestrator do
           Map.get(running_entry, :codex_input_tokens, 0)
         )
     end
+  end
+
+  defp continue_after_turn?(server, issue_id) do
+    GenServer.call(server, {:continue_after_turn, issue_id}, 5_000)
   end
 
   defp waiting_watcher?(state, issue_id) do

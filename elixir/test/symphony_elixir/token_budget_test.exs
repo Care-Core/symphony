@@ -393,6 +393,32 @@ defmodule SymphonyElixir.TokenBudgetTest do
     refute_receive :stale_retry_dispatched
   end
 
+  test "agent runner leaves a deferred wait model-idle after the completed turn" do
+    issue = %Issue{
+      id: "issue-deferred-turn",
+      identifier: "MT-DEFERRED-TURN",
+      title: "Deferred turn",
+      state: "In Progress",
+      labels: []
+    }
+
+    assert :stop =
+             AgentRunner.continue_after_turn_for_test(issue,
+               continue_after_turn: fn "issue-deferred-turn" -> false end
+             )
+
+    assert :continue =
+             AgentRunner.continue_after_turn_for_test(issue,
+               continue_after_turn: fn "issue-deferred-turn" -> true end
+             )
+
+    assert :stop =
+             AgentRunner.continue_after_turn_for_test(issue,
+               resume_phase: "implementation",
+               continue_after_turn: fn _issue_id -> true end
+             )
+  end
+
   test "retry dispatch carries the bounded phase budget into the running attempt" do
     workspace_root =
       Path.join(System.tmp_dir!(), "symphony-budget-dispatch-#{System.unique_integer([:positive])}")
@@ -463,6 +489,7 @@ defmodule SymphonyElixir.TokenBudgetTest do
     assert opts[:attempt] == 1
     assert opts[:resume_phase] == "validation"
     assert opts[:max_additional_input_tokens] == 100
+    assert is_function(opts[:continue_after_turn], 1)
   end
 
   test "manual stop durably holds a running issue and preserves its workspace" do

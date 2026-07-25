@@ -200,6 +200,67 @@ codex:
 - `server.port` or CLI `--port` enables the optional Phoenix LiveView dashboard and JSON API at
   `/`, `/api/v1/state`, `/api/v1/<issue_identifier>`, and `/api/v1/refresh`.
 
+### Token budgets and durable holds
+
+Token budgets are optional Codex settings in `WORKFLOW.md`:
+
+```yaml
+codex:
+  input_token_limit: 5000000
+  input_token_limits_by_label:
+    Symphony Micro: 1000000
+    Symphony Normal: 5000000
+  input_token_warning_ratio: 0.70
+  input_token_checkpoint_grace: 500000
+```
+
+- `input_token_limit` is the default per-issue cap. Matching label caps are case-insensitive; when
+  more than one cap applies, Symphony uses the smallest one.
+- At `input_token_warning_ratio`, Symphony asks the active turn to checkpoint. After a delivered
+  warning, `input_token_checkpoint_grace` bounds the additional input tokens allowed before the
+  runner stops the worker and holds the issue. Reaching the hard cap also holds immediately.
+- Holds are private, atomic files under the workspace root. They survive runner restarts and
+  tracker-state changes, retain the claim and workspace, suppress automatic retries, and fail
+  closed if checkpoint delivery or durable-state persistence cannot be confirmed. Every bounded
+  attempt re-holds on exit.
+- Resuming a budget hold requires both a phase (`implementation`, `validation`, `review-fix`,
+  `hosted-closeout`, or `landing`) and a positive `max_additional_input_tokens`. The effective
+  allowance is the smaller of the request and the issue's current label cap. A bounded attempt
+  runs one completed agent turn before returning control to the orchestrator.
+- This port intentionally has no tracked-diff `no_progress` breaker. Progress receipts support
+  review and provider-state coordination; they do not enforce a fingerprint-based runaway counter.
+
+### Authenticated control and deferred waits
+
+Set a non-empty `SYMPHONY_CONTROL_TOKEN` before starting the optional HTTP server. Mutating routes
+accept only loopback requests carrying that exact value in `x-symphony-control-token`:
+
+- `POST /api/v1/<issue_identifier>/stop`
+- `POST /api/v1/<issue_identifier>/resume` with `phase` and `max_additional_input_tokens`
+- `POST /api/v1/<issue_identifier>/progress` with `fingerprint`, `progress_kind`, and
+  `progress_receipt`
+- `POST /api/v1/<issue_identifier>/review` with `kind`, `review_fingerprint`, `requested_head`,
+  `observed_local_head`, and `observed_remote_head`; an additional review round also requires the
+  recorded `human_override`
+- `POST /api/v1/<issue_identifier>/wait` with `expected_head`, a workspace-confined
+  `receipt_path`, `timeout_seconds`, `waiter_script`, and `waiter_args`
+
+Progress and review state is durable and fail-closed. Review authorization reuses an accepted full
+review only for the same exact fingerprint/head and otherwise allows the bounded full-then-delta
+sequence. A registered waiter runs outside the agent turn, persists provider transitions, keeps the
+model idle while the watcher is waiting, survives runner restart, and schedules one continuation on
+terminal truth, timeout, or head change. Replacing or manually stopping a waiter prevents the old
+waiter from waking the issue.
+
+### Managed-sandbox proof and review constraint
+
+Some managed macOS sandboxes deny `/bin/ps` with `Operation not permitted`. In that environment the
+proof-stack lease and isolated reviewer cannot safely discover or coordinate their processes. The
+runner does not bypass that restriction. For a ticket that requires either gate, use the approved
+operator-managed SSH lane on a host where process inspection is permitted and persist its receipt;
+without that lane and receipt, proof or security review remains blocked rather than being reported
+as complete.
+
 ### Linear adapter profile
 
 - Config: use `tracker.kind: linear` with `tracker.provider.endpoint` (default
