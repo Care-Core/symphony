@@ -18,17 +18,17 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
     assert {:error, :stale_review_head} =
              authorize_review(pid, issue, review_hash, "full", observed_local_head: @next_head)
 
-    assert {:ok, %{kind: "full", review_round_count: 1}} =
+    assert {:ok, %{kind: "full", review_round_count: 0}} =
              authorize_review(pid, issue, review_hash, "full")
 
-    provider_transition =
+    completed_full_review =
       progress_fingerprint()
-      |> Map.put(:hosted_receipt, %{"status" => "passed", "polls" => 2})
+      |> Map.put(:full_review_verdict, "pass")
 
-    assert {:ok, %{review_fingerprint: ^review_hash}} =
+    assert {:ok, %{changed: true, review_fingerprint: ^review_hash}} =
              Orchestrator.record_progress(
                issue.identifier,
-               progress_attributes(provider_transition, "provider-terminal", progress_kind: "provider_transition"),
+               progress_attributes(completed_full_review, "full-review-receipt", progress_kind: "review_receipt"),
                pid
              )
 
@@ -53,14 +53,77 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
     assert {:error, :full_review_already_completed} =
              authorize_review(pid, issue, changed_review_hash, "full", changed_head_options)
 
-    assert {:ok, %{kind: "delta", review_round_count: 2}} =
+    assert {:ok, %{kind: "delta", review_round_count: 1}} =
              authorize_review(pid, issue, changed_review_hash, "delta", changed_head_options)
+
+    completed_delta_review = Map.put(changed_head, :full_review_verdict, "pass")
+
+    assert {:ok, %{changed: true, review_fingerprint: ^changed_review_hash}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(completed_delta_review, "delta-review-receipt", progress_kind: "review_receipt"),
+               pid
+             )
 
     issue_id = issue.id
     assert {:ok, %{^issue_id => persisted}} = SymphonyElixir.HoldStore.load_progress(workspace_root)
     assert persisted["review_fingerprint_hash"] == changed_review_hash
     assert persisted["full_review_count"] == 1
     assert persisted["delta_review_count"] == 1
+
+    Process.exit(worker_pid, :shutdown)
+  end
+
+  test "review completion accounting starts only when the authorized receipt is sealed" do
+    {pid, issue, worker_pid, workspace_root, _workspace} =
+      start_progress_orchestrator("review-receipt-seal")
+
+    fingerprint = progress_fingerprint()
+
+    assert {:ok, %{changed: true, review_fingerprint: review_hash}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(fingerprint, "checkpoint-1"),
+               pid
+             )
+
+    assert {:ok, %{authorized: true, authorization: authorization}} =
+             authorize_review(pid, issue, review_hash, "full")
+
+    progress = :sys.get_state(pid).progress[issue.id]
+    assert progress["full_review_count"] == 0
+    assert progress["review_round_count"] == 0
+
+    issue_id = issue.id
+    assert {:ok, %{^issue_id => authorized}} = SymphonyElixir.HoldStore.load_progress(workspace_root)
+    assert authorized["full_review_count"] == 0
+    assert authorized["review_round_count"] == 0
+    assert authorized["last_review_authorization"] == authorization
+
+    completed_fingerprint = Map.put(fingerprint, :full_review_verdict, "pass")
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(completed_fingerprint, "review-receipt-1", progress_kind: "review_receipt"),
+               pid
+             )
+
+    completed = :sys.get_state(pid).progress[issue.id]
+    assert completed["full_review_count"] == 1
+    assert completed["review_round_count"] == 1
+    assert completed["last_completed_review_authorization"] == authorization
+    assert completed["last_review_receipt"] == "review-receipt-1"
+
+    assert {:ok, %{changed: false}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(completed_fingerprint, "review-receipt-1", progress_kind: "review_receipt"),
+               pid
+             )
+
+    assert :sys.get_state(pid).progress[issue.id]["full_review_count"] == 1
+    assert {:error, :full_review_already_completed} = authorize_review(pid, issue, review_hash, "full")
 
     Process.exit(worker_pid, :shutdown)
   end
@@ -449,6 +512,70 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
         get_in(state.progress, [issue.id, "watcher", "state"]) == "receipt_invalid" and
         get_in(state.progress, [issue.id, "watcher", "wake_count"]) == 1 and
         state.waiter_tasks == %{}
+    end)
+  end
+
+  test "a task-supervisor launch failure settles the durable watcher immediately" do
+    {pid, issue, _worker_pid, _workspace_root, workspace} =
+      start_progress_orchestrator("waiter-launch-failure")
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    :sys.replace_state(pid, fn state ->
+      %{state | task_supervisor: Module.concat(__MODULE__, :MissingTaskSupervisor)}
+    end)
+
+    receipt_path = Path.join(workspace, "output/launch-failure-checks.jsonl")
+
+    assert {:error, :waiter_launch_failed} =
+             Orchestrator.register_deferred_wait(
+               issue.identifier,
+               deferred_wait_attributes(workspace, receipt_path),
+               pid
+             )
+
+    assert Process.alive?(pid)
+    state = :sys.get_state(pid)
+    assert state.waiter_tasks == %{}
+    assert get_in(state.progress, [issue.id, "watcher", "state"]) == "receipt_invalid"
+    assert get_in(state.progress, [issue.id, "watcher", "wake_count"]) == 1
+  end
+
+  test "a waiter command startup exception settles the durable watcher immediately" do
+    {pid, issue, _worker_pid, _workspace_root, workspace} =
+      start_progress_orchestrator("waiter-command-failure")
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    waiter_script = Path.join(workspace, "broken-waiter-fixture.sh")
+    File.write!(waiter_script, "#!/definitely/missing\n")
+    File.chmod!(waiter_script, 0o600)
+    receipt_path = Path.join(workspace, "output/command-failure-checks.jsonl")
+
+    attributes =
+      workspace
+      |> deferred_wait_attributes(receipt_path)
+      |> Map.put(:waiter_script, waiter_script)
+
+    assert {:ok, %{watcher_state: "waiting"}} =
+             Orchestrator.register_deferred_wait(issue.identifier, attributes, pid)
+
+    assert_eventually(fn ->
+      state = :sys.get_state(pid)
+
+      state.waiter_tasks == %{} and
+        get_in(state.progress, [issue.id, "watcher", "state"]) == "receipt_invalid" and
+        get_in(state.progress, [issue.id, "watcher", "wake_count"]) == 1
     end)
   end
 

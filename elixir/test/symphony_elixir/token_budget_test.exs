@@ -120,6 +120,76 @@ defmodule SymphonyElixir.TokenBudgetTest do
     assert MapSet.member?(:sys.get_state(restarted_server).claimed, issue.id)
   end
 
+  test "relative persistence root stays anchored to WORKFLOW across a restart from another cwd" do
+    original_cwd = File.cwd!()
+    workflow_dir = Workflow.workflow_file_path() |> Path.expand() |> Path.dirname()
+    relative_root = "relative-workspaces"
+    workspace_root = Path.join(workflow_dir, relative_root)
+    other_cwd = Path.join(workflow_dir, "restart-cwd")
+
+    hold = %{
+      issue_id: "issue-relative-root",
+      identifier: "MT-RELATIVE-ROOT",
+      reason: "manual_stop",
+      limit: nil,
+      observed_tokens: 0,
+      issue_state: "In Progress",
+      held_at: DateTime.utc_now(),
+      cleanup_pending: false,
+      workspace_path: Path.join(workspace_root, "MT-RELATIVE-ROOT")
+    }
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: relative_root,
+      codex_input_token_limit: 100
+    )
+
+    File.mkdir_p!(other_cwd)
+    assert :ok = SymphonyElixir.HoldStore.persist(workspace_root, %{hold.issue_id => hold})
+
+    try do
+      File.cd!(workflow_dir)
+      first_name = Module.concat(__MODULE__, :RelativeRootFirst)
+      {:ok, first_pid} = Orchestrator.start_link(name: first_name)
+      assert [%{identifier: "MT-RELATIVE-ROOT"}] = Orchestrator.snapshot(first_name, 1_000).held
+      GenServer.stop(first_pid)
+
+      File.cd!(other_cwd)
+      restarted_name = Module.concat(__MODULE__, :RelativeRootRestarted)
+      {:ok, restarted_pid} = Orchestrator.start_link(name: restarted_name)
+
+      assert [%{identifier: "MT-RELATIVE-ROOT"}] =
+               Orchestrator.snapshot(restarted_name, 1_000).held
+
+      runtime_issue = %Issue{
+        id: "issue-relative-root-runtime",
+        identifier: "MT-RELATIVE-ROOT-RUNTIME",
+        title: "Relative persistence root runtime write",
+        state: "In Progress",
+        labels: []
+      }
+
+      worker_pid = spawn(fn -> Process.sleep(:infinity) end)
+      put_running_entry(restarted_pid, runtime_issue, worker_pid, input_token_limit: 100)
+      send_token_update(restarted_pid, runtime_issue.id, 100)
+
+      assert Enum.any?(
+               Orchestrator.snapshot(restarted_name, 1_000).held,
+               &(&1.identifier == runtime_issue.identifier)
+             )
+
+      runtime_issue_id = runtime_issue.id
+      assert {:ok, %{^runtime_issue_id => runtime_hold}} = SymphonyElixir.HoldStore.load(workspace_root)
+      assert runtime_hold.reason == "input_token_limit"
+      refute Process.alive?(worker_pid)
+
+      GenServer.stop(restarted_pid)
+    after
+      File.cd!(original_cwd)
+    end
+  end
+
   test "warning threshold fails closed when the live steering channel is unavailable" do
     {pid, server, issue, worker_pid, _workspace_root} =
       start_budget_orchestrator("warning-unsupported", 100)
@@ -222,6 +292,29 @@ defmodule SymphonyElixir.TokenBudgetTest do
 
     assert [%{input_token_warning_status: "delivered"}] =
              Orchestrator.snapshot(server, 1_000).running
+
+    running_ref = :sys.get_state(pid).running[issue.id].ref
+    send(pid, {:DOWN, running_ref, :process, worker_pid, :normal})
+
+    assert [%{reason: "input_token_checkpoint", warning_threshold: 70}] =
+             Orchestrator.snapshot(server, 1_000).held
+
+    assert Orchestrator.snapshot(server, 1_000).retrying == []
+  end
+
+  test "a worker exit while warning delivery is requested fails closed" do
+    {pid, server, issue, worker_pid, _workspace_root} =
+      start_budget_orchestrator("requested-warning-exit", 100)
+
+    put_running_entry(pid, issue, worker_pid,
+      input_token_limit: 100,
+      input_token_warning_ratio: 0.70,
+      input_token_checkpoint_grace: 10,
+      input_token_warning_sent: true,
+      input_token_warning_status: "requested",
+      input_token_warning_threshold: 70,
+      input_token_warning_observed_at: 70
+    )
 
     running_ref = :sys.get_state(pid).running[issue.id].ref
     send(pid, {:DOWN, running_ref, :process, worker_pid, :normal})
@@ -393,6 +486,87 @@ defmodule SymphonyElixir.TokenBudgetTest do
     refute_receive :stale_retry_dispatched
   end
 
+  test "a stalled bounded resume re-holds without falling through to ordinary dispatch" do
+    {pid, _server, issue, worker_pid, workspace_root} =
+      start_budget_orchestrator("resume-stall", 100)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: workspace_root,
+      codex_input_token_limit: 100,
+      codex_stall_timeout_ms: 1_000
+    )
+
+    issue = %{issue | dispatchable: true}
+    Application.put_env(:symphony_elixir, :memory_tracker_issues, [issue])
+    stalled_at = DateTime.add(DateTime.utc_now(), -5, :second)
+    workspace = Path.join(workspace_root, issue.identifier)
+
+    pending_hold = %{
+      issue_id: issue.id,
+      identifier: issue.identifier,
+      reason: "input_token_resume_pending",
+      limit: 100,
+      observed_tokens: 0,
+      resume_phase: "review-fix",
+      requested_additional_input_tokens: 200,
+      effective_additional_input_tokens: 100,
+      attempt_input_token_baseline: 0,
+      input_token_tier_limit: 100,
+      issue_state: issue.state,
+      worker_host: nil,
+      workspace_path: workspace,
+      codex_app_server_pid: nil,
+      cleanup_pending: false,
+      held_at: DateTime.utc_now()
+    }
+
+    assert :ok = SymphonyElixir.HoldStore.persist(workspace_root, %{issue.id => pending_hold})
+
+    put_running_entry(pid, issue, worker_pid,
+      workspace_path: workspace,
+      resume_phase: "review-fix",
+      requested_additional_input_tokens: 200,
+      effective_additional_input_tokens: 100,
+      input_token_tier_limit: 100,
+      input_token_limit: 100,
+      last_codex_timestamp: stalled_at,
+      started_at: stalled_at
+    )
+
+    test_pid = self()
+
+    :sys.replace_state(pid, fn state ->
+      %{
+        state
+        | holds: %{issue.id => pending_hold},
+          claimed: MapSet.put(state.claimed, issue.id),
+          agent_runner: fn _issue, _recipient, _opts ->
+            send(test_pid, :ordinary_dispatch)
+            Process.sleep(:infinity)
+          end
+      }
+    end)
+
+    send(pid, :tick)
+    Process.sleep(100)
+
+    state = :sys.get_state(pid)
+    refute Process.alive?(worker_pid)
+    assert state.running == %{}
+    assert state.retry_attempts == %{}
+    assert state.holds[issue.id].reason == "input_token_checkpoint_failed"
+    assert state.holds[issue.id].resume_phase == "review-fix"
+    assert MapSet.member?(state.claimed, issue.id)
+    refute Orchestrator.should_dispatch_issue_for_test(issue, %{state | claimed: MapSet.new()})
+    refute_receive :ordinary_dispatch
+
+    issue_id = issue.id
+    assert {:ok, %{^issue_id => persisted_hold}} = SymphonyElixir.HoldStore.load(workspace_root)
+    assert persisted_hold.reason == "input_token_checkpoint_failed"
+    assert persisted_hold.resume_phase == "review-fix"
+  end
+
   test "agent runner leaves a deferred wait model-idle after the completed turn" do
     issue = %Issue{
       id: "issue-deferred-turn",
@@ -514,6 +688,26 @@ defmodule SymphonyElixir.TokenBudgetTest do
     assert {:ok, %{^issue_id => persisted_hold}} = SymphonyElixir.HoldStore.load(workspace_root)
     assert persisted_hold.reason == "manual_stop"
     assert persisted_hold.workspace_path == workspace
+  end
+
+  test "manual stop fails closed when the initial hold cannot be persisted" do
+    {pid, server, issue, worker_pid, workspace_root} =
+      start_budget_orchestrator("manual-stop-persistence-failure", 100)
+
+    state_file = Path.join(workspace_root, ".symphony-holds.json")
+    File.mkdir_p!(state_file)
+    put_running_entry(pid, issue, worker_pid, [])
+
+    assert {:error, :hold_state_unavailable} = Orchestrator.stop_issue(issue.identifier, server)
+
+    state = :sys.get_state(pid)
+    assert state.running == %{}
+    assert state.retry_attempts == %{}
+    assert state.hold_store_available == false
+    assert state.holds[issue.id].reason == "manual_stop"
+    assert state.holds[issue.id].cleanup_pending == true
+    assert MapSet.member?(state.claimed, issue.id)
+    refute Process.alive?(worker_pid)
   end
 
   test "manual stop durably replaces a scheduled retry with a hold" do

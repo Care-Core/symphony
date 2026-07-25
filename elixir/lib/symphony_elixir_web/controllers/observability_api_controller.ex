@@ -12,18 +12,22 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
   @spec state(Conn.t(), map()) :: Conn.t()
   def state(conn, _params) do
-    json(conn, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()))
+    with_control_access(conn, fn ->
+      json(conn, Presenter.state_payload(orchestrator(), snapshot_timeout_ms()))
+    end)
   end
 
   @spec issue(Conn.t(), map()) :: Conn.t()
   def issue(conn, %{"issue_identifier" => issue_identifier}) do
-    case Presenter.issue_payload(issue_identifier, orchestrator(), snapshot_timeout_ms()) do
-      {:ok, payload} ->
-        json(conn, payload)
+    with_control_access(conn, fn ->
+      case Presenter.issue_payload(issue_identifier, orchestrator(), snapshot_timeout_ms()) do
+        {:ok, payload} ->
+          json(conn, payload)
 
-      {:error, :issue_not_found} ->
-        error_response(conn, 404, "issue_not_found", "Issue not found")
-    end
+        {:error, :issue_not_found} ->
+          error_response(conn, 404, "issue_not_found", "Issue not found")
+      end
+    end)
   end
 
   @spec refresh(Conn.t(), map()) :: Conn.t()
@@ -193,6 +197,15 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
 
       {:error, reason} ->
         error_response(conn, 422, Atom.to_string(reason), "Progress transition rejected: #{reason}")
+    end
+  end
+
+  defp with_control_access(conn, request) do
+    case require_control_access(conn) do
+      :ok -> request.()
+      {:error, :loopback_only} -> error_response(conn, 403, "loopback_only", "Control endpoints are available only on loopback")
+      {:error, :control_token_not_configured} -> error_response(conn, 503, "control_token_not_configured", "Control token is not configured")
+      {:error, :invalid_control_token} -> error_response(conn, 401, "invalid_control_token", "Invalid control token")
     end
   end
 

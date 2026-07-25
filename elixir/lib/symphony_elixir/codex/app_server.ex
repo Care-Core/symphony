@@ -10,6 +10,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @thread_start_id 2
   @turn_start_id 3
   @token_warning_steer_id "symphony-token-budget-warning"
+  @control_token_env "SYMPHONY_CONTROL_TOKEN"
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @type session :: %{
@@ -253,16 +254,22 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp tracker_secret_port_env(dynamic_tool_binding) do
-    dynamic_tool_binding.secret_environment_names
-    |> valid_environment_names()
+    dynamic_tool_binding
+    |> child_secret_environment_names()
     |> Enum.map(fn name -> {String.to_charlist(name), false} end)
   end
 
   defp tracker_secret_unset_command(dynamic_tool_binding) do
-    case dynamic_tool_binding.secret_environment_names |> valid_environment_names() do
+    case child_secret_environment_names(dynamic_tool_binding) do
       [] -> nil
       names -> "unset " <> Enum.join(names, " ")
     end
+  end
+
+  defp child_secret_environment_names(dynamic_tool_binding) do
+    [@control_token_env | dynamic_tool_binding.secret_environment_names]
+    |> valid_environment_names()
+    |> Enum.uniq()
   end
 
   defp valid_environment_names(names) do
@@ -419,59 +426,16 @@ defmodule SymphonyElixir.Codex.AppServer do
     payload_string = to_string(data)
 
     case Jason.decode(payload_string) do
-      {:ok, %{"method" => "turn/completed"} = payload} ->
-        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
-        {:ok, :turn_completed}
-
-      {:ok, %{"method" => "turn/failed", "params" => _} = payload} ->
-        emit_turn_event(
-          on_message,
-          :turn_failed,
-          payload,
-          payload_string,
-          port,
-          Map.get(payload, "params")
-        )
-
-        {:error, {:turn_failed, Map.get(payload, "params")}}
-
-      {:ok, %{"method" => "turn/cancelled", "params" => _} = payload} ->
-        emit_turn_event(
-          on_message,
-          :turn_cancelled,
-          payload,
-          payload_string,
-          port,
-          Map.get(payload, "params")
-        )
-
-        {:error, {:turn_cancelled, Map.get(payload, "params")}}
-
-      {:ok, %{"method" => method} = payload}
-      when is_binary(method) ->
-        handle_turn_method(
+      {:ok, payload} ->
+        handle_decoded_incoming(
           port,
           on_message,
           payload,
           payload_string,
-          method,
           timeout_ms,
           tool_executor,
           auto_approve_requests
         )
-
-      {:ok, payload} ->
-        emit_message(
-          on_message,
-          :other_message,
-          %{
-            payload: payload,
-            raw: payload_string
-          },
-          metadata_from_message(port, payload)
-        )
-
-        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
 
       {:error, _reason} ->
         log_non_json_stream_line(payload_string, "turn stream")
@@ -487,6 +451,109 @@ defmodule SymphonyElixir.Codex.AppServer do
             metadata_from_message(port, %{raw: payload_string})
           )
         end
+
+        receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+    end
+  end
+
+  defp handle_decoded_incoming(
+         port,
+         on_message,
+         %{"id" => @token_warning_steer_id, "result" => _result} = payload,
+         payload_string,
+         timeout_ms,
+         tool_executor,
+         auto_approve_requests
+       ) do
+    emit_message(
+      on_message,
+      :token_budget_warning_delivered,
+      %{payload: payload, raw: payload_string},
+      metadata_from_message(port, payload)
+    )
+
+    receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+  end
+
+  defp handle_decoded_incoming(
+         port,
+         on_message,
+         %{"id" => @token_warning_steer_id, "error" => _error} = payload,
+         payload_string,
+         timeout_ms,
+         tool_executor,
+         auto_approve_requests
+       ) do
+    emit_message(
+      on_message,
+      :token_budget_warning_unsupported,
+      %{payload: payload, raw: payload_string},
+      metadata_from_message(port, payload)
+    )
+
+    receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
+  end
+
+  defp handle_decoded_incoming(
+         port,
+         on_message,
+         payload,
+         payload_string,
+         timeout_ms,
+         tool_executor,
+         auto_approve_requests
+       ) do
+    case payload do
+      %{"method" => "turn/completed"} ->
+        emit_turn_event(on_message, :turn_completed, payload, payload_string, port, payload)
+        {:ok, :turn_completed}
+
+      %{"method" => "turn/failed", "params" => _} ->
+        emit_turn_event(
+          on_message,
+          :turn_failed,
+          payload,
+          payload_string,
+          port,
+          Map.get(payload, "params")
+        )
+
+        {:error, {:turn_failed, Map.get(payload, "params")}}
+
+      %{"method" => "turn/cancelled", "params" => _} ->
+        emit_turn_event(
+          on_message,
+          :turn_cancelled,
+          payload,
+          payload_string,
+          port,
+          Map.get(payload, "params")
+        )
+
+        {:error, {:turn_cancelled, Map.get(payload, "params")}}
+
+      %{"method" => method} when is_binary(method) ->
+        handle_turn_method(
+          port,
+          on_message,
+          payload,
+          payload_string,
+          method,
+          timeout_ms,
+          tool_executor,
+          auto_approve_requests
+        )
+
+      _other ->
+        emit_message(
+          on_message,
+          :other_message,
+          %{
+            payload: payload,
+            raw: payload_string
+          },
+          metadata_from_message(port, payload)
+        )
 
         receive_loop(port, on_message, timeout_ms, "", tool_executor, auto_approve_requests)
     end

@@ -79,8 +79,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp init_with_config(config, opts) do
-    with {:ok, holds} <- HoldStore.load(config.workspace.root),
-         {:ok, progress} <- HoldStore.load_progress(config.workspace.root) do
+    workspace_root = Config.local_workspace_root()
+
+    with {:ok, holds} <- HoldStore.load(workspace_root),
+         {:ok, progress} <- HoldStore.load_progress(workspace_root) do
       state = initial_state(config, opts, holds, progress)
 
       if map_size(holds) > 0 do
@@ -281,7 +283,7 @@ defmodule SymphonyElixir.Orchestrator do
       waiting_watcher?(state, issue_id) ->
         defer_running_issue(state, issue_id, running_entry, session_id)
 
-      Map.get(running_entry, :input_token_warning_status) == "delivered" ->
+      Map.get(running_entry, :input_token_warning_status) in ["requested", "delivered"] ->
         hold_exited_input_token_budget_issue(
           state,
           issue_id,
@@ -317,7 +319,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp handle_agent_down(reason, state, issue_id, running_entry, session_id) do
     cond do
-      Map.get(running_entry, :input_token_warning_status) == "delivered" ->
+      Map.get(running_entry, :input_token_warning_status) in ["requested", "delivered"] ->
         hold_exited_input_token_budget_issue(
           state,
           issue_id,
@@ -834,7 +836,7 @@ defmodule SymphonyElixir.Orchestrator do
 
     held_state = %{state | holds: Map.put(state.holds, issue_id, hold)}
 
-    case HoldStore.persist(Config.settings!().workspace.root, held_state.holds) do
+    case HoldStore.persist(Config.local_workspace_root(), held_state.holds) do
       :ok ->
         held_state
         |> terminate_running_issue(issue_id, false)
@@ -855,7 +857,7 @@ defmodule SymphonyElixir.Orchestrator do
     hold = build_input_token_budget_hold(issue_id, running_entry, reason, observed)
     held_state = %{state | holds: Map.put(state.holds, issue_id, hold)}
 
-    case HoldStore.persist(Config.settings!().workspace.root, held_state.holds) do
+    case HoldStore.persist(Config.local_workspace_root(), held_state.holds) do
       :ok ->
         %{held_state | claimed: MapSet.put(held_state.claimed, issue_id)}
 
@@ -924,26 +926,40 @@ defmodule SymphonyElixir.Orchestrator do
       identifier = Map.get(running_entry, :identifier, issue_id)
       session_id = running_entry_session_id(running_entry)
 
-      if input_required_blocker?(running_entry) do
-        error = blocker_error(running_entry, "stalled for #{elapsed_ms}ms after Codex requested operator input")
+      cond do
+        Map.get(running_entry, :input_token_warning_status) in ["requested", "delivered"] or
+            is_binary(Map.get(running_entry, :resume_phase)) ->
+          Logger.warning("Bounded issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; re-holding before further work")
 
-        Logger.warning("Issue blocked: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; #{error}")
+          hold_input_token_budget_issue(
+            state,
+            issue_id,
+            running_entry,
+            "input_token_checkpoint_failed",
+            Map.get(running_entry, :codex_input_tokens, 0)
+          )
 
-        state
-        |> record_session_completion_totals(running_entry)
-        |> stop_and_block_issue(issue_id, running_entry, error)
-      else
-        Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+        input_required_blocker?(running_entry) ->
+          error = blocker_error(running_entry, "stalled for #{elapsed_ms}ms after Codex requested operator input")
 
-        next_attempt = next_retry_attempt_from_running(running_entry)
+          Logger.warning("Issue blocked: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; #{error}")
 
-        state
-        |> terminate_running_issue(issue_id, false)
-        |> schedule_issue_retry(issue_id, next_attempt, %{
-          identifier: identifier,
-          issue_url: running_entry.issue.url,
-          error: "stalled for #{elapsed_ms}ms without codex activity"
-        })
+          state
+          |> record_session_completion_totals(running_entry)
+          |> stop_and_block_issue(issue_id, running_entry, error)
+
+        true ->
+          Logger.warning("Issue stalled: issue_id=#{issue_id} issue_identifier=#{identifier} session_id=#{session_id} elapsed_ms=#{elapsed_ms}; restarting with backoff")
+
+          next_attempt = next_retry_attempt_from_running(running_entry)
+
+          state
+          |> terminate_running_issue(issue_id, false)
+          |> schedule_issue_retry(issue_id, next_attempt, %{
+            identifier: identifier,
+            issue_url: running_entry.issue.url,
+            error: "stalled for #{elapsed_ms}ms without codex activity"
+          })
       end
     else
       state
@@ -1129,6 +1145,7 @@ defmodule SymphonyElixir.Orchestrator do
        ) do
     candidate_issue?(issue, active_states, terminal_states) and
       !MapSet.member?(claimed, issue.id) and
+      !Map.has_key?(state.holds, issue.id) and
       !Map.has_key?(running, issue.id) and
       !Map.has_key?(blocked, issue.id) and
       available_slots(state) > 0 and
@@ -2114,8 +2131,17 @@ defmodule SymphonyElixir.Orchestrator do
     }
 
     case persist_holds(held_state) do
-      :ok -> finish_running_manual_stop(held_state, issue_id, pending_hold)
-      {:error, _reason} -> {:error, state, :hold_state_unavailable}
+      :ok ->
+        finish_running_manual_stop(held_state, issue_id, pending_hold)
+
+      {:error, _reason} ->
+        unavailable_state =
+          held_state
+          |> Map.put(:hold_store_available, false)
+          |> terminate_running_issue(issue_id, false)
+          |> Map.update!(:claimed, &MapSet.put(&1, issue_id))
+
+        {:error, unavailable_state, :hold_state_unavailable}
     end
   end
 
@@ -2180,7 +2206,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp persist_holds(%State{} = state) do
-    HoldStore.persist(Config.settings!().workspace.root, state.holds)
+    HoldStore.persist(Config.local_workspace_root(), state.holds)
   end
 
   defp cancel_retry_timer(retry_entry) do
@@ -2282,7 +2308,7 @@ defmodule SymphonyElixir.Orchestrator do
         claimed: MapSet.put(state.claimed, issue_id)
     }
 
-    case HoldStore.persist(Config.settings!().workspace.root, authorized_state.holds) do
+    case HoldStore.persist(Config.local_workspace_root(), authorized_state.holds) do
       :ok -> finish_phase_resume(authorized_state, issue_id, pending_hold, phase_budget)
       {:error, _reason} -> {:reply, {:error, :hold_state_unavailable}, state}
     end
@@ -2325,42 +2351,89 @@ defmodule SymphonyElixir.Orchestrator do
          {:ok, progress_kind} <-
            normalize_progress_kind(option_value(attributes, :progress_kind)),
          {:ok, progress_receipt} <-
-           normalize_progress_receipt(option_value(attributes, :progress_receipt)),
-         existing =
-           Map.get(state.progress, issue_id) ||
-             new_progress_entry(state, issue_id, issue_identifier),
-         :ok <- validate_review_receipt_authorization(existing, progress_kind, fingerprint) do
-      progress_hash = canonical_hash(fingerprint)
-      review_hash = canonical_hash(Map.take(fingerprint, @review_fingerprint_fields))
+           normalize_progress_receipt(option_value(attributes, :progress_receipt)) do
+      existing =
+        Map.get(state.progress, issue_id) ||
+          new_progress_entry(state, issue_id, issue_identifier)
 
-      if progress_hash == Map.get(existing, "progress_fingerprint_hash") do
-        {:ok, state,
-         %{
-           changed: false,
-           progress_fingerprint: progress_hash,
-           review_fingerprint: review_hash
-         }}
-      else
-        updated =
-          existing
-          |> update_review_identity(fingerprint, review_hash)
-          |> Map.merge(%{
-            "fingerprint" => fingerprint,
-            "progress_fingerprint_hash" => progress_hash,
-            "review_fingerprint_hash" => review_hash,
-            "last_progress_kind" => progress_kind,
-            "last_progress_receipt" => progress_receipt,
-            "updated_at" => DateTime.utc_now() |> DateTime.to_iso8601()
-          })
-
-        persist_progress_entry(state, issue_id, updated, %{
-          changed: true,
-          progress_fingerprint: progress_hash,
-          review_fingerprint: review_hash
-        })
-      end
+      record_progress_entry(
+        state,
+        issue_id,
+        existing,
+        fingerprint,
+        progress_kind,
+        progress_receipt
+      )
     else
       nil -> {:error, :issue_not_found, state}
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp record_progress_entry(
+         state,
+         issue_id,
+         existing,
+         fingerprint,
+         progress_kind,
+         progress_receipt
+       ) do
+    progress_hash = canonical_hash(fingerprint)
+    review_hash = canonical_hash(Map.take(fingerprint, @review_fingerprint_fields))
+
+    if progress_hash == Map.get(existing, "progress_fingerprint_hash") and
+         progress_receipt == Map.get(existing, "last_progress_receipt") do
+      {:ok, state,
+       %{
+         changed: false,
+         progress_fingerprint: progress_hash,
+         review_fingerprint: review_hash
+       }}
+    else
+      persist_progress_change(
+        state,
+        issue_id,
+        existing,
+        fingerprint,
+        progress_kind,
+        progress_receipt,
+        progress_hash,
+        review_hash
+      )
+    end
+  end
+
+  defp persist_progress_change(
+         state,
+         issue_id,
+         existing,
+         fingerprint,
+         progress_kind,
+         progress_receipt,
+         progress_hash,
+         review_hash
+       ) do
+    with :ok <- validate_review_receipt_authorization(existing, progress_kind, fingerprint),
+         {:ok, updated} <-
+           existing
+           |> update_review_identity(fingerprint, review_hash)
+           |> complete_review_receipt(progress_kind, progress_receipt) do
+      updated =
+        Map.merge(updated, %{
+          "fingerprint" => fingerprint,
+          "progress_fingerprint_hash" => progress_hash,
+          "review_fingerprint_hash" => review_hash,
+          "last_progress_kind" => progress_kind,
+          "last_progress_receipt" => progress_receipt,
+          "updated_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+        })
+
+      persist_progress_entry(state, issue_id, updated, %{
+        changed: true,
+        progress_fingerprint: progress_hash,
+        review_fingerprint: review_hash
+      })
+    else
       {:error, reason} -> {:error, reason, state}
     end
   end
@@ -2386,7 +2459,7 @@ defmodule SymphonyElixir.Orchestrator do
          true <- fingerprint_contains_head?(Map.get(progress, "fingerprint", %{}), requested_head),
          ^requested_head <- option_value(attributes, :observed_local_head),
          ^requested_head <- option_value(attributes, :observed_remote_head),
-         {:ok, updated} <-
+         {:ok, _eligible} <-
            increment_review_round(progress, kind, option_value(attributes, :human_override)) do
       authorization =
         canonical_hash(%{
@@ -2394,15 +2467,17 @@ defmodule SymphonyElixir.Orchestrator do
           kind: kind,
           review_fingerprint: requested_fingerprint,
           requested_head: requested_head,
-          round: Map.get(updated, "review_round_count", 0),
+          round: Map.get(progress, "review_round_count", 0) + 1,
           issued_at: System.unique_integer([:positive, :monotonic])
         })
 
       updated =
-        updated
+        progress
         |> Map.put("last_review_authorization", authorization)
         |> Map.put("last_review_authorized_head", requested_head)
         |> Map.put("last_review_authorized_fingerprint", requested_fingerprint)
+        |> Map.put("last_review_authorized_kind", kind)
+        |> Map.put("last_review_authorized_override", option_value(attributes, :human_override))
         |> Map.put("updated_at", DateTime.utc_now() |> DateTime.to_iso8601())
 
       persist_progress_entry(state, issue_id, updated, %{
@@ -2524,8 +2599,16 @@ defmodule SymphonyElixir.Orchestrator do
         schedule_deferred_watcher_poll(issue_id, Map.fetch!(watcher, "token"))
         {:ok, launched_state, receipt}
 
-      {:error, reason} ->
-        {:error, reason, state}
+      {:error, {:waiter_launch_failed, reason}} ->
+        settled_state =
+          settle_missing_waiter_receipt(
+            state,
+            issue_id,
+            Map.fetch!(watcher, "token"),
+            {:waiter_launch_failed, reason}
+          )
+
+        {:error, :waiter_launch_failed, settled_state}
     end
   end
 
@@ -2699,6 +2782,29 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp validate_review_receipt_authorization(_progress, _kind, _fingerprint), do: :ok
 
+  defp complete_review_receipt(progress, "review_receipt", receipt) do
+    authorization = Map.get(progress, "last_review_authorization")
+    kind = Map.get(progress, "last_review_authorized_kind")
+    override = Map.get(progress, "last_review_authorized_override")
+
+    with true <- is_binary(authorization) and kind in @review_kinds,
+         {:ok, completed} <- increment_review_round(progress, kind, override) do
+      {:ok,
+       completed
+       |> Map.put("last_completed_review_authorization", authorization)
+       |> Map.put("last_review_receipt", receipt)
+       |> Map.delete("last_review_authorized_head")
+       |> Map.delete("last_review_authorized_fingerprint")
+       |> Map.delete("last_review_authorized_kind")
+       |> Map.delete("last_review_authorized_override")}
+    else
+      false -> {:error, :review_authorization_mismatch}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp complete_review_receipt(progress, _kind, _receipt), do: {:ok, progress}
+
   defp update_review_identity(existing, fingerprint, review_hash) do
     prior_fingerprint = Map.get(existing, "fingerprint", %{})
     prior_review_hash = Map.get(existing, "review_fingerprint_hash")
@@ -2761,7 +2867,7 @@ defmodule SymphonyElixir.Orchestrator do
   defp persist_progress_entry(state, issue_id, entry, receipt) do
     progress = Map.put(state.progress, issue_id, entry)
 
-    case HoldStore.persist_progress(Config.settings!().workspace.root, progress) do
+    case HoldStore.persist_progress(Config.local_workspace_root(), progress) do
       :ok ->
         {:ok, %{state | progress: progress, progress_state_available: true}, receipt}
 
@@ -2878,10 +2984,21 @@ defmodule SymphonyElixir.Orchestrator do
     watcher_token = Map.fetch!(watcher, "token")
     orchestrator = self()
 
-    case Task.Supervisor.start_child(state.task_supervisor, fn ->
-           result = System.cmd(script, args, cd: workspace_path, stderr_to_stdout: true)
-           send(orchestrator, {:deferred_waiter_exit, issue_id, watcher_token, summarize_waiter_result(result)})
-         end) do
+    start_result =
+      try do
+        Task.Supervisor.start_child(state.task_supervisor, fn ->
+          result = run_waiter_command(script, args, workspace_path)
+
+          send(
+            orchestrator,
+            {:deferred_waiter_exit, issue_id, watcher_token, summarize_waiter_result(result)}
+          )
+        end)
+      catch
+        :exit, reason -> {:error, reason}
+      end
+
+    case start_result do
       {:ok, task_pid} ->
         task = %{pid: task_pid, token: watcher_token}
         {:ok, %{state | waiter_tasks: Map.put(state.waiter_tasks, issue_id, task)}}
@@ -2891,8 +3008,18 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp summarize_waiter_result({_output, status}) when is_integer(status),
+  defp run_waiter_command(script, args, workspace_path) do
+    {:ok, System.cmd(script, args, cd: workspace_path, stderr_to_stdout: true)}
+  rescue
+    exception -> {:error, {:exception, Exception.message(exception)}}
+  catch
+    kind, reason -> {:error, {kind, reason}}
+  end
+
+  defp summarize_waiter_result({:ok, {_output, status}}) when is_integer(status),
     do: {:exit_status, status}
+
+  defp summarize_waiter_result({:error, reason}), do: {:waiter_command_failed, reason}
 
   defp remove_deferred_waiter_task(state, issue_id, watcher_token) do
     case Map.get(state.waiter_tasks, issue_id) do
@@ -3115,7 +3242,7 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp persist_progress_map(state, progress, issue_id) do
-    case HoldStore.persist_progress(Config.settings!().workspace.root, progress) do
+    case HoldStore.persist_progress(Config.local_workspace_root(), progress) do
       :ok ->
         %{state | progress: progress, progress_state_available: true}
 

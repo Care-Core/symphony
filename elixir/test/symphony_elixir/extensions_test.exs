@@ -308,12 +308,18 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
-    conn = get(build_conn(), "/api/v1/state")
+    conn = get(control_conn(), "/api/v1/state")
     state_payload = json_response(conn, 200)
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1, "held" => 0},
+             "counts" => %{
+               "running" => 1,
+               "deferred" => 0,
+               "retrying" => 1,
+               "blocked" => 1,
+               "held" => 0
+             },
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -331,6 +337,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
                }
              ],
+             "deferred" => [],
              "retrying" => [
                %{
                  "issue_id" => "issue-retry",
@@ -369,7 +376,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              "rate_limits" => %{"primary" => %{"remaining" => 11}}
            }
 
-    conn = get(build_conn(), "/api/v1/MT-HTTP")
+    conn = get(control_conn(), "/api/v1/MT-HTTP")
     issue_payload = json_response(conn, 200)
 
     assert issue_payload == %{
@@ -393,6 +400,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                "last_event_at" => nil,
                "tokens" => %{"input_tokens" => 4, "output_tokens" => 8, "total_tokens" => 12}
              },
+             "deferred" => nil,
              "retry" => nil,
              "blocked" => nil,
              "hold" => nil,
@@ -402,12 +410,12 @@ defmodule SymphonyElixir.ExtensionsTest do
              "tracked" => %{}
            }
 
-    conn = get(build_conn(), "/api/v1/MT-RETRY")
+    conn = get(control_conn(), "/api/v1/MT-RETRY")
 
     assert %{"status" => "retrying", "retry" => %{"attempt" => 2, "error" => "boom"}} =
              json_response(conn, 200)
 
-    conn = get(build_conn(), "/api/v1/MT-BLOCKED")
+    conn = get(control_conn(), "/api/v1/MT-BLOCKED")
 
     assert %{
              "status" => "blocked",
@@ -419,7 +427,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              }
            } = json_response(conn, 200)
 
-    conn = get(build_conn(), "/api/v1/MT-MISSING")
+    conn = get(control_conn(), "/api/v1/MT-MISSING")
 
     assert json_response(conn, 404) == %{
              "error" => %{"code" => "issue_not_found", "message" => "Issue not found"}
@@ -457,7 +465,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
 
-    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    state_payload = json_response(get(control_conn(), "/api/v1/state"), 200)
 
     assert state_payload["counts"]["held"] == 1
 
@@ -489,7 +497,61 @@ defmodule SymphonyElixir.ExtensionsTest do
                "observed_tokens" => 42,
                "cleanup_pending" => false
              }
-           } = json_response(get(build_conn(), "/api/v1/MT-HELD"), 200)
+           } = json_response(get(control_conn(), "/api/v1/MT-HELD"), 200)
+  end
+
+  test "phoenix observability api keeps deferred issues visible in state and issue views" do
+    started_at = DateTime.utc_now()
+
+    deferred = %{
+      issue_id: "issue-deferred",
+      identifier: "MT-DEFERRED",
+      state: "deferred_wait",
+      worker_host: "dm-dev2",
+      workspace_path: "/workspaces/MT-DEFERRED",
+      started_at: started_at
+    }
+
+    orchestrator_name = Module.concat(__MODULE__, :DeferredObservabilityApiOrchestrator)
+
+    {:ok, _pid} =
+      StaticOrchestrator.start_link(
+        name: orchestrator_name,
+        snapshot: Map.put(static_snapshot(), :deferred, [deferred])
+      )
+
+    start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
+
+    state_payload = json_response(get(control_conn(), "/api/v1/state"), 200)
+
+    assert state_payload["counts"]["deferred"] == 1
+
+    assert state_payload["deferred"] == [
+             %{
+               "issue_id" => "issue-deferred",
+               "issue_identifier" => "MT-DEFERRED",
+               "state" => "deferred_wait",
+               "worker_host" => "dm-dev2",
+               "workspace_path" => "/workspaces/MT-DEFERRED",
+               "started_at" => started_at |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+             }
+           ]
+
+    assert %{
+             "issue_id" => "issue-deferred",
+             "issue_identifier" => "MT-DEFERRED",
+             "status" => "deferred_wait",
+             "workspace" => %{"host" => "dm-dev2", "path" => "/workspaces/MT-DEFERRED"},
+             "running" => nil,
+             "deferred" => %{
+               "state" => "deferred_wait",
+               "worker_host" => "dm-dev2",
+               "workspace_path" => "/workspaces/MT-DEFERRED"
+             },
+             "retry" => nil,
+             "blocked" => nil,
+             "hold" => nil
+           } = json_response(get(control_conn(), "/api/v1/MT-DEFERRED"), 200)
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -511,7 +573,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert json_response(get(build_conn(), "/unknown"), 404) ==
              %{"error" => %{"code" => "not_found", "message" => "Route not found"}}
 
-    state_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    state_payload = json_response(get(control_conn(), "/api/v1/state"), 200)
 
     assert state_payload ==
              %{
@@ -538,9 +600,18 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert json_response(post(build_conn(), "/api/v1/UNKNOWN/stop", %{}), 503)["error"]["code"] ==
              "control_token_not_configured"
 
+    assert json_response(get(build_conn(), "/api/v1/state"), 503)["error"]["code"] ==
+             "control_token_not_configured"
+
     System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
 
     assert json_response(post(build_conn(), "/api/v1/UNKNOWN/stop", %{}), 401)["error"]["code"] ==
+             "invalid_control_token"
+
+    assert json_response(get(build_conn(), "/api/v1/state"), 401)["error"]["code"] ==
+             "invalid_control_token"
+
+    assert json_response(get(build_conn(), "/api/v1/MT-HTTP"), 401)["error"]["code"] ==
              "invalid_control_token"
 
     authorized_conn =
@@ -550,12 +621,18 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert json_response(post(authorized_conn, "/api/v1/UNKNOWN/stop", %{}), 404)["error"]["code"] ==
              "issue_not_found"
 
+    assert json_response(get(authorized_conn, "/api/v1/state"), 200)["counts"]["running"] == 1
+    assert json_response(get(authorized_conn, "/api/v1/MT-HTTP"), 200)["status"] == "running"
+
     remote_conn =
       build_conn()
       |> Plug.Conn.put_req_header("x-symphony-control-token", "test-control-token")
       |> then(&%{&1 | remote_ip: {10, 0, 0, 1}})
 
     assert json_response(post(remote_conn, "/api/v1/UNKNOWN/resume", %{}), 403)["error"]["code"] ==
+             "loopback_only"
+
+    assert json_response(get(remote_conn, "/api/v1/state"), 403)["error"]["code"] ==
              "loopback_only"
   end
 
@@ -937,7 +1014,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     {:ok, _pid} = SlowOrchestrator.start_link(name: timeout_orchestrator)
     start_test_endpoint(orchestrator: timeout_orchestrator, snapshot_timeout_ms: 1)
 
-    timeout_payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+    timeout_payload = json_response(get(control_conn(), "/api/v1/state"), 200)
 
     assert timeout_payload ==
              %{
@@ -1126,11 +1203,18 @@ defmodule SymphonyElixir.ExtensionsTest do
     port = wait_for_bound_port()
     assert port == HttpServer.bound_port()
 
-    response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
+    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+
+    response =
+      Req.get!("http://127.0.0.1:#{port}/api/v1/state",
+        headers: [{"x-symphony-control-token", "test-control-token"}]
+      )
+
     assert response.status == 200
 
     assert response.body["counts"] == %{
              "running" => 1,
+             "deferred" => 0,
              "retrying" => 1,
              "blocked" => 1,
              "held" => 0
@@ -1174,6 +1258,13 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, endpoint_config)
     start_supervised!({SymphonyElixirWeb.Endpoint, []})
+  end
+
+  defp control_conn do
+    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+
+    build_conn()
+    |> Plug.Conn.put_req_header("x-symphony-control-token", "test-control-token")
   end
 
   defp static_snapshot do

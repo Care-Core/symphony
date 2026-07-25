@@ -1394,7 +1394,87 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server does not pass tracker credentials to the local Codex child" do
+  test "app server reports successful token-warning steer delivery" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-steer-response-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-STEER")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+        case "$count" in
+          1) printf '%s\n' '{"id":1,"result":{}}' ;;
+          2) ;;
+          3) printf '%s\n' '{"id":2,"result":{"thread":{"id":"thread-steer"}}}' ;;
+          4) printf '%s\n' '{"id":3,"result":{"turn":{"id":"turn-steer"}}}' ;;
+          5)
+            printf '%s\n' '{"id":"symphony-token-budget-warning","result":{}}'
+            printf '%s\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *) exit 0 ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-steer-response",
+        identifier: "MT-STEER",
+        title: "Confirm steer response",
+        state: "In Progress",
+        labels: []
+      }
+
+      test_pid = self()
+      on_message = fn message -> send(test_pid, {:app_server_message, message}) end
+
+      task =
+        Task.async(fn ->
+          AppServer.run(workspace, "Confirm steer response", issue, on_message: on_message)
+        end)
+
+      assert_receive {:app_server_message,
+                      %{
+                        event: :session_started,
+                        codex_app_server_port: port,
+                        thread_id: "thread-steer",
+                        turn_id: "turn-steer"
+                      }},
+                     1_000
+
+      assert :ok = AppServer.steer_turn(port, "thread-steer", "turn-steer", "Checkpoint")
+
+      assert_receive {:app_server_message,
+                      %{
+                        event: :token_budget_warning_delivered,
+                        payload: %{"id" => "symphony-token-budget-warning", "result" => %{}}
+                      }},
+                     1_000
+
+      assert {:ok, _result} = Task.await(task, 1_000)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server does not pass tracker or control credentials to the local Codex child" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -1405,12 +1485,14 @@ defmodule SymphonyElixir.AppServerTest do
     profile_marker_env = "SYMP_TEST_BASH_PROFILE_LOADED_#{System.unique_integer([:positive])}"
     previous_secret = System.get_env("LINEAR_API_KEY")
     previous_custom_secret = System.get_env(custom_secret_env)
+    previous_control_token = System.get_env("SYMPHONY_CONTROL_TOKEN")
     previous_home = System.get_env("HOME")
     previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
 
     on_exit(fn ->
       restore_env("LINEAR_API_KEY", previous_secret)
       restore_env(custom_secret_env, previous_custom_secret)
+      restore_env("SYMPHONY_CONTROL_TOKEN", previous_control_token)
       restore_env("HOME", previous_home)
       restore_env("SYMP_TEST_CODEx_TRACE", previous_trace)
     end)
@@ -1428,11 +1510,13 @@ defmodule SymphonyElixir.AppServerTest do
       File.write!(Path.join(bash_home, ".bash_profile"), """
       export LINEAR_API_KEY='profile-canonical-secret-that-must-not-reach-child'
       export #{custom_secret_env}='profile-custom-secret-that-must-not-reach-child'
+      export SYMPHONY_CONTROL_TOKEN='profile-control-secret-that-must-not-reach-child'
       export #{profile_marker_env}=1
       """)
 
       System.put_env("LINEAR_API_KEY", "canonical-secret-that-must-not-reach-child")
       System.put_env(custom_secret_env, "custom-secret-that-must-not-reach-child")
+      System.put_env("SYMPHONY_CONTROL_TOKEN", "control-secret-that-must-not-reach-child")
       System.put_env("HOME", bash_home)
       System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
 
@@ -1442,6 +1526,7 @@ defmodule SymphonyElixir.AppServerTest do
       printf 'PROFILE_LOADED:%s\n' "$#{profile_marker_env}" >> "$trace_file"
       printf 'CANONICAL_SECRET:%s\n' "$LINEAR_API_KEY" >> "$trace_file"
       printf 'CUSTOM_SECRET:%s\n' "$#{custom_secret_env}" >> "$trace_file"
+      printf 'CONTROL_SECRET:%s\n' "$SYMPHONY_CONTROL_TOKEN" >> "$trace_file"
       count=0
 
       while IFS= read -r line; do
@@ -1490,6 +1575,7 @@ defmodule SymphonyElixir.AppServerTest do
       assert File.read!(trace_file) =~ "PROFILE_LOADED:1\n"
       assert File.read!(trace_file) =~ "CANONICAL_SECRET:\n"
       assert File.read!(trace_file) =~ "CUSTOM_SECRET:\n"
+      assert File.read!(trace_file) =~ "CONTROL_SECRET:\n"
       refute File.read!(trace_file) =~ "secret-that-must-not-reach-child"
     after
       File.rm_rf(test_root)
@@ -1583,7 +1669,7 @@ defmodule SymphonyElixir.AppServerTest do
       assert argv_line =~ "-T -p 2200 worker-01 bash -lc"
       assert argv_line =~ "cd "
       assert argv_line =~ remote_workspace
-      assert argv_line =~ "unset LINEAR_API_KEY"
+      assert argv_line =~ "unset SYMPHONY_CONTROL_TOKEN LINEAR_API_KEY"
       assert argv_line =~ "exec "
       assert argv_line =~ "fake-remote-codex app-server"
 
