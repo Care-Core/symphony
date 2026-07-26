@@ -31,9 +31,12 @@ If a claimed issue moves to a terminal state (`Done`, `Closed`, `Cancelled`, or 
 Symphony stops the active agent for that issue and cleans up matching workspaces.
 
 If Codex reports that operator input, approval, or MCP elicitation is required, Symphony keeps the
-issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. Blocked
-entries are in memory only; restarting the orchestrator clears that blocked map, so any still-active
-tracker issue can become a dispatch candidate again after restart.
+issue claimed and exposes it as blocked in the runtime state, JSON API, and dashboard. When
+`codex.auto_approve_connector_tools` is enabled, well-formed connector `mcp_tool_call`
+elicitations are the narrow exception: Symphony accepts them for the current session and logs the
+issue, connector, tool, and decision. Unknown, malformed, disabled, and non-connector elicitations
+remain blocked. Blocked entries are in memory only; restarting the orchestrator clears that blocked
+map, so any still-active tracker issue can become a dispatch candidate again after restart.
 
 ## How to use it
 
@@ -151,6 +154,7 @@ Notes:
   case and surrounding whitespace. A blank configured label matches no issue.
 - Safer Codex defaults are used when policy fields are omitted:
   - `codex.approval_policy` defaults to `{"reject":{"sandbox_approval":true,"rules":true,"mcp_elicitations":true}}`
+  - `codex.auto_approve_connector_tools` defaults to `false`
   - `codex.thread_sandbox` defaults to `workspace-write`
   - `codex.turn_sandbox_policy` defaults to a `workspaceWrite` policy rooted at the current issue workspace
 - `codex.turn_timeout_ms` is the maximum silence interval while a turn is streaming. Each
