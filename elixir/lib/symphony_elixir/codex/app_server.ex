@@ -96,15 +96,19 @@ defmodule SymphonyElixir.Codex.AppServer do
         DynamicTool.execute(tool, arguments, dynamic_tool_binding, issue: issue)
       end)
 
-    approval_context = %{
-      auto_approve_connector_tools: auto_approve_connector_tools,
-      auto_approve_requests: auto_approve_requests,
-      issue: issue
-    }
-
     case start_turn(port, thread_id, prompt, issue, workspace, approval_policy, turn_sandbox_policy) do
       {:ok, turn_id} ->
         session_id = "#{thread_id}-#{turn_id}"
+
+        approval_context = %{
+          answered_connector_elicitation_ids: MapSet.new(),
+          auto_approve_connector_tools: auto_approve_connector_tools,
+          auto_approve_requests: auto_approve_requests,
+          issue: issue,
+          thread_id: thread_id,
+          turn_id: turn_id
+        }
+
         Logger.info("Codex session started for #{issue_context(issue)} session_id=#{session_id}")
 
         emit_message(
@@ -616,6 +620,16 @@ defmodule SymphonyElixir.Codex.AppServer do
       :approved ->
         receive_loop(port, on_message, timeout_ms, "", tool_executor, approval_context)
 
+      {:approved, updated_approval_context} ->
+        receive_loop(
+          port,
+          on_message,
+          timeout_ms,
+          "",
+          tool_executor,
+          updated_approval_context
+        )
+
       :approval_required ->
         emit_message(
           on_message,
@@ -847,7 +861,7 @@ defmodule SymphonyElixir.Codex.AppServer do
         payload,
         params,
         meta,
-        approval_context.auto_approve_connector_tools
+        approval_context
       )
 
     log_connector_elicitation_decision(approval_context.issue, params, meta, decision)
@@ -869,33 +883,64 @@ defmodule SymphonyElixir.Codex.AppServer do
           metadata
         )
 
-        :approved
+        {:approved,
+         Map.update!(
+           approval_context,
+           :answered_connector_elicitation_ids,
+           &MapSet.put(&1, id)
+         )}
 
       {:decline, _reason} ->
         :input_required
     end
   end
 
-  defp connector_elicitation_decision(payload, params, meta, true)
+  defp connector_elicitation_decision(
+         payload,
+         params,
+         meta,
+         %{
+           answered_connector_elicitation_ids: answered_ids,
+           auto_approve_connector_tools: true,
+           thread_id: active_thread_id,
+           turn_id: active_turn_id
+         }
+       )
        when is_map(payload) and is_map(params) and is_map(meta) do
     with id when is_binary(id) or is_integer(id) <- Map.get(payload, "id"),
+         ^active_thread_id <- Map.get(params, "threadId"),
+         ^active_turn_id <- Map.get(params, "turnId"),
          "form" <- Map.get(params, "mode"),
          server_name when is_binary(server_name) and server_name != "" <- Map.get(params, "serverName"),
          message when is_binary(message) <- Map.get(params, "message"),
          requested_schema when is_map(requested_schema) <- Map.get(params, "requestedSchema"),
          "mcp_tool_call" <- Map.get(meta, "codex_approval_kind"),
          "connector" <- Map.get(meta, "source") do
-      {:approve, id}
+      if MapSet.member?(answered_ids, id) do
+        {:decline, :already_answered}
+      else
+        {:approve, id}
+      end
     else
       _ -> {:decline, :non_connector_or_malformed}
     end
   end
 
-  defp connector_elicitation_decision(_payload, _params, _meta, true),
-    do: {:decline, :non_connector_or_malformed}
+  defp connector_elicitation_decision(
+         _payload,
+         _params,
+         _meta,
+         %{auto_approve_connector_tools: true}
+       ),
+       do: {:decline, :non_connector_or_malformed}
 
-  defp connector_elicitation_decision(_payload, _params, _meta, false),
-    do: {:decline, :config_disabled}
+  defp connector_elicitation_decision(
+         _payload,
+         _params,
+         _meta,
+         %{auto_approve_connector_tools: false}
+       ),
+       do: {:decline, :config_disabled}
 
   defp log_connector_elicitation_decision(issue, params, meta, {decision, reason}) do
     connector_name =

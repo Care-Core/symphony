@@ -512,6 +512,118 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server leaves a well-formed connector elicitation with an unknown approval kind unanswered" do
+    params =
+      connector_elicitation_params()
+      |> put_in(["_meta", "codex_approval_kind"], "unknown_kind")
+
+    assert_connector_elicitation_requires_input("unknown-kind", params)
+  end
+
+  test "app server leaves a well-formed non-connector elicitation unanswered" do
+    params =
+      connector_elicitation_params()
+      |> put_in(["_meta", "source"], "mcp_server")
+
+    assert_connector_elicitation_requires_input("non-connector-source", params)
+  end
+
+  test "app server leaves connector elicitations with exactly one required meta field missing unanswered" do
+    for key <- ["codex_approval_kind", "source"] do
+      params = update_in(connector_elicitation_params(), ["_meta"], &Map.delete(&1, key))
+      assert_connector_elicitation_requires_input("missing-#{key}", params)
+    end
+  end
+
+  test "app server leaves stale or mismatched connector elicitations unanswered" do
+    assert_connector_elicitation_requires_input(
+      "mismatched-thread",
+      Map.put(connector_elicitation_params(), "threadId", "thread-stale")
+    )
+
+    assert_connector_elicitation_requires_input(
+      "mismatched-turn",
+      Map.put(connector_elicitation_params(), "turnId", "turn-stale")
+    )
+  end
+
+  test "app server never answers the same connector elicitation request id twice" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-duplicate-elicitation-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-REPLAY")
+      codex_binary = Path.join(test_root, "fake-codex")
+      response_trace = Path.join(test_root, "elicitation-responses.jsonl")
+      request = connector_elicitation_request("elicitation-replayed")
+      request_json = Jason.encode!(request)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-review"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-review"}}}'
+            ;;
+          4)
+            printf '%s\\n' '#{request_json}'
+            ;;
+          5)
+            printf '%s\\n' "$line" >> "#{response_trace}"
+            printf '%s\\n' '#{request_json}'
+            ;;
+          6)
+            printf '%s\\n' "$line" >> "#{response_trace}"
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      enable_connector_auto_approval!()
+
+      issue = connector_elicitation_issue("replay")
+
+      assert {:error, {:turn_input_required, ^request}} =
+               AppServer.run(workspace, "Use the connector", issue)
+
+      responses =
+        response_trace
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.map(&Jason.decode!/1)
+
+      assert [%{"id" => "elicitation-replayed", "result" => %{"action" => "accept"}}] = responses
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server config off-switch leaves connector tool elicitations as hard input blockers" do
     test_root =
       Path.join(
@@ -1896,5 +2008,114 @@ defmodule SymphonyElixir.AppServerTest do
 
     File.write!(workflow_path, updated_workflow)
     :ok = WorkflowStore.force_reload()
+  end
+
+  defp assert_connector_elicitation_requires_input(test_name, params) do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-#{test_name}-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-BOUNDARY")
+      codex_binary = Path.join(test_root, "fake-codex")
+      response_trace = Path.join(test_root, "unexpected-elicitation-response.json")
+      request = connector_elicitation_request("elicitation-#{test_name}", params)
+      request_json = Jason.encode!(request)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-review"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-review"}}}'
+            ;;
+          4)
+            printf '%s\\n' '#{request_json}'
+            ;;
+          5)
+            printf '%s\\n' "$line" > "#{response_trace}"
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      enable_connector_auto_approval!()
+
+      issue = connector_elicitation_issue(test_name)
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:turn_input_required, ^request}} =
+                   AppServer.run(workspace, "Use the connector", issue)
+        end)
+
+      refute File.exists?(response_trace)
+      assert log =~ "decision=decline"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  defp connector_elicitation_request(id, params \\ connector_elicitation_params()) do
+    %{
+      "id" => id,
+      "method" => "mcpServer/elicitation/request",
+      "params" => params
+    }
+  end
+
+  defp connector_elicitation_params do
+    %{
+      "threadId" => "thread-review",
+      "turnId" => "turn-review",
+      "serverName" => "codex_apps",
+      "mode" => "form",
+      "message" => "Allow connector tool?",
+      "requestedSchema" => %{"type" => "object", "properties" => %{}},
+      "_meta" => %{
+        "codex_approval_kind" => "mcp_tool_call",
+        "source" => "connector",
+        "persist" => ["session", "always"],
+        "connector_name" => "Linear",
+        "tool_name" => "linear_graphql"
+      }
+    }
+  end
+
+  defp connector_elicitation_issue(suffix) do
+    %Issue{
+      id: "issue-connector-elicitation-#{suffix}",
+      identifier: "MT-BOUNDARY",
+      title: "Connector elicitation boundary",
+      description: "Keep unauthorized connector elicitations unanswered",
+      state: "In Progress",
+      url: "https://example.org/issues/MT-BOUNDARY",
+      labels: ["backend"]
+    }
   end
 end
