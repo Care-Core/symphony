@@ -1899,6 +1899,7 @@ defmodule SymphonyElixir.Orchestrator do
           last_codex_event: metadata.last_codex_event,
           runtime_seconds: running_seconds(metadata.started_at, now)
         }
+        |> Map.merge(progress_metadata(state, issue_id))
       end)
 
     retrying =
@@ -2034,9 +2035,10 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp find_known_issue_id(%State{} = state, issue_identifier) do
     find_issue_id_by_identifier(state.running, issue_identifier) ||
+      find_issue_id_by_identifier(state.deferred, issue_identifier) ||
       find_issue_id_by_identifier(state.retry_attempts, issue_identifier) ||
       find_issue_id_by_identifier(state.holds, issue_identifier) ||
-      find_issue_id_by_identifier(state.progress, issue_identifier)
+      find_issue_id_by_identifier(state.blocked, issue_identifier)
   end
 
   defp find_hold_by_identifier(holds, issue_identifier) do
@@ -3398,6 +3400,16 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp canonical_term(value) when is_list(value), do: Enum.map(value, &canonical_term/1)
   defp canonical_term(value), do: value
+
+  defp progress_metadata(state, issue_id) do
+    progress = Map.get(state.progress, issue_id, %{})
+
+    %{
+      progress_fingerprint: Map.get(progress, "fingerprint"),
+      progress_fingerprint_hash: Map.get(progress, "progress_fingerprint_hash"),
+      review_fingerprint_hash: Map.get(progress, "review_fingerprint_hash")
+    }
+  end
 
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state
   defp blocked_issue_state(_metadata), do: nil

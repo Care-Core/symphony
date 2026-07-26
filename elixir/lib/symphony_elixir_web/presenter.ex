@@ -192,6 +192,7 @@ defmodule SymphonyElixirWeb.Presenter do
         total_tokens: entry.codex_total_tokens
       }
     }
+    |> Map.merge(progress_payload(entry))
   end
 
   defp deferred_entry_payload(entry) do
@@ -267,6 +268,7 @@ defmodule SymphonyElixirWeb.Presenter do
         total_tokens: running.codex_total_tokens
       }
     }
+    |> Map.merge(progress_payload(running))
   end
 
   defp deferred_issue_payload(deferred) do
@@ -324,6 +326,16 @@ defmodule SymphonyElixirWeb.Presenter do
 
   defp summarize_message(nil), do: nil
   defp summarize_message(message), do: StatusDashboard.humanize_codex_message(message)
+
+  defp progress_payload(entry) do
+    [
+      progress_fingerprint: Map.get(entry, :progress_fingerprint),
+      progress_fingerprint_hash: Map.get(entry, :progress_fingerprint_hash),
+      review_fingerprint_hash: Map.get(entry, :review_fingerprint_hash)
+    ]
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
+  end
 
   defp due_at_iso8601(due_in_ms) when is_integer(due_in_ms) do
     DateTime.utc_now()

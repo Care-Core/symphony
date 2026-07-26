@@ -1,8 +1,49 @@
 defmodule SymphonyElixir.ProgressEfficiencyTest do
   use SymphonyElixir.TestSupport
 
+  alias SymphonyElixirWeb.Presenter
+
   @head "0123456789abcdef0123456789abcdef01234567"
   @next_head "fedcba9876543210fedcba9876543210fedcba98"
+
+  test "live issue payload exposes a registered review fingerprint and stop-exit fails closed" do
+    {pid, issue, _worker_pid, workspace_root, _workspace} =
+      start_progress_orchestrator("review-fingerprint-visibility")
+
+    assert {:ok, %{changed: true, review_fingerprint: review_hash}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    {:registered_name, orchestrator_name} = Process.info(pid, :registered_name)
+
+    assert {:ok, %{running: %{review_fingerprint_hash: ^review_hash}}} =
+             Presenter.issue_payload(issue.identifier, orchestrator_name, 1_000)
+
+    assert {:ok, %{authorized: true, review_fingerprint: ^review_hash}} =
+             authorize_review(pid, issue, review_hash, "full")
+
+    stopped_issue = %{issue | state: "Blocked"}
+
+    stopped_state =
+      Orchestrator.reconcile_issue_states_for_test(
+        [stopped_issue],
+        :sys.get_state(pid)
+      )
+
+    :sys.replace_state(pid, fn _state -> stopped_state end)
+
+    issue_id = issue.id
+    assert {:ok, %{^issue_id => persisted}} = SymphonyElixir.HoldStore.load_progress(workspace_root)
+    assert persisted["review_fingerprint_hash"] == review_hash
+
+    assert {:error, :issue_not_found} =
+             Presenter.issue_payload(issue.identifier, orchestrator_name, 1_000)
+
+    assert {:error, :issue_not_found} = authorize_review(pid, issue, review_hash, "full")
+  end
 
   test "review authorization reuses an exact-head full review and requires delta after a head change" do
     {pid, issue, worker_pid, workspace_root, _workspace} =
@@ -786,9 +827,12 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
       last_codex_message: nil,
       last_codex_timestamp: nil,
       last_codex_event: nil,
+      codex_app_server_pid: nil,
       codex_input_tokens: 0,
       codex_output_tokens: 0,
       codex_total_tokens: 0,
+      input_token_warning_status: nil,
+      input_token_warning_threshold: nil,
       turn_count: 1,
       retry_attempt: 0,
       started_at: DateTime.utc_now()
