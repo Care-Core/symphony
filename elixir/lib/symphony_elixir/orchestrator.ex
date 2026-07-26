@@ -698,6 +698,8 @@ defmodule SymphonyElixir.Orchestrator do
           cleanup_issue_workspace(Map.get(running_entry, :issue, identifier), running_entry)
         end
 
+        state = clear_pending_resume_hold(state, issue_id)
+
         %{
           state
           | running: Map.delete(state.running, issue_id),
@@ -1623,12 +1625,44 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp release_issue_claim(%State{} = state, issue_id) do
+    state = clear_pending_resume_hold(state, issue_id)
+
     %{
       state
       | claimed: MapSet.delete(state.claimed, issue_id),
         blocked: Map.delete(state.blocked, issue_id),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
+  end
+
+  # An `input_token_resume_pending` record is transient bookkeeping for an armed
+  # resume; it must not outlive the attempt it authorized. Durable budget holds
+  # (checkpoint/grace/limit/manual) are deliberately preserved here — the resume
+  # API remains their only exit.
+  defp clear_pending_resume_hold(%State{} = state, issue_id) do
+    case Map.get(state.holds, issue_id) do
+      %{reason: @phase_resume_pending_reason} ->
+        cleared = %{state | holds: Map.delete(state.holds, issue_id)}
+
+        case HoldStore.persist(Config.local_workspace_root(), cleared.holds) do
+          :ok ->
+            Logger.info(
+              "Cleared stale armed-resume hold for issue_id=#{issue_id} on attempt conclusion"
+            )
+
+            cleared
+
+          {:error, reason} ->
+            Logger.warning(
+              "Failed to persist cleared armed-resume hold for issue_id=#{issue_id}: #{inspect(reason)}; keeping hold"
+            )
+
+            state
+        end
+
+      _ ->
+        state
+    end
   end
 
   defp retry_delay(attempt, metadata) when is_integer(attempt) and attempt > 0 and is_map(metadata) do
