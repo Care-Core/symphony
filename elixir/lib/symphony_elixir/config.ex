@@ -22,6 +22,7 @@ defmodule SymphonyElixir.Config do
 
   @type codex_runtime_settings :: %{
           approval_policy: String.t() | map(),
+          auto_approve_connector_tools: boolean(),
           thread_sandbox: String.t(),
           turn_sandbox_policy: map()
         }
@@ -128,6 +129,7 @@ defmodule SymphonyElixir.Config do
         {:ok,
          %{
            approval_policy: settings.codex.approval_policy,
+           auto_approve_connector_tools: settings.codex.auto_approve_connector_tools,
            thread_sandbox: settings.codex.thread_sandbox,
            turn_sandbox_policy: turn_sandbox_policy
          }}

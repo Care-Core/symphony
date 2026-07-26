@@ -351,7 +351,95 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
-  test "app server treats MCP elicitation requests as hard input blockers" do
+  test "app server auto-approves connector tool elicitations for the session and logs the decision" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-connector-elicitation-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-187")
+      codex_binary = Path.join(test_root, "fake-codex")
+      response_trace = Path.join(test_root, "elicitation-response.json")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-187"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-187"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":"elicitation-187","method":"mcpServer/elicitation/request","params":{"threadId":"thread-187","turnId":"turn-187","serverName":"codex_apps","mode":"form","message":"Allow connector tool?","requestedSchema":{"type":"object","properties":{}},"_meta":{"codex_approval_kind":"mcp_tool_call","source":"connector","persist":["session","always"],"connector_name":"Linear","tool_name":"linear_graphql"}}}'
+            ;;
+          5)
+            printf '%s\\n' "$line" > "#{response_trace}"
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      enable_connector_auto_approval!()
+
+      issue = %Issue{
+        id: "issue-connector-elicitation",
+        identifier: "MT-187",
+        title: "Connector elicitation",
+        description: "Approve the connector tool",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-187",
+        labels: ["backend"]
+      }
+
+      log =
+        capture_log(fn ->
+          assert {:ok, _result} = AppServer.run(workspace, "Use the connector", issue)
+        end)
+
+      assert response_trace |> File.read!() |> Jason.decode!() == %{
+               "id" => "elicitation-187",
+               "result" => %{
+                 "action" => "accept",
+                 "content" => nil,
+                 "_meta" => %{"persist" => "session"}
+               }
+             }
+
+      assert log =~
+               "Codex connector elicitation decision issue_id=issue-connector-elicitation " <>
+                 "issue_identifier=MT-187"
+
+      assert log =~ ~s(connector_name="Linear" tool_name="linear_graphql" decision=approve)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server leaves unknown MCP elicitations as hard input blockers and logs decline" do
     test_root =
       Path.join(
         System.tmp_dir!(),
@@ -397,6 +485,8 @@ defmodule SymphonyElixir.AppServerTest do
         codex_command: "#{codex_binary} app-server"
       )
 
+      enable_connector_auto_approval!()
+
       issue = %Issue{
         id: "issue-mcp-elicitation",
         identifier: "MT-188",
@@ -407,10 +497,87 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["backend"]
       }
 
-      assert {:error, {:turn_input_required, payload}} =
-               AppServer.run(workspace, "Needs MCP input", issue)
+      log =
+        capture_log(fn ->
+          assert {:error, {:turn_input_required, payload}} =
+                   AppServer.run(workspace, "Needs MCP input", issue)
 
-      assert payload["method"] == "mcpServer/elicitation/request"
+          assert payload["method"] == "mcpServer/elicitation/request"
+        end)
+
+      assert log =~
+               ~s(connector_name="unknown" tool_name="unknown" decision=decline reason=non_connector_or_malformed)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server config off-switch leaves connector tool elicitations as hard input blockers" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-connector-elicitation-off-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-189")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-189"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-189"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"id":"elicitation-189","method":"mcpServer/elicitation/request","params":{"threadId":"thread-189","turnId":"turn-189","serverName":"codex_apps","mode":"form","message":"Allow connector tool?","requestedSchema":{"type":"object","properties":{}},"_meta":{"codex_approval_kind":"mcp_tool_call","source":"connector","persist":"session","connector_name":"Linear","tool_name":"linear_graphql"}}}'
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      issue = %Issue{
+        id: "issue-connector-elicitation-off",
+        identifier: "MT-189",
+        title: "Connector elicitation disabled",
+        description: "Keep connector approval disabled",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-189",
+        labels: ["backend"]
+      }
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:turn_input_required, payload}} =
+                   AppServer.run(workspace, "Use the connector", issue)
+
+          assert payload["method"] == "mcpServer/elicitation/request"
+        end)
+
+      assert log =~
+               ~s(connector_name="Linear" tool_name="linear_graphql" decision=decline reason=config_disabled)
     after
       File.rm_rf(test_root)
     end
@@ -1713,5 +1880,21 @@ defmodule SymphonyElixir.AppServerTest do
     after
       File.rm_rf(test_root)
     end
+  end
+
+  defp enable_connector_auto_approval! do
+    workflow_path = Workflow.workflow_file_path()
+    workflow = File.read!(workflow_path)
+
+    updated_workflow =
+      String.replace(
+        workflow,
+        "  approval_policy:",
+        "  auto_approve_connector_tools: true\n  approval_policy:",
+        global: false
+      )
+
+    File.write!(workflow_path, updated_workflow)
+    :ok = WorkflowStore.force_reload()
   end
 end

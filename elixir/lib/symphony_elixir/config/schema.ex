@@ -192,6 +192,7 @@ defmodule SymphonyElixir.Config.Schema do
 
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:turn_sandbox_policy, :map)
+      field(:auto_approve_connector_tools, :boolean, default: false)
       field(:turn_timeout_ms, :integer, default: 3_600_000)
       field(:read_timeout_ms, :integer, default: 5_000)
       field(:stall_timeout_ms, :integer, default: 300_000)
@@ -211,6 +212,7 @@ defmodule SymphonyElixir.Config.Schema do
           :approval_policy,
           :thread_sandbox,
           :turn_sandbox_policy,
+          :auto_approve_connector_tools,
           :turn_timeout_ms,
           :read_timeout_ms,
           :stall_timeout_ms,
