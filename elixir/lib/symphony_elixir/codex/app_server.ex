@@ -13,6 +13,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @control_token_env "SYMPHONY_CONTROL_TOKEN"
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
+  @max_answered_connector_elicitation_ids 256
   @type session :: %{
           port: port(),
           metadata: map(),
@@ -916,10 +917,15 @@ defmodule SymphonyElixir.Codex.AppServer do
          requested_schema when is_map(requested_schema) <- Map.get(params, "requestedSchema"),
          "mcp_tool_call" <- Map.get(meta, "codex_approval_kind"),
          "connector" <- Map.get(meta, "source") do
-      if MapSet.member?(answered_ids, id) do
-        {:decline, :already_answered}
-      else
-        {:approve, id}
+      cond do
+        MapSet.member?(answered_ids, id) ->
+          {:decline, :already_answered}
+
+        MapSet.size(answered_ids) >= @max_answered_connector_elicitation_ids ->
+          {:decline, :answered_connector_elicitation_id_cap_reached}
+
+        true ->
+          {:approve, id}
       end
     else
       _ -> {:decline, :non_connector_or_malformed}

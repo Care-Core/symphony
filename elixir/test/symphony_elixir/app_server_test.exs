@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.AppServerTest do
   use SymphonyElixir.TestSupport
 
+  @max_answered_connector_elicitation_ids 256
+
   test "app server rejects the workspace root and paths outside workspace root" do
     test_root =
       Path.join(
@@ -619,6 +621,102 @@ defmodule SymphonyElixir.AppServerTest do
         |> Enum.map(&Jason.decode!/1)
 
       assert [%{"id" => "elicitation-replayed", "result" => %{"action" => "accept"}}] = responses
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server caps answered connector elicitation ids without reopening replay" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-elicitation-cap-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-CAP")
+      codex_binary = Path.join(test_root, "fake-codex")
+      response_trace = Path.join(test_root, "elicitation-responses.jsonl")
+      params_json = connector_elicitation_params() |> Jason.encode!()
+
+      first_declined_request =
+        connector_elicitation_request("elicitation-cap-#{@max_answered_connector_elicitation_ids + 1}")
+
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-review"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-review"}}}'
+            ;;
+          4)
+            printf '{"id":"elicitation-cap-%s","method":"mcpServer/elicitation/request","params":#{params_json}}\\n' 1
+            ;;
+          *)
+            printf '%s\\n' "$line" >> "#{response_trace}"
+
+            if [ "$count" -le #{@max_answered_connector_elicitation_ids + 4} ]; then
+              request_number=$((count - 3))
+              printf '{"id":"elicitation-cap-%s","method":"mcpServer/elicitation/request","params":#{params_json}}\\n' "$request_number"
+            else
+              printf '%s\\n' '{"method":"turn/completed"}'
+              exit 0
+            fi
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server"
+      )
+
+      enable_connector_auto_approval!()
+
+      log =
+        capture_log(fn ->
+          assert {:error, {:turn_input_required, ^first_declined_request}} =
+                   AppServer.run(
+                     workspace,
+                     "Use connectors until the per-turn approval cap",
+                     connector_elicitation_issue("cap")
+                   )
+        end)
+
+      responses =
+        response_trace
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.map(&Jason.decode!/1)
+
+      assert length(responses) == @max_answered_connector_elicitation_ids
+
+      assert List.last(responses) == %{
+               "id" => "elicitation-cap-#{@max_answered_connector_elicitation_ids}",
+               "result" => %{
+                 "action" => "accept",
+                 "content" => nil,
+                 "_meta" => %{"persist" => "session"}
+               }
+             }
+
+      assert log =~
+               "decision=decline reason=answered_connector_elicitation_id_cap_reached"
     after
       File.rm_rf(test_root)
     end
