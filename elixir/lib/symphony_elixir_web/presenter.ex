@@ -166,11 +166,24 @@ defmodule SymphonyElixirWeb.Presenter do
   defp retry_attempt(nil), do: 0
   defp retry_attempt(retry), do: retry.attempt || 0
 
-  defp issue_status(_running, _deferred, _retry, _blocked, hold) when not is_nil(hold), do: "held"
-  defp issue_status(running, _deferred, _retry, _blocked, nil) when not is_nil(running), do: "running"
+  # A live session is authoritative: a dispatched resume slice runs with its
+  # armed `input_token_resume_pending` record still stored, and budget records
+  # can coexist with a live attempt. Reporting `held` in that window made every
+  # status-gated control action (deferred-wait registration, manual stop) reject
+  # resume-dispatched slices as "held, not running" while also permitting a
+  # double resume against a live attempt. The stored hold stays visible in the
+  # payload's `hold` field; `status` reports the session truth.
+  defp issue_status(running, _deferred, _retry, _blocked, _hold) when not is_nil(running), do: "running"
+  defp issue_status(nil, _deferred, _retry, _blocked, hold) when not is_nil(hold), do: "held"
   defp issue_status(nil, deferred, _retry, _blocked, nil) when not is_nil(deferred), do: "deferred_wait"
   defp issue_status(nil, nil, retry, _blocked, nil) when not is_nil(retry), do: "retrying"
   defp issue_status(nil, nil, nil, _blocked, nil), do: "blocked"
+
+  @doc false
+  @spec issue_status_for_test(term(), term(), term(), term(), term()) :: String.t()
+  def issue_status_for_test(running, deferred, retry, blocked, hold) do
+    issue_status(running, deferred, retry, blocked, hold)
+  end
 
   defp running_entry_payload(entry) do
     %{
