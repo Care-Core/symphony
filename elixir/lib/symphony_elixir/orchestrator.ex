@@ -1646,16 +1646,12 @@ defmodule SymphonyElixir.Orchestrator do
 
         case HoldStore.persist(Config.local_workspace_root(), cleared.holds) do
           :ok ->
-            Logger.info(
-              "Cleared stale armed-resume hold for issue_id=#{issue_id} on attempt conclusion"
-            )
+            Logger.info("Cleared stale armed-resume hold for issue_id=#{issue_id} on attempt conclusion")
 
             cleared
 
           {:error, reason} ->
-            Logger.warning(
-              "Failed to persist cleared armed-resume hold for issue_id=#{issue_id}: #{inspect(reason)}; keeping hold"
-            )
+            Logger.warning("Failed to persist cleared armed-resume hold for issue_id=#{issue_id}: #{inspect(reason)}; keeping hold")
 
             state
         end
