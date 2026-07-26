@@ -45,6 +45,187 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
     assert {:error, :issue_not_found} = authorize_review(pid, issue, review_hash, "full")
   end
 
+  test "checksum prefix formatting preserves a completed full review for delta authorization" do
+    {pid, issue, worker_pid, workspace_root, _workspace} =
+      start_progress_orchestrator("review-checksum-prefix")
+
+    checksum = String.duplicate("ab", 32)
+    prefixed_fingerprint = progress_fingerprint(matrix_checksum: "sha256:#{checksum}")
+
+    assert {:ok, %{review_fingerprint: review_hash}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(prefixed_fingerprint, "checkpoint-1"),
+               pid
+             )
+
+    assert {:ok, %{kind: "full"}} = authorize_review(pid, issue, review_hash, "full")
+
+    completed_full_review = Map.put(prefixed_fingerprint, :full_review_verdict, "pass")
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(
+                 completed_full_review,
+                 "full-review-receipt",
+                 progress_kind: "review_receipt"
+               ),
+               pid
+             )
+
+    assert :sys.get_state(pid).progress[issue.id]["full_review_count"] == 1
+
+    :sys.replace_state(pid, fn state ->
+      entry = state.progress[issue.id]
+
+      legacy_fingerprint =
+        Map.put(entry["fingerprint"], "matrix_checksum", "sha256:#{checksum}")
+
+      %{state | progress: Map.put(state.progress, issue.id, Map.put(entry, "fingerprint", legacy_fingerprint))}
+    end)
+
+    bare_fingerprint =
+      progress_fingerprint(
+        head: @next_head,
+        diff_checksum: "diff-2",
+        matrix_checksum: checksum
+      )
+
+    preservation_log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, %{review_fingerprint: _changed_review_hash}} =
+                 Orchestrator.record_progress(
+                   issue.identifier,
+                   progress_attributes(bare_fingerprint, "checkpoint-2"),
+                   pid
+                 )
+      end)
+
+    issue_id = issue.id
+    assert {:ok, %{^issue_id => persisted}} = SymphonyElixir.HoldStore.load_progress(workspace_root)
+    assert persisted["full_review_count"] == 1
+    refute preservation_log =~ "Review counts reset"
+    changed_review_hash = persisted["review_fingerprint_hash"]
+
+    changed_head_options = [
+      requested_head: @next_head,
+      observed_local_head: @next_head,
+      observed_remote_head: @next_head
+    ]
+
+    assert {:ok, %{kind: "delta"}} =
+             authorize_review(
+               pid,
+               issue,
+               changed_review_hash,
+               "delta",
+               changed_head_options
+             )
+
+    Process.exit(worker_pid, :shutdown)
+  end
+
+  test "checksum normalization stores sha256 hex bare and lowercase across fingerprint fields" do
+    {pid, issue, worker_pid, workspace_root, _workspace} =
+      start_progress_orchestrator("checksum-normalization")
+
+    mixed_case_checksum = String.duplicate("Ab", 32)
+    expected_checksum = String.downcase(mixed_case_checksum)
+
+    fingerprint =
+      progress_fingerprint(
+        diff_checksum: mixed_case_checksum,
+        matrix_checksum: "sha256:#{mixed_case_checksum}"
+      )
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(fingerprint, "checkpoint-1"),
+               pid
+             )
+
+    issue_id = issue.id
+    assert {:ok, %{^issue_id => persisted}} = SymphonyElixir.HoldStore.load_progress(workspace_root)
+    assert persisted["fingerprint"]["diff_checksum"] == expected_checksum
+    assert persisted["fingerprint"]["matrix_checksum"] == expected_checksum
+
+    Process.exit(worker_pid, :shutdown)
+  end
+
+  test "a genuinely different canonical matrix checksum resets completed review counts" do
+    {pid, issue, worker_pid, workspace_root, _workspace} =
+      start_progress_orchestrator("review-matrix-change")
+
+    initial_checksum = String.duplicate("01", 32)
+    changed_checksum = String.duplicate("10", 32)
+    initial_fingerprint = progress_fingerprint(matrix_checksum: "sha256:#{initial_checksum}")
+
+    assert {:ok, %{review_fingerprint: review_hash}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(initial_fingerprint, "checkpoint-1"),
+               pid
+             )
+
+    assert {:ok, %{kind: "full"}} = authorize_review(pid, issue, review_hash, "full")
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(
+                 Map.put(initial_fingerprint, :full_review_verdict, "pass"),
+                 "full-review-receipt",
+                 progress_kind: "review_receipt"
+               ),
+               pid
+             )
+
+    changed_fingerprint =
+      progress_fingerprint(
+        head: @next_head,
+        diff_checksum: "diff-2",
+        matrix_checksum: changed_checksum
+      )
+
+    reset_log =
+      ExUnit.CaptureLog.capture_log(fn ->
+        assert {:ok, %{review_fingerprint: _changed_review_hash}} =
+                 Orchestrator.record_progress(
+                   issue.identifier,
+                   progress_attributes(changed_fingerprint, "checkpoint-2"),
+                   pid
+                 )
+      end)
+
+    assert reset_log =~ "Review counts reset issue_id=#{issue.id}"
+    assert reset_log =~ ~s(prior_matrix_checksum="#{initial_checksum}")
+    assert reset_log =~ ~s(current_matrix_checksum="#{changed_checksum}")
+
+    issue_id = issue.id
+    assert {:ok, %{^issue_id => persisted}} = SymphonyElixir.HoldStore.load_progress(workspace_root)
+    assert persisted["full_review_count"] == 0
+    changed_review_hash = persisted["review_fingerprint_hash"]
+
+    changed_head_options = [
+      requested_head: @next_head,
+      observed_local_head: @next_head,
+      observed_remote_head: @next_head
+    ]
+
+    assert {:error, :full_review_required} =
+             authorize_review(
+               pid,
+               issue,
+               changed_review_hash,
+               "delta",
+               changed_head_options
+             )
+
+    Process.exit(worker_pid, :shutdown)
+  end
+
   test "review authorization reuses an exact-head full review and requires delta after a head change" do
     {pid, issue, worker_pid, workspace_root, _workspace} =
       start_progress_orchestrator("review-reuse")
@@ -943,7 +1124,7 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
       base_sha: @head,
       head_sha: head,
       diff_checksum: Keyword.get(overrides, :diff_checksum, "diff-1"),
-      matrix_checksum: "matrix-v2",
+      matrix_checksum: Keyword.get(overrides, :matrix_checksum, "matrix-v2"),
       required_check_set: ["Build Check", "Test & Lint"],
       latest_human_comment_checkpoint: nil,
       full_review_verdict: nil,

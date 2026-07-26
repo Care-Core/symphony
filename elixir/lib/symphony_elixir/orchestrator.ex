@@ -18,6 +18,7 @@ defmodule SymphonyElixir.Orchestrator do
   @progress_fingerprint_fields ~w(contract_revision base_sha head_sha diff_checksum matrix_checksum required_check_set latest_human_comment_checkpoint full_review_verdict hosted_receipt)
   @review_fingerprint_fields ~w(contract_revision base_sha head_sha diff_checksum matrix_checksum required_check_set latest_human_comment_checkpoint)
   @review_kinds ~w(full delta security)
+  @sha256_checksum_pattern ~r/\A(?:sha256:)?([0-9a-f]{64})\z/i
   @human_override_pattern ~r/\Alinear-comment:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}@[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+-]+Z\z/i
   @terminal_watcher_states ~w(passed failed timed_out head_changed receipt_invalid cancelled)
   @watcher_poll_interval_ms 5_000
@@ -2624,7 +2625,13 @@ defmodule SymphonyElixir.Orchestrator do
          :ok <- validate_progress_heads(normalized),
          :ok <- validate_progress_checksums(normalized),
          {:ok, required_checks} <- normalize_required_check_set(normalized) do
-      {:ok, Map.put(normalized, "required_check_set", required_checks)}
+      normalized =
+        normalized
+        |> Map.update!("diff_checksum", &normalize_checksum_container/1)
+        |> Map.update!("matrix_checksum", &normalize_checksum_container/1)
+        |> Map.put("required_check_set", required_checks)
+
+      {:ok, normalized}
     end
   end
 
@@ -2819,7 +2826,7 @@ defmodule SymphonyElixir.Orchestrator do
         existing
 
       contract_or_matrix_changed?(prior_fingerprint, fingerprint) ->
-        initialize_review_counts(existing)
+        reset_review_counts(existing, prior_fingerprint, fingerprint)
 
       Map.get(existing, "full_review_count", 0) > 0 ->
         existing
@@ -2834,7 +2841,20 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp contract_or_matrix_changed?(prior, current) do
     Map.get(prior, "contract_revision") != Map.get(current, "contract_revision") or
-      Map.get(prior, "matrix_checksum") != Map.get(current, "matrix_checksum")
+      normalize_checksum_container(Map.get(prior, "matrix_checksum")) !=
+        normalize_checksum_container(Map.get(current, "matrix_checksum"))
+  end
+
+  defp reset_review_counts(entry, prior_fingerprint, current_fingerprint) do
+    Logger.info(
+      "Review counts reset issue_id=#{Map.get(entry, "issue_id")} issue_identifier=#{Map.get(entry, "identifier")} reason=contract_or_matrix_changed " <>
+        "prior_contract_revision=#{inspect(Map.get(prior_fingerprint, "contract_revision"))} " <>
+        "current_contract_revision=#{inspect(Map.get(current_fingerprint, "contract_revision"))} " <>
+        "prior_matrix_checksum=#{inspect(Map.get(prior_fingerprint, "matrix_checksum"))} " <>
+        "current_matrix_checksum=#{inspect(Map.get(current_fingerprint, "matrix_checksum"))}"
+    )
+
+    initialize_review_counts(entry)
   end
 
   defp initialize_review_counts(entry) do
@@ -3375,6 +3395,19 @@ defmodule SymphonyElixir.Orchestrator do
     do: Enum.all?(value, fn {_key, checksum} -> is_binary(checksum) and String.trim(checksum) != "" end)
 
   defp valid_checksum_container?(_value), do: false
+
+  defp normalize_checksum_container(value) when is_binary(value) do
+    case Regex.run(@sha256_checksum_pattern, value, capture: :all_but_first) do
+      [hex] -> String.downcase(hex)
+      _no_sha256_checksum -> value
+    end
+  end
+
+  defp normalize_checksum_container(value) when is_map(value) do
+    Map.new(value, fn {key, checksum} -> {key, normalize_checksum_container(checksum)} end)
+  end
+
+  defp normalize_checksum_container(value), do: value
 
   defp fingerprint_contains_head?(fingerprint, head) do
     case Map.get(fingerprint, "head_sha") do
