@@ -618,6 +618,16 @@ defmodule SymphonyElixir.Codex.AppServer do
 
         {:error, {:turn_input_required, payload}}
 
+      {:input_required, reason} ->
+        emit_message(
+          on_message,
+          :turn_input_required,
+          %{payload: reason},
+          metadata
+        )
+
+        {:error, {:turn_input_required, reason}}
+
       :approved ->
         receive_loop(port, on_message, timeout_ms, "", tool_executor, approval_context)
 
@@ -891,9 +901,21 @@ defmodule SymphonyElixir.Codex.AppServer do
            &MapSet.put(&1, id)
          )}
 
+      {:decline, :answered_connector_elicitation_id_cap_reached} ->
+        {:input_required, connector_elicitation_cap_reason(payload, params)}
+
       {:decline, _reason} ->
         :input_required
     end
+  end
+
+  defp connector_elicitation_cap_reason(payload, params) do
+    %{
+      "reason" => "answered_connector_elicitation_id_cap_reached",
+      "requestId" => Map.get(payload, "id"),
+      "threadId" => Map.get(params, "threadId"),
+      "turnId" => Map.get(params, "turnId")
+    }
   end
 
   defp connector_elicitation_decision(

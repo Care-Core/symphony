@@ -638,10 +638,21 @@ defmodule SymphonyElixir.AppServerTest do
       workspace = Path.join(workspace_root, "MT-CAP")
       codex_binary = Path.join(test_root, "fake-codex")
       response_trace = Path.join(test_root, "elicitation-responses.jsonl")
-      params_json = connector_elicitation_params() |> Jason.encode!()
 
-      first_declined_request =
-        connector_elicitation_request("elicitation-cap-#{@max_answered_connector_elicitation_ids + 1}")
+      params =
+        connector_elicitation_params()
+        |> Map.put("message", "cap-secret-message")
+        |> put_in(["requestedSchema", "capSecret"], "cap-secret-schema")
+        |> put_in(["_meta", "cap_secret"], "cap-secret-meta")
+
+      params_json = Jason.encode!(params)
+
+      cap_decline_reason = %{
+        "reason" => "answered_connector_elicitation_id_cap_reached",
+        "requestId" => "elicitation-cap-#{@max_answered_connector_elicitation_ids + 1}",
+        "threadId" => "thread-review",
+        "turnId" => "turn-review"
+      }
 
       File.mkdir_p!(workspace)
 
@@ -690,7 +701,7 @@ defmodule SymphonyElixir.AppServerTest do
 
       log =
         capture_log(fn ->
-          assert {:error, {:turn_input_required, ^first_declined_request}} =
+          assert {:error, {:turn_input_required, ^cap_decline_reason}} =
                    AppServer.run(
                      workspace,
                      "Use connectors until the per-turn approval cap",
@@ -717,6 +728,16 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert log =~
                "decision=decline reason=answered_connector_elicitation_id_cap_reached"
+
+      assert log =~ ~s("requestId" => "elicitation-cap-257")
+      assert log =~ ~s("threadId" => "thread-review")
+      assert log =~ ~s("turnId" => "turn-review")
+      refute log =~ ~s("message")
+      refute log =~ ~s("requestedSchema")
+      refute log =~ ~s("_meta")
+      refute log =~ "cap-secret-message"
+      refute log =~ "cap-secret-schema"
+      refute log =~ "cap-secret-meta"
     after
       File.rm_rf(test_root)
     end
