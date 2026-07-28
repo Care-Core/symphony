@@ -160,10 +160,15 @@ Notes:
 - `codex.turn_timeout_ms` is the maximum silence interval while a turn is streaming. Each
   app-server update resets it; it is not a total turn runtime cap.
 - Supported `codex.approval_policy` values depend on the targeted Codex app-server version. In the current local Codex schema, string values include `untrusted`, `on-failure`, `on-request`, and `never`, and object-form `reject` is also supported.
+- `codex.permission_profile` optionally selects a named Codex permission profile for both
+  `thread/start` and `turn/start`. Symphony then sends the experimental `permissions` field instead
+  of the corresponding legacy sandbox field. The configured Codex launcher must define that named
+  profile, and the installed Codex app-server must support the experimental field.
 - Supported `codex.thread_sandbox` values: `read-only`, `workspace-write`, `danger-full-access`.
 - When `codex.turn_sandbox_policy` is set explicitly, Symphony passes the map through to Codex
   unchanged. Compatibility then depends on the targeted Codex app-server version rather than local
-  Symphony validation.
+  Symphony validation. An explicit `codex.turn_sandbox_policy` cannot be combined with
+  `codex.permission_profile`.
 - Workflows that run package managers or other commands that resolve external hosts should set
   `networkAccess: true` in `codex.turn_sandbox_policy`; otherwise DNS/network access may be denied
   by the Codex turn sandbox.

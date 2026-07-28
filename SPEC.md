@@ -464,13 +464,13 @@ Fields:
 
 Fields:
 
-For Codex-owned config values such as `approval_policy`, `thread_sandbox`, and
-`turn_sandbox_policy`, supported values are defined by the targeted Codex app-server version.
+For Codex-owned config values such as `approval_policy`, `permission_profile`, `thread_sandbox`,
+and `turn_sandbox_policy`, supported values are defined by the targeted Codex app-server version.
 Implementors SHOULD treat them as pass-through Codex config values rather than relying on a
 hand-maintained enum in this spec. To inspect the installed Codex schema, run
-`codex app-server generate-json-schema --out <dir>` and inspect the relevant definitions referenced
-by `v2/ThreadStartParams.json` and `v2/TurnStartParams.json`. Implementations MAY validate these
-fields locally if they want stricter startup checks.
+`codex app-server generate-json-schema --experimental --out <dir>` and inspect the relevant
+definitions referenced by `v2/ThreadStartParams.json` and `v2/TurnStartParams.json`.
+Implementations MAY validate these fields locally if they want stricter startup checks.
 
 - `command` (string shell command)
   - Default: `codex app-server`
@@ -478,6 +478,12 @@ fields locally if they want stricter startup checks.
   - The launched process MUST speak a compatible app-server protocol over stdio.
 - `approval_policy` (Codex `AskForApproval` value)
   - Default: implementation-defined.
+- `permission_profile` (string or null)
+  - Default: null.
+  - When set, the implementation MUST send the named profile in the experimental `permissions`
+    field on both `thread/start` and `turn/start`, omitting `sandbox` and `sandboxPolicy`.
+  - It MUST NOT be combined with an explicit `turn_sandbox_policy`.
+  - The configured Codex launcher is responsible for defining the named profile.
 - `thread_sandbox` (Codex `SandboxMode` value)
   - Default: implementation-defined.
 - `turn_sandbox_policy` (Codex `SandboxPolicy` value)
@@ -626,6 +632,7 @@ not require recognizing or validating extension fields unless that extension is 
 - `agent.max_concurrent_agents_by_state`: map of positive integers, default `{}`
 - `codex.command`: shell command string, default `codex app-server`
 - `codex.approval_policy`: Codex `AskForApproval` value, default implementation-defined
+- `codex.permission_profile`: named experimental Codex permission profile, default null
 - `codex.thread_sandbox`: Codex `SandboxMode` value, default implementation-defined
 - `codex.turn_sandbox_policy`: Codex `SandboxPolicy` value, default implementation-defined
 - `codex.turn_timeout_ms`: integer, default `3600000`

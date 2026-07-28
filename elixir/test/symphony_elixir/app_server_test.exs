@@ -274,6 +274,165 @@ defmodule SymphonyElixir.AppServerTest do
     end
   end
 
+  test "app server selects a named permission profile without legacy sandbox fields" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-permission-profile-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-PROFILE")
+      codex_binary = Path.join(test_root, "fake-codex")
+      trace_file = Path.join(test_root, "codex-permission-profile.trace")
+      previous_trace = System.get_env("SYMP_TEST_CODEX_TRACE")
+
+      on_exit(fn ->
+        if is_binary(previous_trace) do
+          System.put_env("SYMP_TEST_CODEX_TRACE", previous_trace)
+        else
+          System.delete_env("SYMP_TEST_CODEX_TRACE")
+        end
+      end)
+
+      System.put_env("SYMP_TEST_CODEX_TRACE", trace_file)
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      trace_file="${SYMP_TEST_CODEX_TRACE:-/tmp/codex-permission-profile.trace}"
+      count=0
+
+      while IFS= read -r line; do
+        count=$((count + 1))
+        printf 'JSON:%s\\n' "$line" >> "$trace_file"
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-profile"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-profile"}}}'
+            ;;
+          4)
+            printf '%s\\n' '{"method":"turn/completed"}'
+            exit 0
+            ;;
+          *)
+            exit 0
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_permission_profile: "symphony-issue"
+      )
+
+      issue = %Issue{
+        id: "issue-permission-profile",
+        identifier: "MT-PROFILE",
+        title: "Use a named Codex permission profile",
+        description: "Avoid mixing profile selection with legacy sandbox fields",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-PROFILE",
+        labels: ["backend"]
+      }
+
+      assert {:ok, _result} = AppServer.run(workspace, "Validate permission profile", issue)
+
+      payloads =
+        trace_file
+        |> File.read!()
+        |> String.split("\n", trim: true)
+        |> Enum.filter(&String.starts_with?(&1, "JSON:"))
+        |> Enum.map(&(&1 |> String.trim_leading("JSON:") |> Jason.decode!()))
+
+      thread_start = Enum.find(payloads, &(&1["method"] == "thread/start"))
+      turn_start = Enum.find(payloads, &(&1["method"] == "turn/start"))
+
+      assert thread_start["params"]["permissions"] == "symphony-issue"
+      refute Map.has_key?(thread_start["params"], "sandbox")
+      assert turn_start["params"]["permissions"] == "symphony-issue"
+      refute Map.has_key?(turn_start["params"], "sandboxPolicy")
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "app server fails closed when a named profile requests additional permissions" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-app-server-permission-expansion-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      workspace = Path.join(workspace_root, "MT-1003")
+      codex_binary = Path.join(test_root, "fake-codex")
+      File.mkdir_p!(workspace)
+
+      File.write!(codex_binary, """
+      #!/bin/sh
+      count=0
+      while IFS= read -r _line; do
+        count=$((count + 1))
+
+        case "$count" in
+          1)
+            printf '%s\\n' '{"id":1,"result":{}}'
+            ;;
+          2)
+            printf '%s\\n' '{"id":2,"result":{"thread":{"id":"thread-1003"}}}'
+            ;;
+          3)
+            printf '%s\\n' '{"id":3,"result":{"turn":{"id":"turn-1003"}}}'
+            printf '%s\\n' '{"id":99,"method":"item/permissions/requestApproval","params":{"threadId":"thread-1003","turnId":"turn-1003","itemId":"item-1003","cwd":"/tmp","permissions":{"fileSystem":{"entries":[]}},"startedAtMs":1}}'
+            ;;
+          *)
+            sleep 1
+            ;;
+        esac
+      done
+      """)
+
+      File.chmod!(codex_binary, 0o755)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        codex_command: "#{codex_binary} app-server",
+        codex_approval_policy: "never",
+        codex_permission_profile: "symphony-issue"
+      )
+
+      issue = %Issue{
+        id: "issue-permission-expansion",
+        identifier: "MT-1003",
+        title: "Permission expansion",
+        description: "Ensure named profiles cannot silently broaden",
+        state: "In Progress",
+        url: "https://example.org/issues/MT-1003",
+        labels: ["backend"]
+      }
+
+      assert {:error, {:approval_required, payload}} =
+               AppServer.run(workspace, "Do not broaden the profile", issue)
+
+      assert payload["method"] == "item/permissions/requestApproval"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "app server marks request-for-input events as a hard failure" do
     test_root =
       Path.join(
