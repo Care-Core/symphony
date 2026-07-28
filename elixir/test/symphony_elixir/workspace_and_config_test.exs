@@ -1142,6 +1142,19 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
     assert message =~ "codex.turn_sandbox_policy"
 
+    write_workflow_file!(Workflow.workflow_file_path(), codex_permission_profile: " ")
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "codex.permission_profile"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      codex_permission_profile: "symphony-issue",
+      codex_turn_sandbox_policy: %{type: "workspaceWrite"}
+    )
+
+    assert {:error, {:invalid_workflow_config, message}} = Config.validate!()
+    assert message =~ "cannot be combined with permission_profile"
+
     write_workflow_file!(Workflow.workflow_file_path(),
       codex_approval_policy: "future-policy",
       codex_thread_sandbox: "future-sandbox",

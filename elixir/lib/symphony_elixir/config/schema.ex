@@ -190,6 +190,7 @@ defmodule SymphonyElixir.Config.Schema do
         }
       )
 
+      field(:permission_profile, :string)
       field(:thread_sandbox, :string, default: "workspace-write")
       field(:turn_sandbox_policy, :map)
       field(:auto_approve_connector_tools, :boolean, default: false)
@@ -210,6 +211,7 @@ defmodule SymphonyElixir.Config.Schema do
         [
           :command,
           :approval_policy,
+          :permission_profile,
           :thread_sandbox,
           :turn_sandbox_policy,
           :auto_approve_connector_tools,
@@ -223,6 +225,7 @@ defmodule SymphonyElixir.Config.Schema do
         ],
         empty_values: []
       )
+      |> update_change(:permission_profile, &String.trim/1)
       |> validate_required([:command])
       |> validate_change(:command, fn :command, command ->
         if command != "" and String.trim(command) == "" do
@@ -239,6 +242,27 @@ defmodule SymphonyElixir.Config.Schema do
       |> validate_number(:input_token_checkpoint_grace, greater_than: 0)
       |> update_change(:input_token_limits_by_label, &normalize_label_limits/1)
       |> validate_label_limits(:input_token_limits_by_label)
+      |> validate_permission_profile_selection()
+    end
+
+    defp validate_permission_profile_selection(changeset) do
+      permission_profile = get_field(changeset, :permission_profile)
+      turn_sandbox_policy = get_field(changeset, :turn_sandbox_policy)
+
+      cond do
+        is_binary(permission_profile) and permission_profile == "" ->
+          add_error(changeset, :permission_profile, "can't be blank")
+
+        is_binary(permission_profile) and not is_nil(turn_sandbox_policy) ->
+          add_error(
+            changeset,
+            :turn_sandbox_policy,
+            "cannot be combined with permission_profile"
+          )
+
+        true ->
+          changeset
+      end
     end
 
     defp normalize_label_limits(limits) when is_map(limits) do
