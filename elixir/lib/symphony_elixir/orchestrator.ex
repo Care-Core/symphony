@@ -91,7 +91,7 @@ defmodule SymphonyElixir.Orchestrator do
       end
 
       run_terminal_workspace_cleanup()
-      {:ok, state |> restore_waiting_watchers() |> schedule_tick(0)}
+      {:ok, state |> disable_restored_waiters() |> schedule_tick(0)}
     else
       {:error, {:progress_state_invalid, _, _} = reason} ->
         Logger.error("Failed to restore durable progress state: #{inspect(reason)}")
@@ -1875,13 +1875,9 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   @spec register_deferred_wait(String.t(), map(), GenServer.server()) ::
-          {:ok, map()} | {:error, atom()}
-  def register_deferred_wait(issue_identifier, attributes, server \\ __MODULE__)
-      when is_binary(issue_identifier) and is_map(attributes) do
-    GenServer.call(server, {:register_deferred_wait, issue_identifier, attributes})
-  catch
-    :exit, _ -> {:error, :unavailable}
-  end
+          {:error, :deferred_wait_disabled}
+  def register_deferred_wait(_issue_identifier, _attributes, _server \\ __MODULE__),
+    do: {:error, :deferred_wait_disabled}
 
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
@@ -2038,12 +2034,8 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  def handle_call({:register_deferred_wait, issue_identifier, attributes}, _from, state) do
-    case register_deferred_wait_state(state, issue_identifier, attributes) do
-      {:ok, updated_state, receipt} -> {:reply, {:ok, receipt}, updated_state}
-      {:error, reason, updated_state} -> {:reply, {:error, reason}, updated_state}
-    end
-  end
+  def handle_call({:register_deferred_wait, _issue_identifier, _attributes}, _from, state),
+    do: {:reply, {:error, :deferred_wait_disabled}, state}
 
   def handle_call({:continue_after_turn, issue_id}, _from, state) do
     {:reply, not waiting_watcher?(state, issue_id), state}
@@ -2530,121 +2522,6 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp register_deferred_wait_state(
-         %State{progress_state_available: false} = state,
-         _issue_identifier,
-         _attributes
-       ),
-       do: {:error, :progress_state_unavailable, state}
-
-  defp register_deferred_wait_state(state, issue_identifier, attributes) do
-    with issue_id when is_binary(issue_id) <- find_known_issue_id(state, issue_identifier),
-         %{} = running_entry <- Map.get(state.running, issue_id),
-         %{} = progress <- Map.get(state.progress, issue_id),
-         expected_head when is_binary(expected_head) <- option_value(attributes, :expected_head),
-         true <- valid_commit_sha?(expected_head),
-         true <- fingerprint_contains_head?(Map.get(progress, "fingerprint", %{}), expected_head),
-         {:ok, receipt_path} <-
-           validate_receipt_path(
-             option_value(attributes, :receipt_path),
-             Map.get(running_entry, :workspace_path)
-           ),
-         {:ok, timeout_seconds} <-
-           validate_wait_timeout(option_value(attributes, :timeout_seconds)),
-         {:ok, waiter_command} <-
-           validate_waiter_command(
-             attributes,
-             Map.get(running_entry, :workspace_path),
-             expected_head,
-             receipt_path
-           ) do
-      watcher =
-        build_deferred_watcher(
-          issue_identifier,
-          running_entry,
-          expected_head,
-          receipt_path,
-          timeout_seconds,
-          waiter_command
-        )
-
-      persist_and_launch_deferred_waiter(state, issue_id, progress, watcher, timeout_seconds)
-    else
-      nil -> {:error, :issue_not_found, state}
-      false -> {:error, :review_fingerprint_mismatch, state}
-      {:error, reason} -> {:error, reason, state}
-      _ -> {:error, :issue_not_running, state}
-    end
-  end
-
-  defp build_deferred_watcher(
-         issue_identifier,
-         running_entry,
-         expected_head,
-         receipt_path,
-         timeout_seconds,
-         waiter_command
-       ) do
-    %{
-      "state" => "waiting",
-      "token" => :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower),
-      "expected_head" => expected_head,
-      "receipt_path" => receipt_path,
-      "registered_at" => DateTime.utc_now() |> DateTime.to_iso8601(),
-      "deadline_unix_ms" => System.system_time(:millisecond) + timeout_seconds * 1_000,
-      "last_receipt_hash" => nil,
-      "wake_count" => 0,
-      "identifier" => issue_identifier,
-      "worker_host" => Map.get(running_entry, :worker_host),
-      "workspace_path" => Map.get(running_entry, :workspace_path),
-      "waiter_command" => waiter_command
-    }
-  end
-
-  defp persist_and_launch_deferred_waiter(state, issue_id, progress, watcher, timeout_seconds) do
-    updated =
-      progress
-      |> Map.put("watcher", watcher)
-      |> Map.put("updated_at", DateTime.utc_now() |> DateTime.to_iso8601())
-
-    receipt = %{
-      watcher_state: "waiting",
-      watcher_token: Map.fetch!(watcher, "token"),
-      expected_head: Map.fetch!(watcher, "expected_head"),
-      receipt_path: Map.fetch!(watcher, "receipt_path"),
-      timeout_seconds: timeout_seconds
-    }
-
-    case persist_progress_entry(state, issue_id, updated, receipt) do
-      {:ok, updated_state, persisted_receipt} ->
-        launch_registered_waiter(updated_state, issue_id, watcher, persisted_receipt)
-
-      error ->
-        error
-    end
-  end
-
-  defp launch_registered_waiter(state, issue_id, watcher, receipt) do
-    state = stop_deferred_waiter_task(state, issue_id)
-
-    case launch_deferred_waiter(state, issue_id, watcher) do
-      {:ok, launched_state} ->
-        schedule_deferred_watcher_poll(issue_id, Map.fetch!(watcher, "token"))
-        {:ok, launched_state, receipt}
-
-      {:error, {:waiter_launch_failed, reason}} ->
-        settled_state =
-          settle_missing_waiter_receipt(
-            state,
-            issue_id,
-            Map.fetch!(watcher, "token"),
-            {:waiter_launch_failed, reason}
-          )
-
-        {:error, :waiter_launch_failed, settled_state}
-    end
-  end
-
   defp normalize_progress_fingerprint(fingerprint) when is_map(fingerprint) do
     normalized =
       Enum.reduce(@progress_fingerprint_fields, %{}, fn field, acc ->
@@ -2985,28 +2862,19 @@ defmodule SymphonyElixir.Orchestrator do
     end)
   end
 
-  defp restore_waiting_watchers(state) do
+  defp disable_restored_waiters(state) do
     Enum.reduce(waiting_watcher_issue_ids(state.progress), state, fn issue_id, restored_state ->
-      restore_waiting_watcher(restored_state, issue_id)
+      watcher_token = get_in(restored_state.progress, [issue_id, "watcher", "token"])
+
+      Logger.warning("Disabled restored deferred waiter issue_id=#{issue_id}; scheduling a fail-closed continuation")
+
+      settle_missing_waiter_receipt(
+        restored_state,
+        issue_id,
+        watcher_token,
+        :deferred_wait_disabled
+      )
     end)
-  end
-
-  defp restore_waiting_watcher(state, issue_id) do
-    watcher = get_in(state.progress, [issue_id, "watcher"])
-    watcher_token = Map.fetch!(watcher, "token")
-    polled_state = poll_deferred_watcher(state, issue_id, watcher_token)
-
-    if waiting_watcher?(polled_state, issue_id) do
-      case launch_deferred_waiter(polled_state, issue_id, watcher) do
-        {:ok, launched_state} ->
-          launched_state
-
-        {:error, reason} ->
-          settle_missing_waiter_receipt(polled_state, issue_id, watcher_token, reason)
-      end
-    else
-      polled_state
-    end
   end
 
   defp deferred_metadata(running_entry) do
@@ -3029,49 +2897,6 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp deferred_phase_budget(_running_entry), do: nil
-
-  defp launch_deferred_waiter(state, issue_id, watcher) do
-    %{"script" => script, "args" => args} = Map.fetch!(watcher, "waiter_command")
-    workspace_path = Map.fetch!(watcher, "workspace_path")
-    watcher_token = Map.fetch!(watcher, "token")
-    orchestrator = self()
-
-    start_result =
-      try do
-        Task.Supervisor.start_child(state.task_supervisor, fn ->
-          result = run_waiter_command(script, args, workspace_path)
-
-          send(
-            orchestrator,
-            {:deferred_waiter_exit, issue_id, watcher_token, summarize_waiter_result(result)}
-          )
-        end)
-      catch
-        :exit, reason -> {:error, reason}
-      end
-
-    case start_result do
-      {:ok, task_pid} ->
-        task = %{pid: task_pid, token: watcher_token}
-        {:ok, %{state | waiter_tasks: Map.put(state.waiter_tasks, issue_id, task)}}
-
-      {:error, reason} ->
-        {:error, {:waiter_launch_failed, reason}}
-    end
-  end
-
-  defp run_waiter_command(script, args, workspace_path) do
-    {:ok, System.cmd(script, args, cd: workspace_path, stderr_to_stdout: true)}
-  rescue
-    exception -> {:error, {:exception, Exception.message(exception)}}
-  catch
-    kind, reason -> {:error, {kind, reason}}
-  end
-
-  defp summarize_waiter_result({:ok, {_output, status}}) when is_integer(status),
-    do: {:exit_status, status}
-
-  defp summarize_waiter_result({:error, reason}), do: {:waiter_command_failed, reason}
 
   defp remove_deferred_waiter_task(state, issue_id, watcher_token) do
     case Map.get(state.waiter_tasks, issue_id) do
@@ -3340,74 +3165,6 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp hold_phase_budget(_hold), do: nil
-
-  defp validate_receipt_path(path, workspace_path)
-       when is_binary(path) and is_binary(workspace_path) do
-    expanded_path = Path.expand(path)
-    expanded_workspace = Path.expand(workspace_path)
-
-    if Path.type(path) == :absolute and
-         (expanded_path == expanded_workspace or
-            String.starts_with?(expanded_path, expanded_workspace <> "/")) do
-      {:ok, expanded_path}
-    else
-      {:error, :invalid_receipt_path}
-    end
-  end
-
-  defp validate_receipt_path(_path, _workspace_path), do: {:error, :invalid_receipt_path}
-
-  defp validate_waiter_command(attributes, workspace_path, expected_head, receipt_path)
-       when is_binary(workspace_path) do
-    script = option_value(attributes, :waiter_script)
-    args = option_value(attributes, :waiter_args)
-
-    with {:ok, expanded_script} <- validate_worktree_regular_file(script, workspace_path),
-         true <- is_list(args) and length(args) <= 64,
-         true <- Enum.all?(args, &(is_binary(&1) and byte_size(&1) <= 4_096)),
-         true <- "--collect-terminal" in args,
-         ^expected_head <- named_waiter_argument(args, "--head"),
-         ^receipt_path <- named_waiter_argument(args, "--output") do
-      {:ok, %{"script" => expanded_script, "args" => args}}
-    else
-      {:error, reason} -> {:error, reason}
-      _ -> {:error, :invalid_waiter_command}
-    end
-  end
-
-  defp validate_waiter_command(_attributes, _workspace_path, _expected_head, _receipt_path),
-    do: {:error, :invalid_waiter_command}
-
-  defp validate_worktree_regular_file(path, workspace_path)
-       when is_binary(path) and is_binary(workspace_path) do
-    expanded_path = Path.expand(path)
-    expanded_workspace = Path.expand(workspace_path)
-
-    inside_workspace? =
-      expanded_path != expanded_workspace and
-        String.starts_with?(expanded_path, expanded_workspace <> "/")
-
-    case File.lstat(expanded_path) do
-      {:ok, %File.Stat{type: :regular}} when inside_workspace? -> {:ok, expanded_path}
-      _ -> {:error, :invalid_waiter_command}
-    end
-  end
-
-  defp validate_worktree_regular_file(_path, _workspace_path),
-    do: {:error, :invalid_waiter_command}
-
-  defp named_waiter_argument(args, flag) do
-    case Enum.find_index(args, &(&1 == flag)) do
-      nil -> nil
-      index -> Enum.at(args, index + 1)
-    end
-  end
-
-  defp validate_wait_timeout(seconds)
-       when is_integer(seconds) and seconds > 0 and seconds <= 86_400,
-       do: {:ok, seconds}
-
-  defp validate_wait_timeout(_seconds), do: {:error, :invalid_wait_timeout}
 
   defp valid_commit_sha?(value),
     do: is_binary(value) and Regex.match?(~r/\A[0-9a-f]{40}\z/i, value)
