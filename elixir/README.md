@@ -239,7 +239,7 @@ codex:
 - This port intentionally has no tracked-diff `no_progress` breaker. Progress receipts support
   review and provider-state coordination; they do not enforce a fingerprint-based runaway counter.
 
-### Authenticated control and deferred waits
+### Authenticated control and disabled deferred waits
 
 Set a non-empty `SYMPHONY_CONTROL_TOKEN` before starting the optional HTTP server. Mutating routes
 accept only loopback requests carrying that exact value in `x-symphony-control-token`:
@@ -251,15 +251,16 @@ accept only loopback requests carrying that exact value in `x-symphony-control-t
 - `POST /api/v1/<issue_identifier>/review` with `kind`, `review_fingerprint`, `requested_head`,
   `observed_local_head`, and `observed_remote_head`; an additional review round also requires the
   recorded `human_override`
-- `POST /api/v1/<issue_identifier>/wait` with `expected_head`, a workspace-confined
-  `receipt_path`, `timeout_seconds`, `waiter_script`, and `waiter_args`
 
 Progress and review state is durable and fail-closed. Review authorization reuses an accepted full
 review only for the same exact fingerprint/head and otherwise allows the bounded full-then-delta
-sequence. A registered waiter runs outside the agent turn, persists provider transitions, keeps the
-model idle while the watcher is waiting, survives runner restart, and schedules one continuation on
-terminal truth, timeout, or head change. Replacing or manually stopping a waiter prevents the old
-waiter from waking the issue.
+sequence.
+
+`POST /api/v1/<issue_identifier>/wait` is temporarily disabled. It always returns
+`deferred_wait_disabled`; the orchestrator does not validate, persist, or execute a submitted
+script or arguments. On restart, a legacy waiting record is settled fail-closed and schedules one
+ordinary diagnostic continuation without launching its stored command. This denial does not add a
+replacement waiter or change the other control operations.
 
 ### Managed-sandbox proof and review constraint
 

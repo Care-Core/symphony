@@ -90,10 +90,6 @@ defmodule SymphonyElixir.ExtensionsTest do
       control_result(state, :review, :authorize_review_called, identifier, attributes)
     end
 
-    def handle_call({:register_deferred_wait, identifier, attributes}, _from, state) do
-      control_result(state, :wait, :register_deferred_wait_called, identifier, attributes)
-    end
-
     defp control_result(state, result_key, message, identifier, attributes) do
       if test_pid = Keyword.get(state, :test_pid) do
         send(test_pid, {message, identifier, attributes})
@@ -731,7 +727,7 @@ defmodule SymphonyElixir.ExtensionsTest do
            }
   end
 
-  test "phoenix control api forwards bounded progress, review, and deferred-wait transitions" do
+  test "phoenix control api forwards progress and review but denies deferred waits" do
     orchestrator_name = Module.concat(__MODULE__, :ProgressControlApiOrchestrator)
 
     {:ok, _pid} =
@@ -753,13 +749,6 @@ defmodule SymphonyElixir.ExtensionsTest do
              kind: "full",
              review_round_count: 1,
              review_fingerprint: "review-hash"
-           }},
-        wait:
-          {:ok,
-           %{
-             watcher_state: "waiting",
-             expected_head: "0123456789abcdef0123456789abcdef01234567",
-             timeout_seconds: 1_200
            }}
       )
 
@@ -824,7 +813,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                        "observed_remote_head" => ^head
                      }}
 
-    wait_payload =
+    wait_error =
       control_conn.()
       |> post("/api/v1/MT-CONTROL/wait", %{
         "expected_head" => head,
@@ -839,28 +828,16 @@ defmodule SymphonyElixir.ExtensionsTest do
           "/tmp/MT-CONTROL/output/checks.jsonl"
         ]
       })
-      |> json_response(200)
+      |> json_response(422)
 
-    assert wait_payload == %{
-             "watcher_state" => "waiting",
-             "expected_head" => head,
-             "timeout_seconds" => 1_200
+    assert wait_error == %{
+             "error" => %{
+               "code" => "deferred_wait_disabled",
+               "message" => "Progress transition rejected: deferred_wait_disabled"
+             }
            }
 
-    assert_received {:register_deferred_wait_called, "MT-CONTROL",
-                     %{
-                       "expected_head" => ^head,
-                       "receipt_path" => "/tmp/MT-CONTROL/output/checks.jsonl",
-                       "timeout_seconds" => 1_200,
-                       "waiter_script" => "/tmp/MT-CONTROL/scripts/symphony/wait-for-pr-checks.mjs",
-                       "waiter_args" => [
-                         "--collect-terminal",
-                         "--head",
-                         ^head,
-                         "--output",
-                         "/tmp/MT-CONTROL/output/checks.jsonl"
-                       ]
-                     }}
+    refute_received {:register_deferred_wait_called, _, _}
   end
 
   test "phoenix resume api maps cleanup and hold persistence failures to safe responses" do
