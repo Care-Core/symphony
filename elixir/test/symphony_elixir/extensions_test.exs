@@ -312,7 +312,7 @@ defmodule SymphonyElixir.ExtensionsTest do
              Adapter.intake_scope(%{project_slug: nil, team_key: "CC\nOTHER"})
   end
 
-  test "workflow store rejects a Linear intake scope hot reload" do
+  test "workflow store rejects an effective Linear intake identity hot reload" do
     ensure_workflow_store_running()
 
     assert {:ok, {:project_slug, "project"}} =
@@ -338,11 +338,19 @@ defmodule SymphonyElixir.ExtensionsTest do
     )
 
     assert :ok = WorkflowStore.force_reload()
+    assert Config.settings!().tracker.kind == "memory"
 
     write_workflow_file!(Workflow.workflow_file_path(),
-      tracker_project_slug: nil,
-      tracker_team_key: "CC",
-      prompt: "Two-step team prompt"
+      tracker_api_token: "other-workspace-token",
+      prompt: "Other workspace prompt"
+    )
+
+    assert {:error, :linear_intake_scope_restart_required} = WorkflowStore.force_reload()
+    assert Config.settings!().tracker.kind == "memory"
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_endpoint: "https://other-linear.example.test/graphql",
+      prompt: "Other endpoint prompt"
     )
 
     assert {:error, :linear_intake_scope_restart_required} = WorkflowStore.force_reload()

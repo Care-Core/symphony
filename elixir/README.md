@@ -164,9 +164,12 @@ tracker:
 Do not configure both. Missing, blank, malformed, or conflicting scope settings fail startup and
 hot reload rather than falling back to unscoped intake.
 
-The selected Linear intake scope is immutable for the lifetime of a running Symphony process.
-Changing `project_slug` or `team_key` requires a controlled runner restart so claims authorized by
-the previous scope cannot survive a hot reload.
+The effective Linear intake identity is immutable for the lifetime of a running Symphony process.
+Changing the Linear endpoint, API credential, `project_slug`, or `team_key` requires a controlled
+runner restart so claims authorized by the previous workspace and scope cannot survive a hot reload,
+including a reload routed temporarily through another tracker adapter. If the workflow store itself
+crashes, Symphony restarts the dependent agent runtime with it rather than preserving claims across
+a new configuration identity.
 
 Notes:
 

@@ -22,7 +22,14 @@ defmodule SymphonyElixir.TestSupport do
       alias SymphonyElixir.Workspace
 
       import SymphonyElixir.TestSupport,
-        only: [write_workflow_file!: 1, write_workflow_file!: 2, restore_env: 2, stop_default_http_server: 0]
+        only: [
+          write_workflow_file!: 1,
+          write_workflow_file!: 2,
+          restart_workflow_store_with!: 1,
+          restart_workflow_store_with!: 2,
+          restore_env: 2,
+          stop_default_http_server: 0
+        ]
 
       setup do
         workflow_root =
@@ -35,7 +42,21 @@ defmodule SymphonyElixir.TestSupport do
         workflow_file = Path.join(workflow_root, "WORKFLOW.md")
         write_workflow_file!(workflow_file)
         Workflow.set_workflow_file_path(workflow_file)
-        if Process.whereis(SymphonyElixir.WorkflowStore), do: SymphonyElixir.WorkflowStore.force_reload()
+
+        if Process.whereis(SymphonyElixir.WorkflowStore) do
+          :ok =
+            Supervisor.terminate_child(
+              SymphonyElixir.Supervisor,
+              SymphonyElixir.WorkflowStore
+            )
+        end
+
+        {:ok, _pid} =
+          Supervisor.restart_child(
+            SymphonyElixir.Supervisor,
+            SymphonyElixir.WorkflowStore
+          )
+
         stop_default_http_server()
 
         on_exit(fn ->
@@ -62,6 +83,20 @@ defmodule SymphonyElixir.TestSupport do
       end
     end
 
+    :ok
+  end
+
+  def restart_workflow_store_with!(path, overrides \\ []) do
+    if Process.whereis(SymphonyElixir.WorkflowStore) do
+      :ok =
+        Supervisor.terminate_child(
+          SymphonyElixir.Supervisor,
+          SymphonyElixir.WorkflowStore
+        )
+    end
+
+    write_workflow_file!(path, overrides)
+    {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, SymphonyElixir.WorkflowStore)
     :ok
   end
 

@@ -1344,7 +1344,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       restore_env(api_key_env_var, previous_api_key)
     end)
 
-    write_workflow_file!(Workflow.workflow_file_path(),
+    restart_workflow_store_with!(Workflow.workflow_file_path(),
       tracker_api_token: "$#{api_key_env_var}",
       workspace_root: "$#{workspace_env_var}",
       codex_command: "#{codex_bin} app-server"
@@ -1483,7 +1483,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       restore_env(api_key_env_var, previous_api_key)
     end)
 
-    write_workflow_file!(Workflow.workflow_file_path(),
+    restart_workflow_store_with!(Workflow.workflow_file_path(),
       tracker_api_token: "env:#{api_key_env_var}",
       workspace_root: "env:#{workspace_env_var}"
     )

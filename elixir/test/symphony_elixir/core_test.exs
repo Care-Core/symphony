@@ -171,7 +171,7 @@ defmodule SymphonyElixir.CoreTest do
     on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
     System.put_env("LINEAR_API_KEY", env_api_key)
 
-    write_workflow_file!(Workflow.workflow_file_path(),
+    restart_workflow_store_with!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
       tracker_project_slug: "project",
       codex_command: "/bin/sh app-server"
@@ -276,6 +276,36 @@ defmodule SymphonyElixir.CoreTest do
     assert is_pid(Process.whereis(SymphonyElixir.Orchestrator))
 
     GenServer.stop(pid)
+  end
+
+  test "a workflow store crash restarts the dependent agent runtime" do
+    workflow_store_pid = Process.whereis(WorkflowStore)
+    runtime_pid = Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) || restart_default_runtime!()
+
+    assert is_pid(workflow_store_pid)
+    assert is_pid(runtime_pid)
+
+    Process.exit(workflow_store_pid, :kill)
+
+    restarted_workflow_store_pid =
+      eventually_value(fn ->
+        case Process.whereis(WorkflowStore) do
+          pid when is_pid(pid) and pid != workflow_store_pid -> pid
+          _ -> nil
+        end
+      end)
+
+    restarted_runtime_pid =
+      eventually_value(fn ->
+        case Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) do
+          pid when is_pid(pid) and pid != runtime_pid -> pid
+          _ -> nil
+        end
+      end)
+
+    assert is_pid(restarted_workflow_store_pid)
+    assert is_pid(restarted_runtime_pid)
+    refute Process.alive?(runtime_pid)
   end
 
   test "orchestrator fails startup when semantic preflight fails" do

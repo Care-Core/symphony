@@ -1241,8 +1241,9 @@ Each adapter owns:
 - endpoint, authentication, transport, timeouts, pagination, and rate-limit handling;
 - provider-specific scope selection (project, board, team, repository, query, or equivalent);
 - fail-closed validation when its supported scope selectors are missing, malformed, or ambiguous;
-- fail-closed handling of live scope changes so claims from an earlier selector cannot continue
-  under a newly selected scope;
+- fail-closed handling of live effective-intake changes, including endpoint, credential identity,
+  and scope selector, so claims from an earlier authorization boundary cannot continue under a newly
+  selected boundary;
 - mapping provider payloads into the normalized Issue fields in Section 4.1.1;
 - choosing a stable dispatch identity and preserving any distinct underlying IDs in `native_ref`;
 - deriving `dispatchable` from provider-specific routing rules;

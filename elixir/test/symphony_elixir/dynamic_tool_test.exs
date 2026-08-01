@@ -55,19 +55,21 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
     end)
 
-    write_workflow_file!(Workflow.workflow_file_path(),
+    restart_workflow_store_with!(Workflow.workflow_file_path(),
       tracker_kind: "linear",
       tracker_api_token: "session-token",
       tracker_project_slug: "session-project"
     )
 
-    assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
-    assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
-
     binding = BoundDynamicTool.bind()
 
-    write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")
-    assert BoundDynamicTool.bind().tool_specs == []
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: "session-token",
+      tracker_project_slug: "session-project",
+      tracker_assignee: "new-session@example.test"
+    )
+
+    assert BoundDynamicTool.bind().tracker_settings.assignee == "new-session@example.test"
 
     test_pid = self()
 
@@ -86,6 +88,7 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
 
     assert tracker_settings.api_key == "session-token"
     assert tracker_settings.project_slug == "session-project"
+    assert tracker_settings.assignee == nil
     assert response["success"] == true
   end
 

@@ -2112,7 +2112,7 @@ defmodule SymphonyElixir.AppServerTest do
 
       File.chmod!(codex_binary, 0o755)
 
-      write_workflow_file!(Workflow.workflow_file_path(),
+      restart_workflow_store_with!(Workflow.workflow_file_path(),
         workspace_root: workspace_root,
         tracker_api_token: "$#{custom_secret_env}",
         codex_command: "#{codex_binary} app-server"
