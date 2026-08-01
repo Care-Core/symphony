@@ -1,6 +1,9 @@
 defmodule Mix.Tasks.Symphony.Build do
   use Mix.Task
 
+  @moduledoc """
+  Builds the Symphony escript with source provenance in its application metadata.
+  """
   @shortdoc "Build the Symphony escript with exact source provenance"
 
   @impl Mix.Task
