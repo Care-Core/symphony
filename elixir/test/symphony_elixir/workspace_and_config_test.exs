@@ -611,6 +611,152 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
                     }}
   end
 
+  test "linear client scopes issue state fetches by id to an exact team key" do
+    graphql_fun = fn query, variables ->
+      send(self(), {:fetch_team_issue_states, query, variables})
+      {:ok, %{"data" => %{"issues" => %{"nodes" => []}}}}
+    end
+
+    assert {:ok, []} =
+             Client.fetch_issues_by_ids_for_test(
+               ["issue-1"],
+               {:team_key, "CC"},
+               graphql_fun
+             )
+
+    assert_receive {:fetch_team_issue_states, query,
+                    %{
+                      ids: ["issue-1"],
+                      teamKey: "CC",
+                      first: 1,
+                      relationFirst: 50
+                    }}
+
+    assert query =~ "SymphonyLinearTeamIssuesById"
+    assert query =~ "team: {key: {eq: $teamKey}}"
+    refute query =~ "projectSlug"
+  end
+
+  test "linear client preserves team scope across candidate pagination" do
+    raw_issue = fn id, identifier ->
+      %{
+        "id" => id,
+        "identifier" => identifier,
+        "title" => "Team issue #{identifier}",
+        "state" => %{"name" => "Todo"},
+        "labels" => %{"nodes" => []},
+        "inverseRelations" => %{"nodes" => []}
+      }
+    end
+
+    graphql_fun = fn query, variables ->
+      send(self(), {:fetch_team_issue_page, query, variables})
+
+      {nodes, page_info} =
+        case variables.after do
+          nil ->
+            {[raw_issue.("issue-1", "CC-1")], %{"hasNextPage" => true, "endCursor" => "next"}}
+
+          "next" ->
+            {[raw_issue.("issue-2", "CC-2")], %{"hasNextPage" => false, "endCursor" => nil}}
+        end
+
+      {:ok, %{"data" => %{"issues" => %{"nodes" => nodes, "pageInfo" => page_info}}}}
+    end
+
+    assert {:ok, issues} =
+             Client.fetch_issues_by_states_for_test(
+               ["Todo"],
+               {:team_key, "CC"},
+               graphql_fun
+             )
+
+    assert Enum.map(issues, & &1.identifier) == ["CC-1", "CC-2"]
+
+    assert_receive {:fetch_team_issue_page, query,
+                    %{
+                      teamKey: "CC",
+                      stateNames: ["Todo"],
+                      first: 50,
+                      relationFirst: 50,
+                      after: nil
+                    }}
+
+    assert query =~ "SymphonyLinearTeamPoll"
+    assert query =~ "team: {key: {eq: $teamKey}}"
+    refute query =~ "projectSlug"
+
+    assert_receive {:fetch_team_issue_page, ^query,
+                    %{
+                      teamKey: "CC",
+                      stateNames: ["Todo"],
+                      first: 50,
+                      relationFirst: 50,
+                      after: "next"
+                    }}
+  end
+
+  test "linear client rejects partial team candidate responses before dispatch" do
+    raw_issue = %{
+      "id" => "issue-1",
+      "identifier" => "CC-1",
+      "title" => "Partial team issue",
+      "state" => %{"name" => "Todo"},
+      "labels" => %{"nodes" => []},
+      "inverseRelations" => nil
+    }
+
+    errors = [%{"message" => "inverseRelations failed"}]
+
+    graphql_fun = fn _query, _variables ->
+      {:ok,
+       %{
+         "data" => %{
+           "issues" => %{
+             "nodes" => [raw_issue],
+             "pageInfo" => %{"hasNextPage" => false, "endCursor" => nil}
+           }
+         },
+         "errors" => errors
+       }}
+    end
+
+    assert {:error, {:linear_graphql_errors, ^errors}} =
+             Client.fetch_issues_by_states_for_test(
+               ["Todo"],
+               {:team_key, "CC"},
+               graphql_fun
+             )
+  end
+
+  test "linear client rejects partial scoped issue refresh responses" do
+    raw_issue = %{
+      "id" => "issue-1",
+      "identifier" => "CC-1",
+      "title" => "Partial team issue",
+      "state" => %{"name" => "Todo"},
+      "labels" => %{"nodes" => []},
+      "inverseRelations" => nil
+    }
+
+    errors = [%{"message" => "inverseRelations failed"}]
+
+    graphql_fun = fn _query, _variables ->
+      {:ok,
+       %{
+         "data" => %{"issues" => %{"nodes" => [raw_issue]}},
+         "errors" => errors
+       }}
+    end
+
+    assert {:error, {:linear_graphql_errors, ^errors}} =
+             Client.fetch_issues_by_ids_for_test(
+               ["issue-1"],
+               {:team_key, "CC"},
+               graphql_fun
+             )
+  end
+
   test "linear client logs response bodies for non-200 graphql responses" do
     log =
       ExUnit.CaptureLog.capture_log(fn ->
@@ -1010,6 +1156,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert config.tracker.endpoint == "https://api.linear.app/graphql"
     assert config.tracker.api_key == nil
     assert config.tracker.project_slug == nil
+    assert config.tracker.team_key == nil
     assert config.tracker.required_labels == []
     assert config.workspace.root == Path.join(System.tmp_dir!(), "symphony_workspaces")
     assert config.worker.max_concurrent_agents_per_host == nil
@@ -1197,7 +1344,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       restore_env(api_key_env_var, previous_api_key)
     end)
 
-    write_workflow_file!(Workflow.workflow_file_path(),
+    restart_workflow_store_with!(Workflow.workflow_file_path(),
       tracker_api_token: "$#{api_key_env_var}",
       workspace_root: "$#{workspace_env_var}",
       codex_command: "#{codex_bin} app-server"
@@ -1228,12 +1375,14 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     assert settings.tracker.endpoint == "https://linear.example.test/graphql"
     assert settings.tracker.api_key == "provider-token"
     assert settings.tracker.project_slug == "provider-project"
+    assert settings.tracker.team_key == nil
     assert settings.tracker.secret_environment_names == ["LINEAR_API_KEY"]
 
     assert settings.tracker.provider == %{
              "endpoint" => "https://linear.example.test/graphql",
              "api_key" => "provider-token",
              "project_slug" => "provider-project",
+             "team_key" => nil,
              "assignee" => nil,
              "extra" => %{"team" => "platform"}
            }
@@ -1272,6 +1421,39 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     assert {:error, :invalid_linear_assignee} =
              Config.validate_settings(invalid_assignee_settings)
+
+    assert {:ok, invalid_project_settings} =
+             Schema.parse(%{
+               tracker: %{
+                 kind: "linear",
+                 provider: %{api_key: "token", project_slug: 123}
+               }
+             })
+
+    assert {:error, :invalid_linear_project_slug} =
+             Config.validate_settings(invalid_project_settings)
+
+    assert {:ok, invalid_team_settings} =
+             Schema.parse(%{
+               tracker: %{
+                 kind: "linear",
+                 provider: %{api_key: "token", project_slug: nil, team_key: 123}
+               }
+             })
+
+    assert {:error, :invalid_linear_team_key} =
+             Config.validate_settings(invalid_team_settings)
+
+    assert {:ok, conflicting_scope_settings} =
+             Schema.parse(%{
+               tracker: %{
+                 kind: "linear",
+                 provider: %{api_key: "token", project_slug: "project", team_key: "CC"}
+               }
+             })
+
+    assert {:error, :conflicting_linear_intake_scope} =
+             Config.validate_settings(conflicting_scope_settings)
   end
 
   test "schema does not inject linear defaults before an adapter is selected" do
@@ -1301,7 +1483,7 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       restore_env(api_key_env_var, previous_api_key)
     end)
 
-    write_workflow_file!(Workflow.workflow_file_path(),
+    restart_workflow_store_with!(Workflow.workflow_file_path(),
       tracker_api_token: "env:#{api_key_env_var}",
       workspace_root: "env:#{workspace_env_var}"
     )

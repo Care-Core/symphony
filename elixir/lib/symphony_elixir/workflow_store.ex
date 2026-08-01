@@ -8,6 +8,7 @@ defmodule SymphonyElixir.WorkflowStore do
 
   alias SymphonyElixir.Config
   alias SymphonyElixir.Config.Schema
+  alias SymphonyElixir.Linear.Adapter, as: LinearAdapter
   alias SymphonyElixir.Workflow
 
   @poll_interval_ms 1_000
@@ -15,7 +16,7 @@ defmodule SymphonyElixir.WorkflowStore do
   defmodule State do
     @moduledoc false
 
-    defstruct [:path, :stamp, :workflow, :settings]
+    defstruct [:path, :stamp, :workflow, :settings, :linear_intake_identity]
   end
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -132,12 +133,40 @@ defmodule SymphonyElixir.WorkflowStore do
   defp reload_path(path, state) do
     case load_state(path) do
       {:ok, new_state} ->
-        {:ok, new_state}
+        accept_reload(path, state, new_state)
 
       {:error, reason} ->
         log_reload_error(path, reason)
         {:error, reason, state}
     end
+  end
+
+  defp accept_reload(path, state, new_state) do
+    case validate_immutable_linear_intake_identity(
+           state.linear_intake_identity,
+           new_state.linear_intake_identity
+         ) do
+      :ok ->
+        {:ok, preserve_linear_intake_identity(state, new_state)}
+
+      {:error, reason} ->
+        log_reload_error(path, reason)
+        {:error, reason, state}
+    end
+  end
+
+  defp validate_immutable_linear_intake_identity(nil, _new_identity), do: :ok
+  defp validate_immutable_linear_intake_identity(_current_identity, nil), do: :ok
+  defp validate_immutable_linear_intake_identity(identity, identity), do: :ok
+
+  defp validate_immutable_linear_intake_identity(_current_identity, _new_identity),
+    do: {:error, :linear_intake_scope_restart_required}
+
+  defp preserve_linear_intake_identity(state, new_state) do
+    %{
+      new_state
+      | linear_intake_identity: state.linear_intake_identity || new_state.linear_intake_identity
+    }
   end
 
   defp reload_current_path(path, state) do
@@ -159,12 +188,27 @@ defmodule SymphonyElixir.WorkflowStore do
          {:ok, settings} <- Schema.parse(workflow.config),
          :ok <- Config.validate_settings(settings),
          {:ok, stamp} <- current_stamp(path) do
-      {:ok, %State{path: path, stamp: stamp, workflow: workflow, settings: settings}}
+      {:ok,
+       %State{
+         path: path,
+         stamp: stamp,
+         workflow: workflow,
+         settings: settings,
+         linear_intake_identity: linear_intake_identity(settings)
+       }}
     else
       {:error, reason} ->
         {:error, reason}
     end
   end
+
+  defp linear_intake_identity(%{tracker: %{kind: "linear"} = tracker}) do
+    {:ok, scope} = LinearAdapter.intake_scope(tracker)
+
+    {scope, tracker.endpoint, :crypto.hash(:sha256, tracker.api_key)}
+  end
+
+  defp linear_intake_identity(_settings), do: nil
 
   defp current_stamp(path) when is_binary(path) do
     with {:ok, stat} <- File.stat(path, time: :posix),

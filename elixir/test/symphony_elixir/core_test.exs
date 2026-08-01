@@ -43,7 +43,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_project_slug: nil
     )
 
-    assert {:error, :missing_linear_project_slug} = Config.validate!()
+    assert {:error, :missing_linear_intake_scope} = Config.validate!()
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_api_token: "   ",
@@ -57,7 +57,29 @@ defmodule SymphonyElixir.CoreTest do
       tracker_project_slug: ""
     )
 
-    assert {:error, :missing_linear_project_slug} = Config.validate!()
+    assert {:error, :missing_linear_intake_scope} = Config.validate!()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: "token",
+      tracker_project_slug: nil,
+      tracker_team_key: " CC "
+    )
+
+    assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
+    assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
+    assert :ok = Config.validate!()
+
+    assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
+    write_workflow_file!(Workflow.workflow_file_path())
+    assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_api_token: "token",
+      tracker_project_slug: "project",
+      tracker_team_key: "CC"
+    )
+
+    assert {:error, :conflicting_linear_intake_scope} = Config.validate!()
 
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_project_slug: "project",
@@ -104,11 +126,21 @@ defmodule SymphonyElixir.CoreTest do
     original_workflow_path = Workflow.workflow_file_path()
     previous_linear_api_key = System.get_env("LINEAR_API_KEY")
 
-    on_exit(fn -> Workflow.set_workflow_file_path(original_workflow_path) end)
+    on_exit(fn ->
+      if Process.whereis(WorkflowStore) do
+        Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
+      end
+
+      Workflow.set_workflow_file_path(original_workflow_path)
+      Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
+    end)
+
     on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
 
     System.put_env("LINEAR_API_KEY", "test-linear-api-key")
     Workflow.clear_workflow_file_path()
+    assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
+    assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
 
     assert {:ok, %{config: config, prompt: prompt}} = Workflow.load()
     assert is_map(config)
@@ -139,7 +171,7 @@ defmodule SymphonyElixir.CoreTest do
     on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
     System.put_env("LINEAR_API_KEY", env_api_key)
 
-    write_workflow_file!(Workflow.workflow_file_path(),
+    restart_workflow_store_with!(Workflow.workflow_file_path(),
       tracker_api_token: nil,
       tracker_project_slug: "project",
       codex_command: "/bin/sh app-server"
@@ -246,6 +278,36 @@ defmodule SymphonyElixir.CoreTest do
     GenServer.stop(pid)
   end
 
+  test "a workflow store crash restarts the dependent agent runtime" do
+    workflow_store_pid = Process.whereis(WorkflowStore)
+    runtime_pid = Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) || restart_default_runtime!()
+
+    assert is_pid(workflow_store_pid)
+    assert is_pid(runtime_pid)
+
+    Process.exit(workflow_store_pid, :kill)
+
+    restarted_workflow_store_pid =
+      eventually_value(fn ->
+        case Process.whereis(WorkflowStore) do
+          pid when is_pid(pid) and pid != workflow_store_pid -> pid
+          _ -> nil
+        end
+      end)
+
+    restarted_runtime_pid =
+      eventually_value(fn ->
+        case Process.whereis(SymphonyElixir.AgentRuntimeSupervisor) do
+          pid when is_pid(pid) and pid != runtime_pid -> pid
+          _ -> nil
+        end
+      end)
+
+    assert is_pid(restarted_workflow_store_pid)
+    assert is_pid(restarted_runtime_pid)
+    refute Process.alive?(runtime_pid)
+  end
+
   test "orchestrator fails startup when semantic preflight fails" do
     issue_suffix = System.unique_integer([:positive])
     orchestrator_name = Module.concat(__MODULE__, "InvalidOrchestrator#{issue_suffix}")
@@ -286,7 +348,7 @@ defmodule SymphonyElixir.CoreTest do
 
     previous_trap_exit = Process.flag(:trap_exit, true)
 
-    assert {:error, :missing_linear_project_slug} =
+    assert {:error, :missing_linear_intake_scope} =
              Orchestrator.start_link(name: orchestrator_name)
 
     Process.flag(:trap_exit, previous_trap_exit)
@@ -324,7 +386,7 @@ defmodule SymphonyElixir.CoreTest do
       tracker_project_slug: nil
     )
 
-    assert {:error, :missing_linear_project_slug} = Config.validate!()
+    assert {:error, :missing_linear_intake_scope} = Config.validate!()
     assert Config.settings!().tracker.kind == "memory"
 
     Process.exit(original_orchestrator_pid, :kill)
@@ -1487,7 +1549,9 @@ defmodule SymphonyElixir.CoreTest do
     on_exit(fn -> restore_env("LINEAR_API_KEY", previous_linear_api_key) end)
 
     System.put_env("LINEAR_API_KEY", "test-linear-api-key")
+    assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
     Workflow.set_workflow_file_path(Path.expand("WORKFLOW.md", File.cwd!()))
+    assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
 
     issue = %Issue{
       identifier: "MT-616",
@@ -1498,7 +1562,14 @@ defmodule SymphonyElixir.CoreTest do
       labels: ["templating", "workflow"]
     }
 
-    on_exit(fn -> Workflow.set_workflow_file_path(workflow_path) end)
+    on_exit(fn ->
+      if Process.whereis(WorkflowStore) do
+        Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
+      end
+
+      Workflow.set_workflow_file_path(workflow_path)
+      Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
+    end)
 
     prompt = PromptBuilder.build_prompt(issue, attempt: 2)
 

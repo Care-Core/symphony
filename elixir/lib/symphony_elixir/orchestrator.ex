@@ -397,8 +397,14 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Tracker API token missing in WORKFLOW.md")
         state
 
-      {:error, :missing_linear_project_slug} ->
-        Logger.error("Tracker project scope missing in WORKFLOW.md")
+      {:error, reason}
+      when reason in [
+             :missing_linear_intake_scope,
+             :conflicting_linear_intake_scope,
+             :invalid_linear_project_slug,
+             :invalid_linear_team_key
+           ] ->
+        Logger.error("Tracker intake scope invalid in WORKFLOW.md: #{reason}")
         state
 
       {:error, :missing_tracker_kind} ->

@@ -5,6 +5,7 @@ defmodule SymphonyElixir.Linear.Client do
 
   require Logger
   alias SymphonyElixir.Config
+  alias SymphonyElixir.Linear.Adapter
   alias SymphonyElixir.Tracker.Issue
 
   @issue_page_size 50
@@ -96,6 +97,92 @@ defmodule SymphonyElixir.Linear.Client do
   }
   """
 
+  @team_query """
+  query SymphonyLinearTeamPoll($teamKey: String!, $stateNames: [String!]!, $first: Int!, $relationFirst: Int!, $after: String) {
+    issues(filter: {team: {key: {eq: $teamKey}}, state: {name: {in: $stateNames}}}, first: $first, after: $after) {
+      nodes {
+        id
+        identifier
+        title
+        description
+        priority
+        state {
+          name
+        }
+        branchName
+        url
+        assignee {
+          id
+        }
+        labels {
+          nodes {
+            name
+          }
+        }
+        inverseRelations(first: $relationFirst) {
+          nodes {
+            type
+            issue {
+              id
+              identifier
+              state {
+                name
+              }
+            }
+          }
+        }
+        createdAt
+        updatedAt
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+  """
+
+  @team_query_by_ids """
+  query SymphonyLinearTeamIssuesById($ids: [ID!]!, $teamKey: String!, $first: Int!, $relationFirst: Int!) {
+    issues(filter: {id: {in: $ids}, team: {key: {eq: $teamKey}}}, first: $first) {
+      nodes {
+        id
+        identifier
+        title
+        description
+        priority
+        state {
+          name
+        }
+        branchName
+        url
+        assignee {
+          id
+        }
+        labels {
+          nodes {
+            name
+          }
+        }
+        inverseRelations(first: $relationFirst) {
+          nodes {
+            type
+            issue {
+              id
+              identifier
+              state {
+                name
+              }
+            }
+          }
+        }
+        createdAt
+        updatedAt
+      }
+    }
+  }
+  """
+
   @viewer_query """
   query SymphonyLinearViewer {
     viewer {
@@ -113,9 +200,9 @@ defmodule SymphonyElixir.Linear.Client do
         {:ok, []}
 
       states ->
-        with {:ok, tracker} <- configured_tracker_for_read(),
+        with {:ok, {_tracker, intake_scope}} <- configured_tracker_for_read(),
              {:ok, assignee_filter} <- routing_assignee_filter() do
-          do_fetch_by_states(tracker.project_slug, states, assignee_filter)
+          do_fetch_by_states(intake_scope, states, assignee_filter)
         end
     end
   end
@@ -129,9 +216,9 @@ defmodule SymphonyElixir.Linear.Client do
         {:ok, []}
 
       ids ->
-        with {:ok, tracker} <- configured_tracker_for_read(),
+        with {:ok, {_tracker, intake_scope}} <- configured_tracker_for_read(),
              {:ok, assignee_filter} <- routing_assignee_filter() do
-          do_fetch_issue_states(ids, tracker.project_slug, assignee_filter)
+          do_fetch_issue_states(ids, intake_scope, assignee_filter)
         end
     end
   end
@@ -206,6 +293,17 @@ defmodule SymphonyElixir.Linear.Client do
           {:ok, [Issue.t()]} | {:error, term()}
   def fetch_issues_by_ids_for_test(issue_ids, graphql_fun)
       when is_list(issue_ids) and is_function(graphql_fun, 2) do
+    fetch_issues_by_ids_for_test(issue_ids, {:project_slug, "test-project"}, graphql_fun)
+  end
+
+  @doc false
+  @spec fetch_issues_by_ids_for_test(
+          [String.t()],
+          Adapter.intake_scope(),
+          (String.t(), map() -> {:ok, map()} | {:error, term()})
+        ) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_ids_for_test(issue_ids, intake_scope, graphql_fun)
+      when is_list(issue_ids) and is_tuple(intake_scope) and is_function(graphql_fun, 2) do
     ids = Enum.uniq(issue_ids)
 
     case ids do
@@ -213,29 +311,62 @@ defmodule SymphonyElixir.Linear.Client do
         {:ok, []}
 
       ids ->
-        do_fetch_issue_states(ids, "test-project", nil, graphql_fun)
+        do_fetch_issue_states(ids, intake_scope, nil, graphql_fun)
     end
   end
 
-  defp do_fetch_by_states(project_slug, state_names, assignee_filter) do
-    do_fetch_by_states_page(project_slug, state_names, assignee_filter, nil, [])
+  @doc false
+  @spec fetch_issues_by_states_for_test(
+          [String.t()],
+          Adapter.intake_scope(),
+          (String.t(), map() -> {:ok, map()} | {:error, term()})
+        ) :: {:ok, [Issue.t()]} | {:error, term()}
+  def fetch_issues_by_states_for_test(state_names, intake_scope, graphql_fun)
+      when is_list(state_names) and is_tuple(intake_scope) and is_function(graphql_fun, 2) do
+    do_fetch_by_states(intake_scope, Enum.uniq(state_names), nil, graphql_fun)
   end
 
-  defp do_fetch_by_states_page(project_slug, state_names, assignee_filter, after_cursor, acc_issues) do
+  defp do_fetch_by_states(intake_scope, state_names, assignee_filter) do
+    do_fetch_by_states(intake_scope, state_names, assignee_filter, &graphql/2)
+  end
+
+  defp do_fetch_by_states(intake_scope, state_names, assignee_filter, graphql_fun) do
+    do_fetch_by_states_page(intake_scope, state_names, assignee_filter, graphql_fun, nil, [])
+  end
+
+  defp do_fetch_by_states_page(
+         intake_scope,
+         state_names,
+         assignee_filter,
+         graphql_fun,
+         after_cursor,
+         acc_issues
+       ) do
+    {query, scope_variables} = poll_query(intake_scope)
+
     with {:ok, body} <-
-           graphql(@query, %{
-             projectSlug: project_slug,
-             stateNames: state_names,
-             first: @issue_page_size,
-             relationFirst: @issue_page_size,
-             after: after_cursor
-           }),
+           graphql_fun.(
+             query,
+             Map.merge(scope_variables, %{
+               stateNames: state_names,
+               first: @issue_page_size,
+               relationFirst: @issue_page_size,
+               after: after_cursor
+             })
+           ),
          {:ok, issues, page_info} <- decode_linear_page_response(body, assignee_filter) do
       updated_acc = prepend_page_issues(issues, acc_issues)
 
       case next_page_cursor(page_info) do
         {:ok, next_cursor} ->
-          do_fetch_by_states_page(project_slug, state_names, assignee_filter, next_cursor, updated_acc)
+          do_fetch_by_states_page(
+            intake_scope,
+            state_names,
+            assignee_filter,
+            graphql_fun,
+            next_cursor,
+            updated_acc
+          )
 
         :done ->
           {:ok, finalize_paginated_issues(updated_acc)}
@@ -252,39 +383,42 @@ defmodule SymphonyElixir.Linear.Client do
 
   defp finalize_paginated_issues(acc_issues) when is_list(acc_issues), do: Enum.reverse(acc_issues)
 
-  defp do_fetch_issue_states(ids, project_slug, assignee_filter) do
-    do_fetch_issue_states(ids, project_slug, assignee_filter, &graphql/2)
+  defp do_fetch_issue_states(ids, intake_scope, assignee_filter) do
+    do_fetch_issue_states(ids, intake_scope, assignee_filter, &graphql/2)
   end
 
-  defp do_fetch_issue_states(ids, project_slug, assignee_filter, graphql_fun)
-       when is_list(ids) and is_binary(project_slug) and is_function(graphql_fun, 2) do
+  defp do_fetch_issue_states(ids, intake_scope, assignee_filter, graphql_fun)
+       when is_list(ids) and is_tuple(intake_scope) and is_function(graphql_fun, 2) do
     issue_order_index = issue_order_index(ids)
-    do_fetch_issue_states_page(ids, project_slug, assignee_filter, graphql_fun, [], issue_order_index)
+    do_fetch_issue_states_page(ids, intake_scope, assignee_filter, graphql_fun, [], issue_order_index)
   end
 
-  defp do_fetch_issue_states_page([], _project_slug, _assignee_filter, _graphql_fun, acc_issues, issue_order_index) do
+  defp do_fetch_issue_states_page([], _intake_scope, _assignee_filter, _graphql_fun, acc_issues, issue_order_index) do
     acc_issues
     |> finalize_paginated_issues()
     |> sort_issues_by_requested_ids(issue_order_index)
     |> then(&{:ok, &1})
   end
 
-  defp do_fetch_issue_states_page(ids, project_slug, assignee_filter, graphql_fun, acc_issues, issue_order_index) do
+  defp do_fetch_issue_states_page(ids, intake_scope, assignee_filter, graphql_fun, acc_issues, issue_order_index) do
     {batch_ids, rest_ids} = Enum.split(ids, @issue_page_size)
+    {query, scope_variables} = issues_by_ids_query(intake_scope)
 
-    case graphql_fun.(@query_by_ids, %{
-           ids: batch_ids,
-           projectSlug: project_slug,
-           first: length(batch_ids),
-           relationFirst: @issue_page_size
-         }) do
+    case graphql_fun.(
+           query,
+           Map.merge(scope_variables, %{
+             ids: batch_ids,
+             first: length(batch_ids),
+             relationFirst: @issue_page_size
+           })
+         ) do
       {:ok, body} ->
         with {:ok, issues} <- decode_linear_response_strict(body, assignee_filter) do
           updated_acc = prepend_page_issues(issues, acc_issues)
 
           do_fetch_issue_states_page(
             rest_ids,
-            project_slug,
+            intake_scope,
             assignee_filter,
             graphql_fun,
             updated_acc,
@@ -400,6 +534,10 @@ defmodule SymphonyElixir.Linear.Client do
     decode_linear_response(response, assignee_filter, :error_on_malformed)
   end
 
+  defp decode_linear_response(%{"errors" => errors}, _assignee_filter, _malformed_policy) do
+    {:error, {:linear_graphql_errors, errors}}
+  end
+
   defp decode_linear_response(
          %{"data" => %{"issues" => %{"nodes" => nodes}}},
          assignee_filter,
@@ -428,12 +566,12 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
-  defp decode_linear_response(%{"errors" => errors}, _assignee_filter, _malformed_policy) do
-    {:error, {:linear_graphql_errors, errors}}
-  end
-
   defp decode_linear_response(_unknown, _assignee_filter, _malformed_policy) do
     {:error, :linear_unknown_payload}
+  end
+
+  defp decode_linear_page_response(%{"errors" => errors}, _assignee_filter) do
+    {:error, {:linear_graphql_errors, errors}}
   end
 
   defp decode_linear_page_response(
@@ -556,12 +694,24 @@ defmodule SymphonyElixir.Linear.Client do
   defp configured_tracker_for_read do
     tracker = Config.settings!().tracker
 
-    cond do
-      is_nil(tracker.api_key) -> {:error, :missing_linear_api_token}
-      is_nil(tracker.project_slug) -> {:error, :missing_linear_project_slug}
-      true -> {:ok, tracker}
+    if is_nil(tracker.api_key) do
+      {:error, :missing_linear_api_token}
+    else
+      case Adapter.intake_scope(tracker) do
+        {:ok, intake_scope} -> {:ok, {tracker, intake_scope}}
+        {:error, reason} -> {:error, reason}
+      end
     end
   end
+
+  defp poll_query({:project_slug, project_slug}), do: {@query, %{projectSlug: project_slug}}
+  defp poll_query({:team_key, team_key}), do: {@team_query, %{teamKey: team_key}}
+
+  defp issues_by_ids_query({:project_slug, project_slug}),
+    do: {@query_by_ids, %{projectSlug: project_slug}}
+
+  defp issues_by_ids_query({:team_key, team_key}),
+    do: {@team_query_by_ids, %{teamKey: team_key}}
 
   defp build_assignee_filter(assignee) when is_binary(assignee) do
     case normalize_assignee_match_value(assignee) do
