@@ -232,6 +232,40 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "recorded workspace removal carries exact issue branch context into hooks" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-recorded-workspace-branch-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      recorded_workspace = Path.join([test_root, "recorded-workspaces", "MT-RECORDED-BRANCH"])
+      current_root = Path.join(test_root, "current-workspaces")
+      before_remove_marker = Path.join(test_root, "before-remove.branch")
+      branch_name = "feature/recorded-exact-branch"
+
+      File.mkdir_p!(recorded_workspace)
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: current_root,
+        hook_before_remove: "printf '%s' \"$SYMPHONY_ISSUE_BRANCH_NAME\" > \"#{before_remove_marker}\""
+      )
+
+      issue = %Issue{
+        id: "recorded-branch",
+        identifier: "MT-RECORDED-BRANCH",
+        branch_name: branch_name
+      }
+
+      assert {:ok, _removed} = Workspace.remove_recorded(recorded_workspace, nil, issue)
+      assert File.read!(before_remove_marker) == branch_name
+      refute File.exists?(recorded_workspace)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace canonicalizes symlinked workspace roots before creating issue directories" do
     test_root =
       Path.join(
@@ -300,6 +334,119 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "local workspace hooks receive the exact issue branch without shell expansion" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-branch-#{System.unique_integer([:positive])}"
+      )
+
+    previous_branch = System.get_env("SYMPHONY_ISSUE_BRANCH_NAME")
+    previous_home = System.get_env("HOME")
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_ISSUE_BRANCH_NAME", previous_branch)
+      restore_env("HOME", previous_home)
+    end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      shell_home = Path.join(test_root, "shell-home")
+      injection_marker = Path.join(test_root, "branch-executed")
+      before_remove_marker = Path.join(test_root, "before-remove.branch")
+
+      branch_name =
+        "feature/exact-'quote'-$HOME-$(touch #{injection_marker})\nnext; touch #{injection_marker}"
+
+      File.mkdir_p!(shell_home)
+
+      File.write!(
+        Path.join(shell_home, ".profile"),
+        "export SYMPHONY_ISSUE_BRANCH_NAME='profile-stale-branch'\n"
+      )
+
+      System.put_env("HOME", shell_home)
+      System.put_env("SYMPHONY_ISSUE_BRANCH_NAME", "ambient-stale-branch")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "printf '%s' \"$SYMPHONY_ISSUE_BRANCH_NAME\" > after-create.branch",
+        hook_before_run: "printf '%s' \"$SYMPHONY_ISSUE_BRANCH_NAME\" > before-run.branch",
+        hook_after_run: "printf '%s' \"$SYMPHONY_ISSUE_BRANCH_NAME\" > after-run.branch",
+        hook_before_remove: "printf '%s' \"$SYMPHONY_ISSUE_BRANCH_NAME\" > \"#{before_remove_marker}\""
+      )
+
+      issue = %Issue{id: "issue-branch", identifier: "MT-BRANCH", branch_name: branch_name}
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
+      assert :ok = Workspace.run_before_run_hook(workspace, issue)
+      assert :ok = Workspace.run_after_run_hook(workspace, issue)
+
+      assert File.read!(Path.join(workspace, "after-create.branch")) == branch_name
+      assert File.read!(Path.join(workspace, "before-run.branch")) == branch_name
+      assert File.read!(Path.join(workspace, "after-run.branch")) == branch_name
+      refute File.exists?(injection_marker)
+
+      assert :ok = Workspace.remove_issue_workspaces(issue)
+      assert File.read!(before_remove_marker) == branch_name
+      refute File.exists?(workspace)
+      refute File.exists?(injection_marker)
+      assert System.get_env("SYMPHONY_ISSUE_BRANCH_NAME") == "ambient-stale-branch"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "workspace hooks clear ambient branch context when the issue has no branch" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-missing-branch-#{System.unique_integer([:positive])}"
+      )
+
+    previous_branch = System.get_env("SYMPHONY_ISSUE_BRANCH_NAME")
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_ISSUE_BRANCH_NAME", previous_branch)
+    end)
+
+    try do
+      workspace_root = Path.join(test_root, "workspaces")
+      System.put_env("SYMPHONY_ISSUE_BRANCH_NAME", "ambient-stale-branch")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "test -z \"$SYMPHONY_ISSUE_BRANCH_NAME\""
+      )
+
+      assert {:ok, _workspace} =
+               Workspace.create_for_issue(%Issue{
+                 id: "missing-branch",
+                 identifier: "MT-NO-BRANCH",
+                 branch_name: nil
+               })
+
+      assert {:ok, _workspace} =
+               Workspace.create_for_issue(%Issue{
+                 id: "invalid-branch",
+                 identifier: "MT-INVALID-BRANCH",
+                 branch_name: 123
+               })
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        hook_after_create: "test -n \"$SYMPHONY_ISSUE_BRANCH_NAME\" || exit 23"
+      )
+
+      assert {:error, {:workspace_hook_failed, "after_create", 23, _output}} =
+               Workspace.create_for_issue("MT-BRANCH-REQUIRED")
+
+      assert System.get_env("SYMPHONY_ISSUE_BRANCH_NAME") == "ambient-stale-branch"
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
   test "workspace retries after_create after a failed new workspace bootstrap" do
     test_root =
       Path.join(
@@ -309,6 +456,8 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
 
     workspace_root = Path.join(test_root, "workspaces")
     attempt_log = Path.join(test_root, "after-create-attempts")
+    branch_log = Path.join(test_root, "after-create-branches")
+    branch_name = "feature/retry-exact-branch"
 
     try do
       write_workflow_file!(Workflow.workflow_file_path(),
@@ -316,17 +465,25 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
         hook_after_create: """
         if [ -f "#{attempt_log}" ]; then count=$(wc -l < "#{attempt_log}"); else count=0; fi
         printf 'attempt\\n' >> "#{attempt_log}"
+        printf '%s\\n' "$SYMPHONY_ISSUE_BRANCH_NAME" >> "#{branch_log}"
         if [ "$count" -eq 0 ]; then printf partial > partial.txt; exit 17; fi
         printf ready > READY
         """
       )
 
-      assert {:error, {:workspace_hook_failed, "after_create", 17, _output}} =
-               Workspace.create_for_issue("MT-FAIL-RETRY")
+      issue = %Issue{
+        id: "retry-branch",
+        identifier: "MT-FAIL-RETRY",
+        branch_name: branch_name
+      }
 
-      assert {:ok, workspace} = Workspace.create_for_issue("MT-FAIL-RETRY")
+      assert {:error, {:workspace_hook_failed, "after_create", 17, _output}} =
+               Workspace.create_for_issue(issue)
+
+      assert {:ok, workspace} = Workspace.create_for_issue(issue)
       assert File.read!(Path.join(workspace, "READY")) == "ready"
       assert String.split(String.trim(File.read!(attempt_log)), "\n") == ["attempt", "attempt"]
+      assert String.split(String.trim(File.read!(branch_log)), "\n") == [branch_name, branch_name]
     after
       File.rm_rf(test_root)
     end
@@ -1859,6 +2016,84 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
       assert trace =~ "echo before-remove"
       assert trace =~ "rm -rf"
       assert trace =~ workspace_path
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "remote workspace hooks receive literal issue branch context and clear it for removal" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-remote-hook-branch-#{System.unique_integer([:positive])}"
+      )
+
+    previous_path = System.get_env("PATH")
+    previous_branch = System.get_env("SYMPHONY_ISSUE_BRANCH_NAME")
+
+    on_exit(fn ->
+      restore_env("PATH", previous_path)
+      restore_env("SYMPHONY_ISSUE_BRANCH_NAME", previous_branch)
+    end)
+
+    try do
+      fake_ssh = Path.join(test_root, "ssh")
+      workspace_root = Path.join(test_root, "remote-workspaces")
+      workspace_path = Path.join(workspace_root, "MT-SSH-BRANCH")
+      before_remove_marker = Path.join(test_root, "before-remove.branch")
+      injection_marker = Path.join(test_root, "branch-executed")
+
+      branch_name =
+        "feature/remote-'quote'-$HOME-$(touch #{injection_marker})\nnext; touch #{injection_marker}"
+
+      File.mkdir_p!(test_root)
+
+      File.write!(fake_ssh, """
+      #!/bin/sh
+      for arg in "$@"; do remote_command="$arg"; done
+      exec /bin/sh -c "$remote_command"
+      """)
+
+      File.chmod!(fake_ssh, 0o755)
+      System.put_env("PATH", test_root <> ":" <> (previous_path || ""))
+      System.put_env("SYMPHONY_ISSUE_BRANCH_NAME", "ambient-stale-branch")
+
+      write_workflow_file!(Workflow.workflow_file_path(),
+        workspace_root: workspace_root,
+        worker_ssh_hosts: ["worker-01:2200"],
+        hook_after_create: "printf '%s' \"$SYMPHONY_ISSUE_BRANCH_NAME\" > after-create.branch",
+        hook_before_run: "printf '%s' \"$SYMPHONY_ISSUE_BRANCH_NAME\" > before-run.branch",
+        hook_after_run: "printf '%s' \"$SYMPHONY_ISSUE_BRANCH_NAME\" > after-run.branch",
+        hook_before_remove: "printf '%s' \"$SYMPHONY_ISSUE_BRANCH_NAME\" > \"#{before_remove_marker}\""
+      )
+
+      issue = %Issue{
+        id: "remote-issue-branch",
+        identifier: "MT-SSH-BRANCH",
+        branch_name: branch_name
+      }
+
+      assert {:ok, canonical_workspace_path} =
+               SymphonyElixir.PathSafety.canonicalize(workspace_path)
+
+      assert {:ok, ^canonical_workspace_path} =
+               Workspace.create_for_issue(issue, "worker-01:2200")
+
+      assert :ok =
+               Workspace.run_before_run_hook(canonical_workspace_path, issue, "worker-01:2200")
+
+      assert :ok =
+               Workspace.run_after_run_hook(canonical_workspace_path, issue, "worker-01:2200")
+
+      assert File.read!(Path.join(canonical_workspace_path, "after-create.branch")) == branch_name
+      assert File.read!(Path.join(canonical_workspace_path, "before-run.branch")) == branch_name
+      assert File.read!(Path.join(canonical_workspace_path, "after-run.branch")) == branch_name
+      refute File.exists?(injection_marker)
+
+      assert :ok = Workspace.remove_issue_workspaces(issue, "worker-01:2200")
+      assert File.read!(before_remove_marker) == branch_name
+      refute File.exists?(workspace_path)
+      assert System.get_env("SYMPHONY_ISSUE_BRANCH_NAME") == "ambient-stale-branch"
     after
       File.rm_rf(test_root)
     end

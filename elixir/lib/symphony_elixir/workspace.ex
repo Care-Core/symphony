@@ -7,6 +7,7 @@ defmodule SymphonyElixir.Workspace do
   alias SymphonyElixir.{Config, PathSafety, SSH}
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
+  @issue_branch_env "SYMPHONY_ISSUE_BRANCH_NAME"
 
   @type worker_host :: String.t() | nil
 
@@ -94,12 +95,16 @@ defmodule SymphonyElixir.Workspace do
   def remove(workspace), do: remove(workspace, nil)
 
   @spec remove(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
-  def remove(workspace, nil) do
+  def remove(workspace, worker_host) do
+    remove_with_context(workspace, worker_host, issue_context(Path.basename(workspace)))
+  end
+
+  defp remove_with_context(workspace, nil, issue_context) do
     case File.exists?(workspace) do
       true ->
         case validate_workspace_path(workspace, nil) do
           :ok ->
-            remove_local_workspace(workspace)
+            remove_local_workspace(workspace, issue_context)
 
           {:error, reason} ->
             {:error, reason, ""}
@@ -110,8 +115,8 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  def remove(workspace, worker_host) when is_binary(worker_host) do
-    maybe_run_before_remove_hook(workspace, worker_host)
+  defp remove_with_context(workspace, worker_host, issue_context) when is_binary(worker_host) do
+    maybe_run_before_remove_hook(workspace, issue_context, worker_host)
 
     script =
       [
@@ -134,11 +139,18 @@ defmodule SymphonyElixir.Workspace do
 
   @doc false
   @spec remove_recorded(Path.t(), worker_host()) :: {:ok, [String.t()]} | {:error, term(), String.t()}
-  def remove_recorded(workspace, nil) when is_binary(workspace) do
+  def remove_recorded(workspace, worker_host) do
+    remove_recorded(workspace, worker_host, nil)
+  end
+
+  @doc false
+  @spec remove_recorded(Path.t(), worker_host(), term()) ::
+          {:ok, [String.t()]} | {:error, term(), String.t()}
+  def remove_recorded(workspace, nil, issue_or_identifier) when is_binary(workspace) do
     if Path.type(workspace) == :absolute do
       case validate_recorded_workspace_path(workspace) do
         :ok ->
-          remove_local_workspace(workspace)
+          remove_local_workspace(workspace, issue_context(issue_or_identifier))
 
         {:error, reason} ->
           {:error, reason, ""}
@@ -148,16 +160,17 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  def remove_recorded(workspace, worker_host) when is_binary(workspace) and is_binary(worker_host) do
-    remove(workspace, worker_host)
+  def remove_recorded(workspace, worker_host, issue_or_identifier)
+      when is_binary(workspace) and is_binary(worker_host) do
+    remove_with_context(workspace, worker_host, issue_context(issue_or_identifier))
   end
 
-  def remove_recorded(workspace, _worker_host) do
+  def remove_recorded(workspace, _worker_host, _issue_or_identifier) do
     {:error, {:workspace_path_unreadable, workspace, :invalid}, ""}
   end
 
-  defp remove_local_workspace(workspace) do
-    maybe_run_before_remove_hook(workspace, nil)
+  defp remove_local_workspace(workspace, issue_context) do
+    maybe_run_before_remove_hook(workspace, issue_context, nil)
     File.rm_rf(workspace)
   end
 
@@ -168,7 +181,7 @@ defmodule SymphonyElixir.Workspace do
   def remove_issue_workspaces(%{id: _issue_id, identifier: _identifier} = issue, worker_host)
       when is_binary(worker_host) do
     case workspace_path_for_issue(workspace_key(issue), worker_host) do
-      {:ok, workspace} -> remove(workspace, worker_host)
+      {:ok, workspace} -> remove_with_context(workspace, worker_host, issue_context(issue))
       {:error, _reason} -> :ok
     end
 
@@ -179,7 +192,7 @@ defmodule SymphonyElixir.Workspace do
     case Config.settings!().worker.ssh_hosts do
       [] ->
         case workspace_path_for_issue(workspace_key(issue), nil) do
-          {:ok, workspace} -> remove(workspace, nil)
+          {:ok, workspace} -> remove_with_context(workspace, nil, issue_context(issue))
           {:error, _reason} -> :ok
         end
 
@@ -328,7 +341,7 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp maybe_run_before_remove_hook(workspace, nil) do
+  defp maybe_run_before_remove_hook(workspace, issue_context, nil) do
     hooks = Config.settings!().hooks
 
     case File.dir?(workspace) do
@@ -338,13 +351,7 @@ defmodule SymphonyElixir.Workspace do
             :ok
 
           command ->
-            run_hook(
-              command,
-              workspace,
-              %{issue_id: nil, issue_identifier: Path.basename(workspace)},
-              "before_remove",
-              nil
-            )
+            run_hook(command, workspace, issue_context, "before_remove", nil)
             |> ignore_hook_failure()
         end
 
@@ -353,7 +360,8 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp maybe_run_before_remove_hook(workspace, worker_host) when is_binary(worker_host) do
+  defp maybe_run_before_remove_hook(workspace, issue_context, worker_host)
+       when is_binary(worker_host) do
     hooks = Config.settings!().hooks
 
     case hooks.before_remove do
@@ -363,6 +371,7 @@ defmodule SymphonyElixir.Workspace do
       command ->
         script =
           [
+            hook_environment_command(issue_context),
             remote_shell_assign("workspace", workspace),
             "if [ -d \"$workspace\" ]; then",
             "  cd \"$workspace\"",
@@ -377,7 +386,7 @@ defmodule SymphonyElixir.Workspace do
             handle_hook_command_result(
               {output, status},
               workspace,
-              %{issue_id: nil, issue_identifier: Path.basename(workspace)},
+              issue_context,
               "before_remove"
             )
 
@@ -401,7 +410,13 @@ defmodule SymphonyElixir.Workspace do
 
     task =
       Task.async(fn ->
-        System.cmd("sh", ["-lc", command], cd: workspace, stderr_to_stdout: true)
+        hook_command = hook_environment_command(issue_context) <> "\n" <> command
+
+        System.cmd("sh", ["-lc", hook_command],
+          cd: workspace,
+          env: hook_environment(issue_context),
+          stderr_to_stdout: true
+        )
       end)
 
     case Task.yield(task, timeout_ms) do
@@ -422,7 +437,14 @@ defmodule SymphonyElixir.Workspace do
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
-    case run_remote_command(worker_host, "cd #{shell_escape(workspace)} && #{command}", timeout_ms) do
+    script =
+      [
+        hook_environment_command(issue_context),
+        "cd #{shell_escape(workspace)} && #{command}"
+      ]
+      |> Enum.join("\n")
+
+    case run_remote_command(worker_host, script, timeout_ms) do
       {:ok, cmd_result} ->
         handle_hook_command_result(cmd_result, workspace, issue_context, hook_name)
 
@@ -565,27 +587,41 @@ defmodule SymphonyElixir.Workspace do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
 
+  defp hook_environment(issue_context) do
+    [{@issue_branch_env, hook_branch_name(issue_context)}]
+  end
+
+  defp hook_environment_command(issue_context) do
+    "export #{@issue_branch_env}=#{shell_escape(hook_branch_name(issue_context))}"
+  end
+
+  defp hook_branch_name(%{branch_name: branch_name}) when is_binary(branch_name), do: branch_name
+  defp hook_branch_name(_issue_context), do: ""
+
   defp worker_host_for_log(nil), do: "local"
   defp worker_host_for_log(worker_host), do: worker_host
 
-  defp issue_context(%{id: issue_id, identifier: identifier}) do
+  defp issue_context(%{id: issue_id, identifier: identifier} = issue) do
     %{
       issue_id: issue_id,
-      issue_identifier: identifier || "issue"
+      issue_identifier: identifier || "issue",
+      branch_name: Map.get(issue, :branch_name)
     }
   end
 
   defp issue_context(identifier) when is_binary(identifier) do
     %{
       issue_id: nil,
-      issue_identifier: identifier
+      issue_identifier: identifier,
+      branch_name: nil
     }
   end
 
   defp issue_context(_identifier) do
     %{
       issue_id: nil,
-      issue_identifier: "issue"
+      issue_identifier: "issue",
+      branch_name: nil
     }
   end
 

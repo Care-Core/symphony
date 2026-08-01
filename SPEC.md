@@ -441,6 +441,11 @@ Fields:
   - Invalid values fail configuration validation.
   - Changes SHOULD be re-applied at runtime for future hook executions.
 
+Hooks invoked with a full tracker issue expose that issue's exact normalized branch through
+`SYMPHONY_ISSUE_BRANCH_NAME`. Implementations MUST override an ambient value for the hook process,
+MUST use an empty value when no branch context is available, and MUST treat the value as data rather
+than shell source. This hook-scoped variable does not imply that the coding-agent child receives it.
+
 #### 5.3.5 `agent` (object)
 
 Fields:
@@ -922,6 +927,9 @@ Execution contract:
   `cwd`.
 - On POSIX systems, `sh -lc <script>` (or a stricter equivalent such as `bash -lc <script>`) is a
   conforming default.
+- For hooks invoked with a full tracker issue, set `SYMPHONY_ISSUE_BRANCH_NAME` to the exact
+  normalized issue branch. Override ambient state, use an empty value when the branch is absent,
+  and preserve the value literally across local and remote shells.
 - Hook timeout uses `hooks.timeout_ms`; default: `60000 ms`.
 - Log hook start, failures, and timeouts.
 

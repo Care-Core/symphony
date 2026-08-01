@@ -207,6 +207,10 @@ Notes:
   identifier, title, and body.
 - Use `hooks.after_create` to bootstrap a fresh workspace. For a Git-backed repo, you can run
   `git clone ... .` there, along with any other setup commands you need.
+- Hooks invoked with a full tracker issue receive its exact normalized branch as
+  `SYMPHONY_ISSUE_BRANCH_NAME`. Symphony overrides any ambient value for the hook process and uses
+  an empty value when branch context is unavailable; the variable is not added to the coding-agent
+  process.
 - If a hook needs `mise exec` inside a freshly cloned workspace, trust the repo config and fetch
   the project dependencies in `hooks.after_create` before invoking `mise` later from other hooks.
 - For the Linear adapter, `tracker.provider.api_key` reads from `LINEAR_API_KEY` when unset or
