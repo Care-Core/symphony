@@ -11,6 +11,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @turn_start_id 3
   @token_warning_steer_id "symphony-token-budget-warning"
   @control_token_env "SYMPHONY_CONTROL_TOKEN"
+  @issue_branch_env "SYMPHONY_ISSUE_BRANCH_NAME"
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @max_answered_connector_elicitation_ids 256
@@ -246,7 +247,7 @@ defmodule SymphonyElixir.Codex.AppServer do
             :stderr_to_stdout,
             args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding))],
             cd: String.to_charlist(workspace),
-            env: tracker_secret_port_env(dynamic_tool_binding),
+            env: child_scrub_port_env(dynamic_tool_binding),
             line: @port_line_bytes
           ]
         )
@@ -262,7 +263,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp local_launch_command(dynamic_tool_binding) do
     [
-      tracker_secret_unset_command(dynamic_tool_binding),
+      child_scrub_unset_command(dynamic_tool_binding),
       "exec #{Config.settings!().codex.command}"
     ]
     |> Enum.reject(&is_nil/1)
@@ -272,28 +273,28 @@ defmodule SymphonyElixir.Codex.AppServer do
   defp remote_launch_command(workspace, dynamic_tool_binding) when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
-      tracker_secret_unset_command(dynamic_tool_binding),
+      child_scrub_unset_command(dynamic_tool_binding),
       "exec #{Config.settings!().codex.command}"
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
   end
 
-  defp tracker_secret_port_env(dynamic_tool_binding) do
+  defp child_scrub_port_env(dynamic_tool_binding) do
     dynamic_tool_binding
-    |> child_secret_environment_names()
+    |> child_scrub_environment_names()
     |> Enum.map(fn name -> {String.to_charlist(name), false} end)
   end
 
-  defp tracker_secret_unset_command(dynamic_tool_binding) do
-    case child_secret_environment_names(dynamic_tool_binding) do
+  defp child_scrub_unset_command(dynamic_tool_binding) do
+    case child_scrub_environment_names(dynamic_tool_binding) do
       [] -> nil
       names -> "unset " <> Enum.join(names, " ")
     end
   end
 
-  defp child_secret_environment_names(dynamic_tool_binding) do
-    [@control_token_env | dynamic_tool_binding.secret_environment_names]
+  defp child_scrub_environment_names(dynamic_tool_binding) do
+    [@control_token_env, @issue_branch_env | dynamic_tool_binding.secret_environment_names]
     |> valid_environment_names()
     |> Enum.uniq()
   end

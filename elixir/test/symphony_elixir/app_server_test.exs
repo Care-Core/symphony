@@ -2043,6 +2043,7 @@ defmodule SymphonyElixir.AppServerTest do
     previous_secret = System.get_env("LINEAR_API_KEY")
     previous_custom_secret = System.get_env(custom_secret_env)
     previous_control_token = System.get_env("SYMPHONY_CONTROL_TOKEN")
+    previous_issue_branch = System.get_env("SYMPHONY_ISSUE_BRANCH_NAME")
     previous_home = System.get_env("HOME")
     previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
 
@@ -2050,6 +2051,7 @@ defmodule SymphonyElixir.AppServerTest do
       restore_env("LINEAR_API_KEY", previous_secret)
       restore_env(custom_secret_env, previous_custom_secret)
       restore_env("SYMPHONY_CONTROL_TOKEN", previous_control_token)
+      restore_env("SYMPHONY_ISSUE_BRANCH_NAME", previous_issue_branch)
       restore_env("HOME", previous_home)
       restore_env("SYMP_TEST_CODEx_TRACE", previous_trace)
     end)
@@ -2068,12 +2070,14 @@ defmodule SymphonyElixir.AppServerTest do
       export LINEAR_API_KEY='profile-canonical-secret-that-must-not-reach-child'
       export #{custom_secret_env}='profile-custom-secret-that-must-not-reach-child'
       export SYMPHONY_CONTROL_TOKEN='profile-control-secret-that-must-not-reach-child'
+      export SYMPHONY_ISSUE_BRANCH_NAME='profile-branch-that-must-not-reach-child'
       export #{profile_marker_env}=1
       """)
 
       System.put_env("LINEAR_API_KEY", "canonical-secret-that-must-not-reach-child")
       System.put_env(custom_secret_env, "custom-secret-that-must-not-reach-child")
       System.put_env("SYMPHONY_CONTROL_TOKEN", "control-secret-that-must-not-reach-child")
+      System.put_env("SYMPHONY_ISSUE_BRANCH_NAME", "ambient-branch-that-must-not-reach-child")
       System.put_env("HOME", bash_home)
       System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
 
@@ -2084,6 +2088,7 @@ defmodule SymphonyElixir.AppServerTest do
       printf 'CANONICAL_SECRET:%s\n' "$LINEAR_API_KEY" >> "$trace_file"
       printf 'CUSTOM_SECRET:%s\n' "$#{custom_secret_env}" >> "$trace_file"
       printf 'CONTROL_SECRET:%s\n' "$SYMPHONY_CONTROL_TOKEN" >> "$trace_file"
+      printf 'ISSUE_BRANCH:%s\n' "$SYMPHONY_ISSUE_BRANCH_NAME" >> "$trace_file"
       count=0
 
       while IFS= read -r line; do
@@ -2133,7 +2138,9 @@ defmodule SymphonyElixir.AppServerTest do
       assert File.read!(trace_file) =~ "CANONICAL_SECRET:\n"
       assert File.read!(trace_file) =~ "CUSTOM_SECRET:\n"
       assert File.read!(trace_file) =~ "CONTROL_SECRET:\n"
+      assert File.read!(trace_file) =~ "ISSUE_BRANCH:\n"
       refute File.read!(trace_file) =~ "secret-that-must-not-reach-child"
+      refute File.read!(trace_file) =~ "branch-that-must-not-reach-child"
     after
       File.rm_rf(test_root)
     end
@@ -2226,7 +2233,10 @@ defmodule SymphonyElixir.AppServerTest do
       assert argv_line =~ "-T -p 2200 worker-01 bash -lc"
       assert argv_line =~ "cd "
       assert argv_line =~ remote_workspace
-      assert argv_line =~ "unset SYMPHONY_CONTROL_TOKEN LINEAR_API_KEY"
+
+      assert argv_line =~
+               "unset SYMPHONY_CONTROL_TOKEN SYMPHONY_ISSUE_BRANCH_NAME LINEAR_API_KEY"
+
       assert argv_line =~ "exec "
       assert argv_line =~ "fake-remote-codex app-server"
 
