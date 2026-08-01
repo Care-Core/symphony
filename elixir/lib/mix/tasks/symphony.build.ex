@@ -27,9 +27,8 @@ defmodule Mix.Tasks.Symphony.Build do
              stderr_to_stdout: true
            ),
          source_sha <- String.trim(source_sha),
-         true <- Regex.match?(~r/\A[0-9a-f]{40}\z/, source_sha),
-         true <- String.trim(status) == "" do
-      source_sha
+         true <- Regex.match?(~r/\A[0-9a-f]{40}\z/, source_sha) do
+      if String.trim(status) == "", do: source_sha, else: source_sha <> "-dirty"
     else
       _ -> Mix.raise("Symphony builds require a clean Git checkout at an exact commit")
     end
@@ -53,7 +52,14 @@ defmodule Mix.Tasks.Symphony.Build do
       """
     )
 
-    case Kernel.ParallelCompiler.compile_to_path([generated_source], Mix.Project.compile_path()) do
+    :code.purge(SymphonyElixir.BuildInfo)
+    :code.delete(SymphonyElixir.BuildInfo)
+
+    case Kernel.ParallelCompiler.compile_to_path(
+           [generated_source],
+           Mix.Project.compile_path(),
+           return_diagnostics: true
+         ) do
       {:ok, _modules, _warnings} -> :ok
       {:error, errors, _warnings} -> Mix.raise("Unable to embed build provenance: #{inspect(errors)}")
     end
