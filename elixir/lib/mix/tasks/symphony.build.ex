@@ -8,7 +8,7 @@ defmodule Mix.Tasks.Symphony.Build do
     source_sha = source_sha!()
 
     Mix.Task.run("compile")
-    write_build_info!(source_sha)
+    write_build_provenance!(source_sha)
     Mix.Task.reenable("escript.build")
     Mix.Task.run("escript.build")
   end
@@ -34,34 +34,22 @@ defmodule Mix.Tasks.Symphony.Build do
     end
   end
 
-  defp write_build_info!(source_sha) do
-    generated_root = Path.join(Mix.Project.manifest_path(), "generated")
-    generated_source = Path.join(generated_root, "symphony_build_info.ex")
-    File.mkdir_p!(generated_root)
+  defp write_build_provenance!(source_sha) do
+    app = Mix.Project.config()[:app]
+    application_path = Path.join(Mix.Project.compile_path(), "#{app}.app")
 
-    File.write!(
-      generated_source,
-      """
-      defmodule SymphonyElixir.BuildInfo do
-        @moduledoc false
-        @source_sha #{inspect(source_sha)}
+    case :file.consult(String.to_charlist(application_path)) do
+      {:ok, [{:application, ^app, properties}]} ->
+        environment =
+          properties
+          |> Keyword.get(:env, [])
+          |> Keyword.put(:build_source_sha, source_sha)
 
-        @spec source_sha() :: String.t()
-        def source_sha, do: @source_sha
-      end
-      """
-    )
+        application = {:application, app, Keyword.put(properties, :env, environment)}
+        File.write!(application_path, :io_lib.format(~c"~tp.~n", [application]))
 
-    :code.purge(SymphonyElixir.BuildInfo)
-    :code.delete(SymphonyElixir.BuildInfo)
-
-    case Kernel.ParallelCompiler.compile_to_path(
-           [generated_source],
-           Mix.Project.compile_path(),
-           return_diagnostics: true
-         ) do
-      {:ok, _modules, _warnings} -> :ok
-      {:error, errors, _warnings} -> Mix.raise("Unable to embed build provenance: #{inspect(errors)}")
+      other ->
+        Mix.raise("Unable to embed build provenance in #{application_path}: #{inspect(other)}")
     end
   end
 end
