@@ -77,6 +77,10 @@ mise exec -- mix build
 mise exec -- ./bin/symphony ./WORKFLOW.md
 ```
 
+`mix build` records the exact Git commit in the escript application metadata. Builds from a dirty
+checkout are marked `<commit>-dirty` so deployment tooling can reject artifacts that do not match
+the clean source checkout it validated.
+
 ## Burrito releases
 
 Symphony ships self-contained executables built with
