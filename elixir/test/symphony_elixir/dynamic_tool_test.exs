@@ -50,6 +50,9 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
       tracker_project_slug: "session-project"
     )
 
+    assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
+    assert {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
+
     binding = BoundDynamicTool.bind()
 
     write_workflow_file!(Workflow.workflow_file_path(), tracker_kind: "memory")

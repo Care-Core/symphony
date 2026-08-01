@@ -170,10 +170,10 @@ defmodule SymphonyElixir.ExtensionsTest do
       prompt: "Semantic-invalid prompt"
     )
 
-    assert {:error, :missing_linear_project_slug} = WorkflowStore.force_reload()
+    assert {:error, :missing_linear_intake_scope} = WorkflowStore.force_reload()
     assert {:ok, %{prompt: "Second prompt"}} = Workflow.current()
     assert Config.settings!().polling.interval_ms == good_settings.polling.interval_ms
-    assert {:error, :missing_linear_project_slug} = Config.validate!()
+    assert {:error, :missing_linear_intake_scope} = Config.validate!()
 
     third_workflow = Path.join(Path.dirname(Workflow.workflow_file_path()), "THIRD_WORKFLOW.md")
     write_workflow_file!(third_workflow, prompt: "Third prompt")
@@ -284,6 +284,57 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert_receive {:fetch_issues_by_ids_called, ["issue-1"]}
 
     assert [%{"name" => "linear_graphql"}] = Adapter.agent_tool_specs()
+  end
+
+  test "linear adapter requires one normalized intake scope" do
+    assert {:ok, {:project_slug, "project"}} =
+             Adapter.intake_scope(%{project_slug: " project ", team_key: nil})
+
+    assert {:ok, {:team_key, "CC"}} =
+             Adapter.intake_scope(%{project_slug: nil, team_key: " CC "})
+
+    assert {:error, :missing_linear_intake_scope} =
+             Adapter.intake_scope(%{project_slug: " ", team_key: nil})
+
+    assert {:error, :conflicting_linear_intake_scope} =
+             Adapter.intake_scope(%{project_slug: "project", team_key: "CC"})
+
+    assert {:error, :invalid_linear_project_slug} =
+             Adapter.intake_scope(%{project_slug: 123, team_key: nil})
+
+    assert {:error, :invalid_linear_team_key} =
+             Adapter.intake_scope(%{project_slug: nil, team_key: 123})
+
+    assert {:error, :invalid_linear_project_slug} =
+             Adapter.intake_scope(%{project_slug: "bad slug", team_key: nil})
+
+    assert {:error, :invalid_linear_team_key} =
+             Adapter.intake_scope(%{project_slug: nil, team_key: "CC\nOTHER"})
+  end
+
+  test "workflow store rejects a Linear intake scope hot reload" do
+    ensure_workflow_store_running()
+
+    assert {:ok, {:project_slug, "project"}} =
+             Adapter.intake_scope(Config.settings!().tracker)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: nil,
+      tracker_team_key: "CC",
+      prompt: "Team-scoped prompt"
+    )
+
+    assert {:error, :linear_intake_scope_restart_required} = WorkflowStore.force_reload()
+
+    assert {:ok, {:project_slug, "project"}} =
+             Adapter.intake_scope(Config.settings!().tracker)
+
+    assert {:ok, %{prompt: current_prompt}} = Workflow.current()
+    refute current_prompt == "Team-scoped prompt"
+
+    write_workflow_file!(Workflow.workflow_file_path(), prompt: "Project-scoped prompt")
+    assert :ok = WorkflowStore.force_reload()
+    assert {:ok, %{prompt: "Project-scoped prompt"}} = Workflow.current()
   end
 
   test "phoenix observability api preserves state, issue, and refresh responses" do

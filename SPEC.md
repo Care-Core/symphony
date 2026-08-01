@@ -1240,6 +1240,9 @@ Each adapter owns:
 - construction from the current effective tracker configuration, including active/terminal states;
 - endpoint, authentication, transport, timeouts, pagination, and rate-limit handling;
 - provider-specific scope selection (project, board, team, repository, query, or equivalent);
+- fail-closed validation when its supported scope selectors are missing, malformed, or ambiguous;
+- fail-closed handling of live scope changes so claims from an earlier selector cannot continue
+  under a newly selected scope;
 - mapping provider payloads into the normalized Issue fields in Section 4.1.1;
 - choosing a stable dispatch identity and preserving any distinct underlying IDs in `native_ref`;
 - deriving `dispatchable` from provider-specific routing rules;

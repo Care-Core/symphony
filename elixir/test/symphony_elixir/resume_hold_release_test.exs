@@ -188,4 +188,84 @@ defmodule SymphonyElixir.ResumeHoldReleaseTest do
       File.rm_rf(test_root)
     end
   end
+
+  test "scope reconciliation durably clears holds that are no longer visible" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-held-scope-clear-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      :ok = base_state(test_root)
+
+      issue = %Issue{id: "issue-4", identifier: "MT-904", state: "Todo", labels: []}
+      workspace = Path.join(test_root, issue.identifier)
+      File.mkdir_p!(workspace)
+
+      hold =
+        pending_hold(issue, workspace)
+        |> Map.put(:reason, "input_token_checkpoint")
+
+      assert :ok = HoldStore.persist(test_root, %{issue.id => hold})
+
+      state = %Orchestrator.State{
+        holds: %{issue.id => hold},
+        claimed: MapSet.new([issue.id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      updated_state = Orchestrator.reconcile_held_issue_scope_for_test([], state)
+
+      refute Map.has_key?(updated_state.holds, issue.id)
+      refute MapSet.member?(updated_state.claimed, issue.id)
+      assert updated_state.hold_store_available
+      assert File.exists?(workspace)
+
+      assert {:ok, persisted} = HoldStore.load(test_root)
+      refute Map.has_key?(persisted, issue.id)
+    after
+      File.rm_rf(test_root)
+    end
+  end
+
+  test "scope reconciliation preserves holds that remain visible" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-held-scope-keep-#{System.unique_integer([:positive])}"
+      )
+
+    try do
+      :ok = base_state(test_root)
+
+      issue = %Issue{id: "issue-5", identifier: "MT-905", state: "Todo", labels: []}
+      workspace = Path.join(test_root, issue.identifier)
+      File.mkdir_p!(workspace)
+
+      hold =
+        pending_hold(issue, workspace)
+        |> Map.put(:reason, "manual_stop")
+
+      assert :ok = HoldStore.persist(test_root, %{issue.id => hold})
+
+      state = %Orchestrator.State{
+        holds: %{issue.id => hold},
+        claimed: MapSet.new([issue.id]),
+        codex_totals: %{input_tokens: 0, output_tokens: 0, total_tokens: 0, seconds_running: 0},
+        retry_attempts: %{}
+      }
+
+      updated_state = Orchestrator.reconcile_held_issue_scope_for_test([issue], state)
+
+      assert updated_state.holds[issue.id] == hold
+      assert MapSet.member?(updated_state.claimed, issue.id)
+
+      assert {:ok, persisted} = HoldStore.load(test_root)
+      assert persisted[issue.id].reason == "manual_stop"
+    after
+      File.rm_rf(test_root)
+    end
+  end
 end

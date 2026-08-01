@@ -7,6 +7,7 @@ defmodule SymphonyElixir.StatusDashboard do
   require Logger
 
   alias SymphonyElixir.{Config, HttpServer}
+  alias SymphonyElixir.Linear.Adapter, as: LinearAdapter
   alias SymphonyElixir.Orchestrator
   alias SymphonyElixirWeb.ObservabilityPubSub
 
@@ -393,25 +394,34 @@ defmodule SymphonyElixir.StatusDashboard do
   end
 
   defp format_project_link_lines do
-    project_part =
+    scope_line =
       case Config.settings!().tracker do
-        %{kind: "linear", project_slug: project_slug}
-        when is_binary(project_slug) and project_slug != "" ->
-          colorize(linear_project_url(project_slug), @ansi_cyan)
+        %{kind: "linear"} = tracker ->
+          format_linear_scope_line(LinearAdapter.intake_scope(tracker))
 
         _ ->
-          colorize("n/a", @ansi_gray)
+          colorize("│ Project: ", @ansi_bold) <> colorize("n/a", @ansi_gray)
       end
-
-    project_line = colorize("│ Project: ", @ansi_bold) <> project_part
 
     case dashboard_url() do
       url when is_binary(url) ->
-        [project_line, colorize("│ Dashboard: ", @ansi_bold) <> colorize(url, @ansi_cyan)]
+        [scope_line, colorize("│ Dashboard: ", @ansi_bold) <> colorize(url, @ansi_cyan)]
 
       _ ->
-        [project_line]
+        [scope_line]
     end
+  end
+
+  defp format_linear_scope_line({:ok, {:project_slug, project_slug}}) do
+    colorize("│ Project: ", @ansi_bold) <> colorize(linear_project_url(project_slug), @ansi_cyan)
+  end
+
+  defp format_linear_scope_line({:ok, {:team_key, team_key}}) do
+    colorize("│ Team: ", @ansi_bold) <> colorize(team_key, @ansi_cyan)
+  end
+
+  defp format_linear_scope_line({:error, _reason}) do
+    colorize("│ Scope: ", @ansi_bold) <> colorize("invalid", @ansi_red)
   end
 
   defp format_project_refresh_line(%{checking?: true}) do

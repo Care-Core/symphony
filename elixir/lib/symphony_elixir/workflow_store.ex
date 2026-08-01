@@ -8,6 +8,7 @@ defmodule SymphonyElixir.WorkflowStore do
 
   alias SymphonyElixir.Config
   alias SymphonyElixir.Config.Schema
+  alias SymphonyElixir.Linear.Adapter, as: LinearAdapter
   alias SymphonyElixir.Workflow
 
   @poll_interval_ms 1_000
@@ -132,6 +133,17 @@ defmodule SymphonyElixir.WorkflowStore do
   defp reload_path(path, state) do
     case load_state(path) do
       {:ok, new_state} ->
+        accept_reload(path, state, new_state)
+
+      {:error, reason} ->
+        log_reload_error(path, reason)
+        {:error, reason, state}
+    end
+  end
+
+  defp accept_reload(path, state, new_state) do
+    case validate_immutable_linear_intake_scope(state.settings, new_state.settings) do
+      :ok ->
         {:ok, new_state}
 
       {:error, reason} ->
@@ -139,6 +151,20 @@ defmodule SymphonyElixir.WorkflowStore do
         {:error, reason, state}
     end
   end
+
+  defp validate_immutable_linear_intake_scope(
+         %{tracker: %{kind: "linear"} = current_tracker},
+         %{tracker: %{kind: "linear"} = new_tracker}
+       ) do
+    with {:ok, current_scope} <- LinearAdapter.intake_scope(current_tracker),
+         {:ok, new_scope} <- LinearAdapter.intake_scope(new_tracker) do
+      if current_scope == new_scope,
+        do: :ok,
+        else: {:error, :linear_intake_scope_restart_required}
+    end
+  end
+
+  defp validate_immutable_linear_intake_scope(_current_settings, _new_settings), do: :ok
 
   defp reload_current_path(path, state) do
     case current_stamp(path) do

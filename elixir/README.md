@@ -143,12 +143,38 @@ You are working on an issue from the configured tracker {{ issue.identifier }}.
 Title: {{ issue.title }} Body: {{ issue.description }}
 ```
 
+For Linear, configure exactly one scheduler intake scope. Existing project-scoped workflows use
+
+```yaml
+tracker:
+  kind: linear
+  provider:
+    project_slug: "..."
+```
+
+Workflows that intentionally schedule across one Linear team without a queue project use
+
+```yaml
+tracker:
+  kind: linear
+  provider:
+    team_key: "ENG"
+```
+
+Do not configure both. Missing, blank, malformed, or conflicting scope settings fail startup and
+hot reload rather than falling back to unscoped intake.
+
+The selected Linear intake scope is immutable for the lifetime of a running Symphony process.
+Changing `project_slug` or `team_key` requires a controlled runner restart so claims authorized by
+the previous scope cannot survive a hot reload.
+
 Notes:
 
 - If a value is missing, defaults are used.
 - `tracker.kind` selects an adapter. Adapter-owned endpoint, scope, and auth settings belong under
   `tracker.provider`; the current Linear adapter still accepts the older flat `endpoint`,
-  `api_key`, `project_slug`, and `assignee` aliases for compatibility.
+  `api_key`, `project_slug`, and `assignee` aliases for compatibility. A flat `team_key` is also
+  accepted, but `tracker.provider.team_key` is canonical.
 - `tracker.required_labels` is optional. When set, an issue must have every
   configured label to dispatch or continue running. Label matching ignores
   case and surrounding whitespace. A blank configured label matches no issue.
@@ -275,13 +301,13 @@ as complete.
 
 - Config: use `tracker.kind: linear` with `tracker.provider.endpoint` (default
   `https://api.linear.app/graphql`), `api_key` (defaults to `LINEAR_API_KEY` and accepts
-  `$VAR`), required `project_slug`, and optional `assignee` (a Linear user ID or `me`,
-  defaulting to `LINEAR_ASSIGNEE`).
-  The legacy flat `tracker.endpoint`, `api_key`, `project_slug`, and `assignee` aliases remain
-  supported. `required_labels`, `active_states`, and `terminal_states` stay under `tracker`.
-- Scope and paging: candidate reads filter the configured project slug and requested state names,
-  following Linear pages of 50. ID refreshes are also project-scoped and batch up to 50 IDs. Empty
-  state/ID lists return `{:ok, []}` without a Linear request.
+  `$VAR`), exactly one scheduler scope (`project_slug` or `team_key`), and optional `assignee` (a
+  Linear user ID or `me`, defaulting to `LINEAR_ASSIGNEE`). The legacy flat `tracker.endpoint`,
+  `api_key`, `project_slug`, and `assignee` aliases remain supported; flat `team_key` is also
+  accepted. `required_labels`, `active_states`, and `terminal_states` stay under `tracker`.
+- Scope and paging: candidate reads filter the configured project slug or exact team key plus the
+  requested state names, following Linear pages of 50. ID refreshes apply the same server-side
+  scope and batch up to 50 IDs. Empty state/ID lists return `{:ok, []}` without a Linear request.
 - Identity and normalization: `issue.id` is the Linear issue ID and `issue.native_ref` is currently
   `nil`. Records missing a nonblank ID, identifier, title, or state are dropped from candidate
   pages and fail ID refreshes. State keeps Linear's spelling; integer priorities are preserved and
@@ -294,11 +320,13 @@ as complete.
 - Tool: the Linear adapter advertises `linear_graphql`, accepting either a raw query string or an
   object with nonblank `query` and optional object `variables`. Symphony executes it host-side
   with the session-bound endpoint/token and strips declared token environment variables from the
-  Codex child. `project_slug` scopes scheduler reads, not raw tool calls; the tool can access
-  whatever the configured Linear token can access.
+  Codex child. The configured project/team selector scopes scheduler reads, not raw tool calls;
+  the tool can access whatever the configured Linear token can access.
 - Responsibility and errors: `linear_graphql` adds no idempotency key, retry, scope guard, or
   rate-limit policy, so workflows own idempotent mutations and handling provider errors. Read/config
-  failures use `{:error, :missing_linear_api_token}`, `{:error, :missing_linear_project_slug}`,
+  failures use `{:error, :missing_linear_api_token}`, `{:error, :missing_linear_intake_scope}`,
+  `{:error, :conflicting_linear_intake_scope}`, `{:error, :invalid_linear_project_slug}`,
+  `{:error, :invalid_linear_team_key}`, `{:error, :linear_intake_scope_restart_required}`,
   `{:error, :invalid_linear_endpoint}`, `{:error, :invalid_linear_assignee}`,
   `{:error, :missing_linear_viewer_identity}`, `{:error, {:linear_api_status, status}}`,
   `{:error, {:linear_api_request, reason}}`, `{:error, {:linear_graphql_errors, errors}}`,
@@ -307,8 +335,8 @@ as complete.
   arguments, missing auth, and transport failures return `"success" => false` with
   `{"error": {"message": ...}}`, while top-level GraphQL errors preserve the response body with
   `"success" => false`.
-  For portable reporting, map missing/invalid token, project, endpoint, assignee, or viewer errors
-  to `tracker_config` or `tracker_auth`, request failures to `tracker_transport`, non-200 responses to
+  For portable reporting, map missing/invalid token, scope, endpoint, assignee, or viewer errors to
+  `tracker_config` or `tracker_auth`, request failures to `tracker_transport`, non-200 responses to
   `tracker_response` (`429` is `tracker_rate_limited`), GraphQL/unknown payload failures to
   `tracker_payload`, and missing cursors to `tracker_pagination`; logs and tool responses carry the
   human-readable provider detail.
