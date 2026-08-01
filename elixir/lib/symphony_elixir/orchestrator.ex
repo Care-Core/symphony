@@ -386,7 +386,6 @@ defmodule SymphonyElixir.Orchestrator do
       state
       |> reconcile_running_issues()
       |> reconcile_blocked_issues()
-      |> reconcile_held_issues()
 
     with true <- state.hold_store_available,
          :ok <- Config.validate!(),
@@ -496,32 +495,6 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp reconcile_held_issues(%State{} = state) do
-    active_issue_ids =
-      state.running
-      |> Map.keys()
-      |> Kernel.++(Map.keys(state.blocked))
-      |> MapSet.new()
-
-    held_issue_ids =
-      state.holds
-      |> Map.keys()
-      |> Enum.reject(&MapSet.member?(active_issue_ids, &1))
-
-    if held_issue_ids == [] do
-      state
-    else
-      case Tracker.fetch_issues_by_ids(held_issue_ids) do
-        {:ok, issues} ->
-          reconcile_missing_held_issue_ids(state, held_issue_ids, issues)
-
-        {:error, reason} ->
-          Logger.debug("Failed to refresh held issue scope: #{inspect(reason)}; keeping durable holds")
-          state
-      end
-    end
-  end
-
   @doc false
   @spec reconcile_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
@@ -536,12 +509,6 @@ defmodule SymphonyElixir.Orchestrator do
   @spec reconcile_blocked_issue_states_for_test([Issue.t()], term()) :: term()
   def reconcile_blocked_issue_states_for_test(issues, %State{} = state) when is_list(issues) do
     reconcile_blocked_issue_states(issues, state, active_state_set(), terminal_state_set())
-  end
-
-  @doc false
-  @spec reconcile_held_issue_scope_for_test([Issue.t()], term()) :: term()
-  def reconcile_held_issue_scope_for_test(issues, %State{} = state) when is_list(issues) do
-    reconcile_missing_held_issue_ids(state, Map.keys(state.holds), issues)
   end
 
   @doc false
@@ -690,52 +657,6 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp reconcile_missing_blocked_issue_ids(state, _requested_issue_ids, _issues), do: state
-
-  defp reconcile_missing_held_issue_ids(%State{} = state, requested_issue_ids, issues)
-       when is_list(requested_issue_ids) and is_list(issues) do
-    visible_issue_ids =
-      issues
-      |> Enum.flat_map(fn
-        %Issue{id: issue_id} when is_binary(issue_id) -> [issue_id]
-        _ -> []
-      end)
-      |> MapSet.new()
-
-    missing_issue_ids =
-      Enum.reject(requested_issue_ids, &MapSet.member?(visible_issue_ids, &1))
-
-    clear_out_of_scope_holds(state, missing_issue_ids)
-  end
-
-  defp reconcile_missing_held_issue_ids(state, _requested_issue_ids, _issues), do: state
-
-  defp clear_out_of_scope_holds(%State{} = state, []), do: state
-
-  defp clear_out_of_scope_holds(%State{} = state, issue_ids) when is_list(issue_ids) do
-    cleared_holds = Map.drop(state.holds, issue_ids)
-
-    case HoldStore.persist(Config.local_workspace_root(), cleared_holds) do
-      :ok ->
-        Enum.each(issue_ids, fn issue_id ->
-          Logger.info("Held issue no longer visible in the configured tracker scope: issue_id=#{issue_id}; clearing durable hold")
-          cancel_retry_timer_if_present(Map.get(state.retry_attempts, issue_id))
-        end)
-
-        %{
-          state
-          | holds: cleared_holds,
-            claimed: Enum.reduce(issue_ids, state.claimed, &MapSet.delete(&2, &1)),
-            retry_attempts: Map.drop(state.retry_attempts, issue_ids)
-        }
-
-      {:error, reason} ->
-        Logger.error("Failed to persist removal of out-of-scope durable holds: #{inspect(reason)}; keeping holds")
-        %{state | hold_store_available: false}
-    end
-  end
-
-  defp cancel_retry_timer_if_present(nil), do: :ok
-  defp cancel_retry_timer_if_present(retry_entry), do: cancel_retry_timer(retry_entry)
 
   defp log_missing_running_issue(%State{} = state, issue_id) when is_binary(issue_id) do
     case Map.get(state.running, issue_id) do

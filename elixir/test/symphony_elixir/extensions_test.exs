@@ -332,6 +332,22 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert {:ok, %{prompt: current_prompt}} = Workflow.current()
     refute current_prompt == "Team-scoped prompt"
 
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      prompt: "Memory prompt"
+    )
+
+    assert :ok = WorkflowStore.force_reload()
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_project_slug: nil,
+      tracker_team_key: "CC",
+      prompt: "Two-step team prompt"
+    )
+
+    assert {:error, :linear_intake_scope_restart_required} = WorkflowStore.force_reload()
+    assert Config.settings!().tracker.kind == "memory"
+
     write_workflow_file!(Workflow.workflow_file_path(), prompt: "Project-scoped prompt")
     assert :ok = WorkflowStore.force_reload()
     assert {:ok, %{prompt: "Project-scoped prompt"}} = Workflow.current()

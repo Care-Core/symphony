@@ -16,7 +16,7 @@ defmodule SymphonyElixir.WorkflowStore do
   defmodule State do
     @moduledoc false
 
-    defstruct [:path, :stamp, :workflow, :settings]
+    defstruct [:path, :stamp, :workflow, :settings, :linear_intake_scope]
   end
 
   @spec start_link(keyword()) :: GenServer.on_start()
@@ -142,9 +142,12 @@ defmodule SymphonyElixir.WorkflowStore do
   end
 
   defp accept_reload(path, state, new_state) do
-    case validate_immutable_linear_intake_scope(state.settings, new_state.settings) do
+    case validate_immutable_linear_intake_scope(
+           state.linear_intake_scope,
+           new_state.linear_intake_scope
+         ) do
       :ok ->
-        {:ok, new_state}
+        {:ok, preserve_linear_intake_scope(state, new_state)}
 
       {:error, reason} ->
         log_reload_error(path, reason)
@@ -152,19 +155,16 @@ defmodule SymphonyElixir.WorkflowStore do
     end
   end
 
-  defp validate_immutable_linear_intake_scope(
-         %{tracker: %{kind: "linear"} = current_tracker},
-         %{tracker: %{kind: "linear"} = new_tracker}
-       ) do
-    with {:ok, current_scope} <- LinearAdapter.intake_scope(current_tracker),
-         {:ok, new_scope} <- LinearAdapter.intake_scope(new_tracker) do
-      if current_scope == new_scope,
-        do: :ok,
-        else: {:error, :linear_intake_scope_restart_required}
-    end
-  end
+  defp validate_immutable_linear_intake_scope(nil, _new_scope), do: :ok
+  defp validate_immutable_linear_intake_scope(_current_scope, nil), do: :ok
+  defp validate_immutable_linear_intake_scope(scope, scope), do: :ok
 
-  defp validate_immutable_linear_intake_scope(_current_settings, _new_settings), do: :ok
+  defp validate_immutable_linear_intake_scope(_current_scope, _new_scope),
+    do: {:error, :linear_intake_scope_restart_required}
+
+  defp preserve_linear_intake_scope(state, new_state) do
+    %{new_state | linear_intake_scope: state.linear_intake_scope || new_state.linear_intake_scope}
+  end
 
   defp reload_current_path(path, state) do
     case current_stamp(path) do
@@ -185,12 +185,26 @@ defmodule SymphonyElixir.WorkflowStore do
          {:ok, settings} <- Schema.parse(workflow.config),
          :ok <- Config.validate_settings(settings),
          {:ok, stamp} <- current_stamp(path) do
-      {:ok, %State{path: path, stamp: stamp, workflow: workflow, settings: settings}}
+      {:ok,
+       %State{
+         path: path,
+         stamp: stamp,
+         workflow: workflow,
+         settings: settings,
+         linear_intake_scope: linear_intake_scope(settings)
+       }}
     else
       {:error, reason} ->
         {:error, reason}
     end
   end
+
+  defp linear_intake_scope(%{tracker: %{kind: "linear"} = tracker}) do
+    {:ok, scope} = LinearAdapter.intake_scope(tracker)
+    scope
+  end
+
+  defp linear_intake_scope(_settings), do: nil
 
   defp current_stamp(path) when is_binary(path) do
     with {:ok, stat} <- File.stat(path, time: :posix),

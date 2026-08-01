@@ -44,6 +44,17 @@ defmodule SymphonyElixir.Codex.DynamicToolTest do
   end
 
   test "bound tools keep the adapter and auth snapshot from session startup" do
+    workflow_path = Workflow.workflow_file_path()
+
+    on_exit(fn ->
+      if Process.whereis(WorkflowStore) do
+        :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
+      end
+
+      write_workflow_file!(workflow_path)
+      {:ok, _pid} = Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore)
+    end)
+
     write_workflow_file!(Workflow.workflow_file_path(),
       tracker_kind: "linear",
       tracker_api_token: "session-token",

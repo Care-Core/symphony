@@ -257,7 +257,9 @@ codex:
 - Holds are private, atomic files under the workspace root. They survive runner restarts and
   tracker-state changes, retain the claim and workspace, suppress automatic retries, and fail
   closed if checkpoint delivery or durable-state persistence cannot be confirmed. Every bounded
-  attempt re-holds on exit.
+  attempt re-holds on exit. A scoped refresh never deletes a hold merely because the issue is not
+  visible; explicit resume remains the only release path and fails while the issue is outside the
+  configured Linear scope.
 - Resuming a budget hold requires both a phase (`implementation`, `validation`, `review-fix`,
   `hosted-closeout`, or `landing`) and a positive `max_additional_input_tokens`. The effective
   allowance is the smaller of the request and the issue's current label cap. A bounded attempt

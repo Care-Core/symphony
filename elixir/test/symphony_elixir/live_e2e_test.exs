@@ -455,6 +455,7 @@ defmodule SymphonyElixir.LiveE2ETest do
                  )
       end
 
+      stop_workflow_store_if_running!()
       Workflow.set_workflow_file_path(workflow_file)
 
       write_workflow_file!(workflow_file,
@@ -466,6 +467,8 @@ defmodule SymphonyElixir.LiveE2ETest do
         codex_approval_policy: "never",
         observability_enabled: false
       )
+
+      restart_workflow_store_if_needed!()
 
       team = fetch_team!(team_key)
       active_state = active_state!(team)
@@ -487,6 +490,8 @@ defmodule SymphonyElixir.LiveE2ETest do
             "Symphony live e2e #{backend} issue for #{project["name"]}"
           )
 
+        stop_workflow_store_if_running!()
+
         write_workflow_file!(workflow_file,
           tracker_api_token: "$LINEAR_API_KEY",
           tracker_project_slug: project["slugId"],
@@ -504,6 +509,8 @@ defmodule SymphonyElixir.LiveE2ETest do
           prompt: live_prompt(project["slugId"])
         )
 
+        restart_workflow_store_if_needed!()
+
         assert :ok = AgentRunner.run(issue, self(), max_turns: 3)
 
         runtime_info = receive_runtime_info!(issue.id)
@@ -518,9 +525,11 @@ defmodule SymphonyElixir.LiveE2ETest do
         assert :ok = complete_project(project["id"], completed_project_status["id"])
       end
     after
-      restart_agent_runtime_if_needed()
       cleanup_live_worker_setup(worker_setup)
+      stop_workflow_store_if_running!()
       Workflow.set_workflow_file_path(original_workflow_path)
+      restart_workflow_store_if_needed!()
+      restart_agent_runtime_if_needed()
       File.rm_rf(test_root)
     end
   end
@@ -580,6 +589,21 @@ defmodule SymphonyElixir.LiveE2ETest do
              SymphonyElixir.Supervisor,
              SymphonyElixir.AgentRuntimeSupervisor
            ) do
+        {:ok, _pid} -> :ok
+        {:error, {:already_started, _pid}} -> :ok
+      end
+    end
+  end
+
+  defp stop_workflow_store_if_running! do
+    if Process.whereis(WorkflowStore) do
+      assert :ok = Supervisor.terminate_child(SymphonyElixir.Supervisor, WorkflowStore)
+    end
+  end
+
+  defp restart_workflow_store_if_needed! do
+    if is_nil(Process.whereis(WorkflowStore)) do
+      case Supervisor.restart_child(SymphonyElixir.Supervisor, WorkflowStore) do
         {:ok, _pid} -> :ok
         {:error, {:already_started, _pid}} -> :ok
       end
