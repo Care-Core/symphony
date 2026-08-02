@@ -4,6 +4,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
 
+  alias SymphonyElixir.ControlToken
   alias SymphonyElixir.Linear.Adapter
   alias SymphonyElixir.Tracker.Memory
 
@@ -115,16 +116,12 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   setup do
     endpoint_config = Application.get_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, [])
-    control_token = System.get_env("SYMPHONY_CONTROL_TOKEN")
+    control_token = ControlToken.fetch()
+    :ok = ControlToken.replace_for_test(nil)
 
     on_exit(fn ->
       Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, endpoint_config)
-
-      if is_nil(control_token) do
-        System.delete_env("SYMPHONY_CONTROL_TOKEN")
-      else
-        System.put_env("SYMPHONY_CONTROL_TOKEN", control_token)
-      end
+      restore_control_token(control_token)
     end)
 
     :ok
@@ -666,7 +663,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     {:ok, _pid} = StaticOrchestrator.start_link(name: unknown_name, snapshot: static_snapshot())
     start_test_endpoint(orchestrator: unknown_name, snapshot_timeout_ms: 50)
-    System.delete_env("SYMPHONY_CONTROL_TOKEN")
+    :ok = ControlToken.replace_for_test(nil)
 
     assert json_response(post(build_conn(), "/api/v1/UNKNOWN/stop", %{}), 503)["error"]["code"] ==
              "control_token_not_configured"
@@ -674,7 +671,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert json_response(get(build_conn(), "/api/v1/state"), 503)["error"]["code"] ==
              "control_token_not_configured"
 
-    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+    :ok = ControlToken.replace_for_test("test-control-token")
 
     assert json_response(post(build_conn(), "/api/v1/UNKNOWN/stop", %{}), 401)["error"]["code"] ==
              "invalid_control_token"
@@ -731,7 +728,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       )
 
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
-    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+    :ok = ControlToken.replace_for_test("test-control-token")
 
     stop_payload =
       build_conn()
@@ -770,7 +767,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       )
 
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
-    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+    :ok = ControlToken.replace_for_test("test-control-token")
 
     resume_payload =
       build_conn()
@@ -828,7 +825,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       )
 
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
-    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+    :ok = ControlToken.replace_for_test("test-control-token")
 
     control_conn = fn ->
       build_conn()
@@ -932,7 +929,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       )
 
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
-    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+    :ok = ControlToken.replace_for_test("test-control-token")
 
     control_conn = fn ->
       build_conn()
@@ -984,7 +981,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       )
 
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
-    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+    :ok = ControlToken.replace_for_test("test-control-token")
 
     control_conn = fn ->
       build_conn()
@@ -1042,7 +1039,7 @@ defmodule SymphonyElixir.ExtensionsTest do
       )
 
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
-    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+    :ok = ControlToken.replace_for_test("test-control-token")
 
     for {body, expected_code, expected_status} <- [
           {%{}, "resume_phase_required", 422},
@@ -1255,7 +1252,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     port = wait_for_bound_port()
     assert port == HttpServer.bound_port()
 
-    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+    :ok = ControlToken.replace_for_test("test-control-token")
 
     response =
       Req.get!("http://127.0.0.1:#{port}/api/v1/state",
@@ -1313,11 +1310,16 @@ defmodule SymphonyElixir.ExtensionsTest do
   end
 
   defp control_conn do
-    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+    :ok = ControlToken.replace_for_test("test-control-token")
 
     build_conn()
     |> Plug.Conn.put_req_header("x-symphony-control-token", "test-control-token")
   end
+
+  defp restore_control_token({:ok, token}), do: ControlToken.replace_for_test(token)
+
+  defp restore_control_token({:error, :control_token_not_configured}),
+    do: ControlToken.replace_for_test(nil)
 
   defp static_snapshot do
     %{

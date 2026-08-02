@@ -4,13 +4,12 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, ControlToken, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
   @turn_start_id 3
   @token_warning_steer_id "symphony-token-budget-warning"
-  @control_token_env "SYMPHONY_CONTROL_TOKEN"
   @issue_branch_env "SYMPHONY_ISSUE_BRANCH_NAME"
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
@@ -294,7 +293,8 @@ defmodule SymphonyElixir.Codex.AppServer do
   end
 
   defp child_scrub_environment_names(dynamic_tool_binding) do
-    [@control_token_env, @issue_branch_env | dynamic_tool_binding.secret_environment_names]
+    (ControlToken.secret_environment_names() ++
+       [@issue_branch_env | dynamic_tool_binding.secret_environment_names])
     |> valid_environment_names()
     |> Enum.uniq()
   end

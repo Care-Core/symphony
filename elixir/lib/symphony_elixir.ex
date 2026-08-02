@@ -35,19 +35,26 @@ defmodule SymphonyElixir.Application do
   def start_runtime do
     :ok = SymphonyElixir.LogFile.configure()
 
-    children = [
-      {Phoenix.PubSub, name: SymphonyElixir.PubSub},
-      SymphonyElixir.WorkflowStore,
-      SymphonyElixir.AgentRuntimeSupervisor,
-      SymphonyElixir.HttpServer,
-      SymphonyElixir.StatusDashboard
-    ]
+    case SymphonyElixir.ControlToken.child_spec_from_environment() do
+      {:ok, control_token_child} ->
+        children = [
+          control_token_child,
+          {Phoenix.PubSub, name: SymphonyElixir.PubSub},
+          SymphonyElixir.WorkflowStore,
+          SymphonyElixir.AgentRuntimeSupervisor,
+          SymphonyElixir.HttpServer,
+          SymphonyElixir.StatusDashboard
+        ]
 
-    Supervisor.start_link(
-      children,
-      strategy: :rest_for_one,
-      name: SymphonyElixir.Supervisor
-    )
+        Supervisor.start_link(
+          children,
+          strategy: :rest_for_one,
+          name: SymphonyElixir.Supervisor
+        )
+
+      {:error, reason} ->
+        {:error, {:invalid_control_token_fd, reason}}
+    end
   end
 
   @impl true

@@ -280,8 +280,16 @@ codex:
 
 ### Authenticated control and disabled deferred waits
 
-Set a non-empty `SYMPHONY_CONTROL_TOKEN` before starting the optional HTTP server. Mutating routes
-accept only loopback requests carrying that exact value in `x-symphony-control-token`:
+The optional HTTP control API reads its token once from an inherited anonymous pipe before the
+HTTP server or agent children start. The owner launcher must set `SYMPHONY_CONTROL_TOKEN_FD` to the
+pipe's numeric read descriptor and write a non-empty token of at most 4096 bytes without NUL, CR,
+or LF. The descriptor is closed immediately after the bounded read; the token remains only in the
+owner-side store. A configured invalid, closed, non-pipe, malformed, or oversized descriptor fails
+startup closed. When the descriptor variable is absent, control remains unconfigured. The legacy
+`SYMPHONY_CONTROL_TOKEN` environment secret is not accepted.
+
+Mutating routes accept only loopback requests carrying the configured value in
+`x-symphony-control-token`:
 
 - `POST /api/v1/<issue_identifier>/stop`
 - `POST /api/v1/<issue_identifier>/resume` with `phase` and `max_additional_input_tokens`
