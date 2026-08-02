@@ -1,6 +1,8 @@
 defmodule SymphonyElixir.ControlTokenTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias SymphonyElixir.ControlToken
 
   @fd_env "SYMPHONY_CONTROL_TOKEN_FD"
@@ -28,6 +30,7 @@ defmodule SymphonyElixir.ControlTokenTest do
 
     assert {:ok, pid} = ControlToken.start_link(name: nil)
     assert {:error, :control_token_not_configured} = ControlToken.fetch(pid)
+    refute System.get_env(@legacy_env)
     GenServer.stop(pid)
   end
 
@@ -37,6 +40,10 @@ defmodule SymphonyElixir.ControlTokenTest do
           {"contains\nnewline", :invalid_token_bytes},
           {"contains\rreturn", :invalid_token_bytes},
           {"contains\0nul", :invalid_token_bytes},
+          {" leading-space", :invalid_token_bytes},
+          {"trailing-space ", :invalid_token_bytes},
+          {"contains\ttab", :invalid_token_bytes},
+          {<<0xFF>>, :invalid_token_bytes},
           {String.duplicate("x", 4_097), :token_too_large}
         ] do
       assert {:error, {:invalid_control_token_fd, ^reason}} =
@@ -68,6 +75,76 @@ defmodule SymphonyElixir.ControlTokenTest do
     refute output =~ token
   end
 
+  test "the prepared child survives restart without reusing the consumed descriptor" do
+    name = :control_token_restart_test
+
+    token = "restart-stable-token"
+
+    with_fifo_contents(token, fn fd, file_ref ->
+      System.put_env(@fd_env, Integer.to_string(fd))
+
+      assert {:ok, child_spec} =
+               ControlToken.child_spec_from_environment(name: name, id: name)
+
+      refute inspect(child_spec) =~ token
+      refute System.get_env(@fd_env)
+      assert {:error, :ebadf} = :prim_file.read(file_ref, 1)
+      assert {:ok, supervisor} = Supervisor.start_link([child_spec], strategy: :one_for_one)
+
+      first_pid = Process.whereis(name)
+      assert {:ok, ^token} = ControlToken.fetch(name)
+      monitor = Process.monitor(first_pid)
+      Process.exit(first_pid, :kill)
+      assert_receive {:DOWN, ^monitor, :process, ^first_pid, :killed}
+
+      second_pid = await_restarted_child(name, first_pid)
+      assert {:ok, ^token} = ControlToken.fetch(name)
+      assert second_pid != first_pid
+      Supervisor.stop(supervisor)
+    end)
+  end
+
+  test "a crash report never includes the stored token or restart metadata" do
+    name = :control_token_crash_report_test
+    token = "crash-report-secret-token"
+
+    with_fifo_contents(token, fn fd, _file_ref ->
+      System.put_env(@fd_env, Integer.to_string(fd))
+
+      assert {:ok, child_spec} =
+               ControlToken.child_spec_from_environment(name: name, id: name)
+
+      refute inspect(child_spec) =~ token
+      assert {:ok, supervisor} = Supervisor.start_link([child_spec], strategy: :one_for_one)
+      first_pid = Process.whereis(name)
+      monitor = Process.monitor(first_pid)
+
+      log =
+        capture_log(fn ->
+          caller =
+            Task.async(fn ->
+              catch_exit(GenServer.call(name, :unexpected_control_token_call))
+            end)
+
+          Task.await(caller)
+          assert_receive {:DOWN, ^monitor, :process, ^first_pid, _reason}
+          await_restarted_child(name, first_pid)
+        end)
+
+      assert log =~ "terminating"
+      refute log =~ token
+      assert {:ok, ^token} = ControlToken.fetch(name)
+      Supervisor.stop(supervisor)
+    end)
+  end
+
+  test "preparing the child rejects and consumes an invalid descriptor setting" do
+    System.put_env(@fd_env, "not-a-descriptor")
+
+    assert {:error, :invalid_fd_number} = ControlToken.child_spec_from_environment()
+    refute System.get_env(@fd_env)
+  end
+
   test "a configured regular-file descriptor fails closed and is closed" do
     path = Path.join(System.tmp_dir!(), "symphony-control-token-#{System.unique_integer([:positive])}")
     File.write!(path, "not-an-anonymous-pipe")
@@ -97,19 +174,19 @@ defmodule SymphonyElixir.ControlTokenTest do
   end
 
   test "an inherited pipe that never reaches EOF times out and closes" do
-    path = Path.join(System.tmp_dir!(), "symphony-control-token-timeout-#{System.os_time(:nanosecond)}")
-    File.write!(path, "close-me-after-timeout")
+    with_fifo(fn path ->
+      {:ok, file_ref} = :prim_file.open(String.to_charlist(path), [:read, :write, :binary])
+      System.put_env(@fd_env, Integer.to_string(descriptor_number(file_ref)))
+      started_at = System.monotonic_time(:millisecond)
 
-    try do
-      {:ok, file_ref} = :prim_file.open(String.to_charlist(path), [:read, :binary])
-      fd = descriptor_number(file_ref)
-      reader = fn _fd -> Process.sleep(60_000) end
+      assert {:error, {:invalid_control_token_fd, :read_timeout}} =
+               ControlToken.start_link(name: nil)
 
-      assert {:error, :read_timeout} = ControlToken.read_fd_for_test(fd, reader, 10)
+      elapsed_ms = System.monotonic_time(:millisecond) - started_at
+      assert elapsed_ms >= 2_000
+      assert elapsed_ms < 4_000
       assert {:error, :ebadf} = :prim_file.read(file_ref, 1)
-    after
-      File.rm(path)
-    end
+    end)
   end
 
   test "reads a configured pipe into the owner store" do
@@ -148,13 +225,33 @@ defmodule SymphonyElixir.ControlTokenTest do
   end
 
   test "an unexpected reader exit fails closed" do
-    assert {:error, :read_failed} =
-             ControlToken.read_fd_for_test(1_000_000, fn _fd -> exit(:fixture_crash) end, 50)
+    with_fifo_contents("reader-crash", fn fd, file_ref ->
+      assert {:error, :read_failed} =
+               ControlToken.read_fd_for_test(fd, fn _file_ref -> exit(:fixture_crash) end, 50)
+
+      assert {:error, :ebadf} = :prim_file.read(file_ref, 1)
+    end)
   end
 
   test "a descriptor read error fails closed" do
     assert {:error, :read_failed} =
              ControlToken.read_bounded_for_test(fn _file_ref, _read_size -> {:error, :eio} end)
+  end
+
+  test "private reader setup normalizes unsupported devices and open failures" do
+    assert {:error, :invalid_fd} =
+             ControlToken.normalize_private_reader_for_test({:ok, :missing_io_device})
+
+    assert {:error, :invalid_fd} =
+             ControlToken.normalize_private_reader_for_test({:error, :enoent})
+  end
+
+  test "bounded process cleanup never waits indefinitely" do
+    sleeper = spawn(fn -> Process.sleep(:infinity) end)
+
+    assert :timeout = ControlToken.await_process_down_for_test(sleeper, 0)
+    assert Process.alive?(sleeper)
+    Process.exit(sleeper, :kill)
   end
 
   test "the test owner replacement updates the named store" do
@@ -227,6 +324,21 @@ defmodule SymphonyElixir.ControlTokenTest do
   end
 
   defp descriptor_number(file_ref), do: file_ref |> :prim_file.get_handle() |> :binary.decode_unsigned(:little)
+
+  defp await_restarted_child(name, previous_pid, attempts \\ 100)
+
+  defp await_restarted_child(_name, _previous_pid, 0), do: flunk("control token child did not restart")
+
+  defp await_restarted_child(name, previous_pid, attempts) do
+    case Process.whereis(name) do
+      pid when is_pid(pid) and pid != previous_pid ->
+        pid
+
+      _ ->
+        Process.sleep(10)
+        await_restarted_child(name, previous_pid, attempts - 1)
+    end
+  end
 
   defp elixir_executable do
     System.find_executable("elixir") || flunk("elixir executable not found")
