@@ -75,67 +75,56 @@ defmodule SymphonyElixir.ControlTokenTest do
     refute output =~ token
   end
 
-  test "the prepared child survives restart without reusing the consumed descriptor" do
+  test "the prepared child survives restart without retaining source metadata" do
     name = :control_token_restart_test
-
     token = "restart-stable-token"
 
-    with_fifo_contents(token, fn fd, file_ref ->
-      System.put_env(@fd_env, Integer.to_string(fd))
+    assert {:ok, child_spec} =
+             ControlToken.child_spec_from_token_for_test(token, name: name, id: name)
 
-      assert {:ok, child_spec} =
-               ControlToken.child_spec_from_environment(name: name, id: name)
+    refute inspect(child_spec) =~ token
+    assert {:ok, supervisor} = Supervisor.start_link([child_spec], strategy: :one_for_one)
 
-      refute inspect(child_spec) =~ token
-      refute System.get_env(@fd_env)
-      assert {:error, :ebadf} = :prim_file.read(file_ref, 1)
-      assert {:ok, supervisor} = Supervisor.start_link([child_spec], strategy: :one_for_one)
+    first_pid = Process.whereis(name)
+    assert {:ok, ^token} = ControlToken.fetch(name)
+    monitor = Process.monitor(first_pid)
+    Process.exit(first_pid, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^first_pid, :killed}
 
-      first_pid = Process.whereis(name)
-      assert {:ok, ^token} = ControlToken.fetch(name)
-      monitor = Process.monitor(first_pid)
-      Process.exit(first_pid, :kill)
-      assert_receive {:DOWN, ^monitor, :process, ^first_pid, :killed}
-
-      second_pid = await_restarted_child(name, first_pid)
-      assert {:ok, ^token} = ControlToken.fetch(name)
-      assert second_pid != first_pid
-      Supervisor.stop(supervisor)
-    end)
+    second_pid = await_restarted_child(name, first_pid)
+    assert {:ok, ^token} = ControlToken.fetch(name)
+    assert second_pid != first_pid
+    Supervisor.stop(supervisor)
   end
 
   test "a crash report never includes the stored token or restart metadata" do
     name = :control_token_crash_report_test
     token = "crash-report-secret-token"
 
-    with_fifo_contents(token, fn fd, _file_ref ->
-      System.put_env(@fd_env, Integer.to_string(fd))
+    assert {:ok, child_spec} =
+             ControlToken.child_spec_from_token_for_test(token, name: name, id: name)
 
-      assert {:ok, child_spec} =
-               ControlToken.child_spec_from_environment(name: name, id: name)
+    refute inspect(child_spec) =~ token
+    assert {:ok, supervisor} = Supervisor.start_link([child_spec], strategy: :one_for_one)
+    first_pid = Process.whereis(name)
+    monitor = Process.monitor(first_pid)
 
-      refute inspect(child_spec) =~ token
-      assert {:ok, supervisor} = Supervisor.start_link([child_spec], strategy: :one_for_one)
-      first_pid = Process.whereis(name)
-      monitor = Process.monitor(first_pid)
+    log =
+      capture_log(fn ->
+        caller =
+          Task.async(fn ->
+            catch_exit(GenServer.call(name, :unexpected_control_token_call))
+          end)
 
-      log =
-        capture_log(fn ->
-          caller =
-            Task.async(fn ->
-              catch_exit(GenServer.call(name, :unexpected_control_token_call))
-            end)
+        Task.await(caller)
+        assert_receive {:DOWN, ^monitor, :process, ^first_pid, _reason}
+        await_restarted_child(name, first_pid)
+      end)
 
-          Task.await(caller)
-          assert_receive {:DOWN, ^monitor, :process, ^first_pid, _reason}
-          await_restarted_child(name, first_pid)
-        end)
-
-      assert log =~ "terminating"
-      refute log =~ token
-      assert {:ok, ^token} = ControlToken.fetch(name)
-      Supervisor.stop(supervisor)
-    end)
+    assert log =~ "terminating"
+    refute log =~ token
+    assert {:ok, ^token} = ControlToken.fetch(name)
+    Supervisor.stop(supervisor)
   end
 
   test "preparing the child rejects and consumes an invalid descriptor setting" do
@@ -189,15 +178,25 @@ defmodule SymphonyElixir.ControlTokenTest do
     end)
   end
 
-  test "reads a configured pipe into the owner store" do
-    with_fifo_contents("owner-token", fn fd, file_ref ->
-      System.put_env(@fd_env, Integer.to_string(fd))
+  test "reads a prepared token into the owner store" do
+    assert {:ok, pid} = ControlToken.start_link(name: nil, source: {:token, "owner-token"})
+    assert {:ok, "owner-token"} = ControlToken.fetch(pid)
+    GenServer.stop(pid)
+  end
 
-      assert {:ok, pid} = ControlToken.start_link(name: nil)
-      assert {:ok, "owner-token"} = ControlToken.fetch(pid)
-      assert {:error, :ebadf} = :prim_file.read(file_ref, 1)
-      GenServer.stop(pid)
-    end)
+  test "reads and validates data from a native input port" do
+    executable = System.find_executable("sh") || flunk("sh executable not found")
+
+    port =
+      Port.open(
+        {:spawn_executable, executable},
+        [:binary, :eof, args: [~c"-c", ~c"printf owner-port-token"]]
+      )
+
+    Process.unlink(port)
+
+    assert {:ok, "owner-port-token"} =
+             ControlToken.read_private_port_for_test(port, 1_000)
   end
 
   test "an invalid configured descriptor fails closed" do
@@ -224,37 +223,51 @@ defmodule SymphonyElixir.ControlTokenTest do
     end
   end
 
-  test "an unexpected reader exit fails closed" do
-    with_fifo_contents("reader-crash", fn fd, file_ref ->
-      assert {:error, :read_failed} =
-               ControlToken.read_fd_for_test(fd, fn _file_ref -> exit(:fixture_crash) end, 50)
+  test "an unexpected native port exit fails closed" do
+    executable = System.find_executable("true") || flunk("true executable not found")
+    port = Port.open({:spawn_executable, executable}, [:binary, :exit_status])
+    Process.unlink(port)
 
+    assert {:error, :read_failed} = ControlToken.read_private_port_for_test(port, 1_000)
+  end
+
+  test "native descriptor port setup fails closed for an impossible descriptor" do
+    assert {:error, :invalid_fd} = ControlToken.open_private_port_for_test(-1)
+  end
+
+  test "partial input cannot extend the absolute descriptor deadline" do
+    with_fifo(fn path ->
+      {:ok, file_ref} = :prim_file.open(String.to_charlist(path), [:read, :write, :binary])
+
+      writer =
+        Task.async(fn ->
+          {:ok, writer_ref} = :prim_file.open(String.to_charlist(path), [:write, :binary])
+
+          Enum.each(1..5, fn _index ->
+            :ok = :prim_file.write(writer_ref, "x")
+            Process.sleep(75)
+          end)
+
+          :ok = :prim_file.close(writer_ref)
+        end)
+
+      started_at = System.monotonic_time(:millisecond)
+
+      assert {:error, :read_timeout} =
+               ControlToken.read_fd_for_test(descriptor_number(file_ref), 200)
+
+      elapsed_ms = System.monotonic_time(:millisecond) - started_at
+      assert elapsed_ms >= 200
+      assert elapsed_ms < 350
       assert {:error, :ebadf} = :prim_file.read(file_ref, 1)
+      Task.shutdown(writer, :brutal_kill)
     end)
   end
 
-  test "a descriptor read error fails closed" do
-    assert {:error, :read_failed} =
-             ControlToken.read_bounded_for_test(fn _file_ref, _read_size -> {:error, :eio} end)
-  end
-
-  test "private reader setup normalizes unsupported devices and open failures" do
-    assert {:error, :invalid_fd} =
-             ControlToken.normalize_private_reader_for_test({:ok, :missing_io_device})
-
-    assert {:error, :invalid_fd} =
-             ControlToken.normalize_private_reader_for_test({:error, :enoent})
-  end
-
-  test "bounded process cleanup never waits indefinitely" do
-    sleeper = spawn(fn -> Process.sleep(:infinity) end)
-
-    assert :timeout = ControlToken.await_process_down_for_test(sleeper, 0)
-    assert Process.alive?(sleeper)
-    Process.exit(sleeper, :kill)
-  end
-
   test "the test owner replacement updates the named store" do
+    assert {:ok, child_spec} = ControlToken.child_spec_from_token_for_test("default-child-token")
+    assert child_spec.id == ControlToken
+
     assert :ok = ControlToken.replace_for_test("replacement-token")
     assert {:ok, "replacement-token"} = ControlToken.fetch()
   end

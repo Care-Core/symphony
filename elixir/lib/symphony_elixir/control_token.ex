@@ -19,7 +19,6 @@ defmodule SymphonyElixir.ControlToken do
   @legacy_env "SYMPHONY_CONTROL_TOKEN"
   @max_token_bytes 4_096
   @read_timeout_ms 2_000
-  @reader_shutdown_timeout_ms 250
   @file_type_mask 0o170000
   @fifo_type 0o010000
   @persistent_key {__MODULE__, :token}
@@ -42,11 +41,21 @@ defmodule SymphonyElixir.ControlToken do
   @doc "Consumes the inherited descriptor once and returns a restart-stable child specification."
   @spec child_spec_from_environment(keyword()) ::
           {:ok, Supervisor.child_spec()} | {:error, atom()}
-  def child_spec_from_environment(opts \\ []) do
+  def child_spec_from_environment(opts \\ []), do: child_spec_from_source(:environment, opts)
+
+  if Mix.env() == :test do
+    @doc false
+    @spec child_spec_from_token_for_test(String.t(), keyword()) ::
+            {:ok, Supervisor.child_spec()} | {:error, atom()}
+    def child_spec_from_token_for_test(token, opts \\ []),
+      do: child_spec_from_source({:token, token}, opts)
+  end
+
+  defp child_spec_from_source(source, opts) do
     id = Keyword.get(opts, :id, __MODULE__)
     child_opts = Keyword.delete(opts, :id)
 
-    case load(:environment) do
+    case load(source) do
       {:ok, token} ->
         store_token(token)
 
@@ -73,25 +82,16 @@ defmodule SymphonyElixir.ControlToken do
     end
 
     @doc false
-    @spec read_fd_for_test(integer(), (term() -> term()), non_neg_integer()) :: term()
-    def read_fd_for_test(fd, reader, timeout_ms),
-      do: read_fd_with_timeout(fd, reader, timeout_ms)
+    @spec read_fd_for_test(integer(), non_neg_integer()) :: term()
+    def read_fd_for_test(fd, timeout_ms), do: read_fd_with_timeout(fd, timeout_ms)
 
     @doc false
-    @spec read_bounded_for_test((term(), pos_integer() -> term())) :: term()
-    def read_bounded_for_test(reader), do: read_bounded(:test_file_ref, <<>>, reader)
+    @spec open_private_port_for_test(integer()) :: {:ok, port()} | {:error, :invalid_fd}
+    def open_private_port_for_test(fd), do: open_private_port(fd)
 
     @doc false
-    @spec normalize_private_reader_for_test(term()) :: {:ok, pid()} | {:error, :invalid_fd}
-    def normalize_private_reader_for_test(result), do: normalize_private_reader(result)
-
-    @doc false
-    @spec await_process_down_for_test(pid(), non_neg_integer()) :: :ok | :timeout
-    def await_process_down_for_test(process, timeout_ms) do
-      process
-      |> Process.monitor()
-      |> await_process_down(process, timeout_ms)
-    end
+    @spec read_private_port_for_test(port(), non_neg_integer()) :: term()
+    def read_private_port_for_test(port, timeout_ms), do: read_port_with_timeout(port, timeout_ms)
   end
 
   @impl true
@@ -162,15 +162,15 @@ defmodule SymphonyElixir.ControlToken do
   defp read_configured_fd({:ok, fd}), do: read_fd_with_timeout(fd)
   defp read_configured_fd({:error, reason}), do: {:error, reason}
 
-  defp read_fd_with_timeout(fd), do: read_fd_with_timeout(fd, &read_and_validate/1, @read_timeout_ms)
+  defp read_fd_with_timeout(fd), do: read_fd_with_timeout(fd, @read_timeout_ms)
 
-  defp read_fd_with_timeout(fd, reader_function, timeout_ms) do
+  defp read_fd_with_timeout(fd, timeout_ms) do
     case :prim_file.file_desc_to_ref(fd, [:read, :binary]) do
       {:ok, source_ref} ->
         try do
           with :ok <- require_pipe(source_ref),
-               {:ok, io_server} <- open_private_reader(fd) do
-            read_io_server_with_timeout(io_server, reader_function, timeout_ms)
+               {:ok, port} <- open_private_port(fd) do
+            read_port_with_timeout(port, timeout_ms)
           end
         after
           :ok = :prim_file.close(source_ref)
@@ -181,54 +181,54 @@ defmodule SymphonyElixir.ControlToken do
     end
   end
 
-  defp open_private_reader(fd) do
-    "/dev/fd/#{fd}"
-    |> String.to_charlist()
-    |> :file.open([:read, :binary])
-    |> normalize_private_reader()
+  defp open_private_port(fd) do
+    port = Port.open({:fd, fd, fd}, [:binary, :in, :eof])
+    Process.unlink(port)
+    {:ok, port}
+  rescue
+    _error in [ArgumentError, ErlangError] -> {:error, :invalid_fd}
   end
 
-  defp normalize_private_reader({:ok, io_server}) when is_pid(io_server), do: {:ok, io_server}
+  defp read_port_with_timeout(port, timeout_ms) do
+    monitor = :erlang.monitor(:port, port)
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
 
-  defp normalize_private_reader({:ok, io_device}) do
-    :file.close(io_device)
-    {:error, :invalid_fd}
+    try do
+      receive_port(port, monitor, <<>>, deadline)
+    after
+      close_private_port(port)
+      Process.demonitor(monitor, [:flush])
+    end
   end
 
-  defp normalize_private_reader({:error, _reason}), do: {:error, :invalid_fd}
-
-  defp read_io_server_with_timeout(io_server, reader_function, timeout_ms) do
-    parent = self()
-    result_ref = make_ref()
-
-    {reader, monitor} =
-      spawn_monitor(fn ->
-        result = reader_function.(io_server)
-        send(parent, {result_ref, result})
-      end)
+  defp receive_port(port, monitor, data, deadline) do
+    remaining_ms = max(deadline - System.monotonic_time(:millisecond), 0)
 
     receive do
-      {^result_ref, result} ->
-        Process.demonitor(monitor, [:flush])
-        :ok = :file.close(io_server)
-        result
+      {^port, {:data, chunk}} when is_binary(chunk) ->
+        receive_port_chunk(port, monitor, data, chunk, deadline)
 
-      {:DOWN, ^monitor, :process, ^reader, _reason} ->
-        terminate_io_server(io_server)
+      {^port, :eof} ->
+        validate_token(data)
+
+      {:DOWN, ^monitor, :port, ^port, _reason} ->
         {:error, :read_failed}
     after
-      timeout_ms ->
-        terminate_io_server(io_server)
-        Process.exit(reader, :kill)
-        await_process_down(monitor, reader)
-        {:error, :read_timeout}
+      remaining_ms -> {:error, :read_timeout}
     end
   end
 
-  defp read_and_validate(file_ref) do
-    with {:ok, token} <- read_bounded(file_ref, <<>>) do
-      validate_token(token)
-    end
+  defp receive_port_chunk(_port, _monitor, data, chunk, _deadline)
+       when byte_size(data) + byte_size(chunk) > @max_token_bytes,
+       do: {:error, :token_too_large}
+
+  defp receive_port_chunk(port, monitor, data, chunk, deadline),
+    do: receive_port(port, monitor, data <> chunk, deadline)
+
+  defp close_private_port(port) do
+    Port.close(port)
+  rescue
+    ArgumentError -> :ok
   end
 
   defp require_pipe(file_ref) do
@@ -240,25 +240,6 @@ defmodule SymphonyElixir.ControlToken do
       else: {:error, :not_a_pipe}
   end
 
-  defp read_bounded(io_device, data), do: read_bounded(io_device, data, &:file.read/2)
-
-  defp read_bounded(file_ref, data, reader) when byte_size(data) <= @max_token_bytes do
-    read_size = min(1_024, @max_token_bytes + 1 - byte_size(data))
-
-    case reader.(file_ref, read_size) do
-      :eof -> {:ok, data}
-      {:ok, chunk} -> read_bounded_chunk(file_ref, data, chunk, reader)
-      {:error, _reason} -> {:error, :read_failed}
-    end
-  end
-
-  defp read_bounded_chunk(_file_ref, data, chunk, _reader)
-       when byte_size(data) + byte_size(chunk) > @max_token_bytes,
-       do: {:error, :token_too_large}
-
-  defp read_bounded_chunk(file_ref, data, chunk, reader),
-    do: read_bounded(file_ref, data <> chunk, reader)
-
   defp validate_token(<<>>), do: {:error, :empty_token}
 
   defp validate_token(token) when byte_size(token) > @max_token_bytes,
@@ -268,21 +249,5 @@ defmodule SymphonyElixir.ControlToken do
     if token |> :binary.bin_to_list() |> Enum.all?(&(&1 in 0x21..0x7E)),
       do: {:ok, token},
       else: {:error, :invalid_token_bytes}
-  end
-
-  defp await_process_down(monitor, process, timeout_ms \\ @reader_shutdown_timeout_ms) do
-    receive do
-      {:DOWN, ^monitor, :process, ^process, _reason} -> :ok
-    after
-      timeout_ms ->
-        Process.demonitor(monitor, [:flush])
-        :timeout
-    end
-  end
-
-  defp terminate_io_server(io_server) do
-    monitor = Process.monitor(io_server)
-    Process.exit(io_server, :kill)
-    await_process_down(monitor, io_server)
   end
 end
