@@ -6,9 +6,8 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   use Phoenix.Controller, formats: [:json]
 
   alias Plug.Conn
+  alias SymphonyElixir.ControlToken
   alias SymphonyElixirWeb.{Endpoint, Presenter}
-
-  @control_token_env "SYMPHONY_CONTROL_TOKEN"
 
   @spec state(Conn.t(), map()) :: Conn.t()
   def state(conn, _params) do
@@ -231,10 +230,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   end
 
   defp control_token do
-    case System.get_env(@control_token_env) do
-      token when is_binary(token) and byte_size(token) > 0 -> {:ok, token}
-      _ -> {:error, :control_token_not_configured}
-    end
+    ControlToken.fetch()
   end
 
   defp validate_control_token(conn, expected_token) do

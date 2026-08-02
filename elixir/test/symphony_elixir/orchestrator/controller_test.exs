@@ -3,16 +3,19 @@ defmodule SymphonyElixir.Orchestrator.ControllerTest do
 
   import Phoenix.ConnTest
 
+  alias SymphonyElixir.ControlToken
+
   @endpoint SymphonyElixirWeb.Endpoint
 
   setup do
     endpoint_config = Application.get_env(:symphony_elixir, @endpoint, [])
-    control_token = System.get_env("SYMPHONY_CONTROL_TOKEN")
+    control_token = ControlToken.fetch()
     service_secret = System.get_env("SYMPHONY_WAITER_SECRET")
+    :ok = ControlToken.replace_for_test(nil)
 
     on_exit(fn ->
       Application.put_env(:symphony_elixir, @endpoint, endpoint_config)
-      restore_env("SYMPHONY_CONTROL_TOKEN", control_token)
+      restore_control_token(control_token)
       restore_env("SYMPHONY_WAITER_SECRET", service_secret)
     end)
 
@@ -35,7 +38,7 @@ defmodule SymphonyElixir.Orchestrator.ControllerTest do
       File.rm(script)
     end)
 
-    System.put_env("SYMPHONY_CONTROL_TOKEN", "test-control-token")
+    :ok = ControlToken.replace_for_test("test-control-token")
 
     System.put_env(
       "SYMPHONY_WAITER_SECRET",
@@ -71,4 +74,9 @@ defmodule SymphonyElixir.Orchestrator.ControllerTest do
 
     refute File.exists?(marker)
   end
+
+  defp restore_control_token({:ok, token}), do: ControlToken.replace_for_test(token)
+
+  defp restore_control_token({:error, :control_token_not_configured}),
+    do: ControlToken.replace_for_test(nil)
 end
