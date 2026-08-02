@@ -151,29 +151,55 @@ defmodule SymphonyElixir.ControlTokenTest do
     end
   end
 
-  test "an oversized inherited token fails closed and closes the pipe" do
-    with_fifo_contents(String.duplicate("x", 4_097), fn fd, file_ref ->
-      System.put_env(@fd_env, Integer.to_string(fd))
+  test "an oversized inherited anonymous token fails closed and closes the pipe" do
+    expression = """
+    Process.flag(:trap_exit, true)
+    result = SymphonyElixir.ControlToken.start_link(name: nil)
+    fd_closed = match?({:error, _}, :prim_file.file_desc_to_ref(9, [:read, :binary]))
+    IO.puts("RESULT=\#{inspect(result)}")
+    IO.puts("FD_CLOSED=\#{fd_closed}")
+    """
 
-      assert {:error, {:invalid_control_token_fd, :token_too_large}} =
-               ControlToken.start_link(name: nil)
+    {output, 0} = run_with_pipe(String.duplicate("x", 4_097), expression)
 
-      assert {:error, :ebadf} = :prim_file.read(file_ref, 1)
-    end)
+    assert output =~ "invalid_control_token_fd"
+    assert output =~ "token_too_large"
+    assert output =~ "FD_CLOSED=true"
+
+    port = output_port(String.duplicate("x", 4_097))
+    assert {:error, :token_too_large} = ControlToken.read_private_port_for_test(port, 1_000)
   end
 
-  test "an inherited pipe that never reaches EOF times out and closes" do
-    with_fifo(fn path ->
-      {:ok, file_ref} = :prim_file.open(String.to_charlist(path), [:read, :write, :binary])
-      System.put_env(@fd_env, Integer.to_string(descriptor_number(file_ref)))
+  test "an inherited anonymous pipe that never reaches EOF times out and closes" do
+    expression = """
+    Process.flag(:trap_exit, true)
+    started_at = System.monotonic_time(:millisecond)
+    result = SymphonyElixir.ControlToken.start_link(name: nil)
+    elapsed_ms = System.monotonic_time(:millisecond) - started_at
+    fd_closed = match?({:error, _}, :prim_file.file_desc_to_ref(9, [:read, :binary]))
+    IO.puts("RESULT=\#{inspect(result)}")
+    IO.puts("ELAPSED_MS=\#{elapsed_ms}")
+    IO.puts("FD_CLOSED=\#{fd_closed}")
+    """
+
+    {output, 0} = run_with_open_pipe(expression)
+    [elapsed_ms] = Regex.run(~r/ELAPSED_MS=(\d+)/, output, capture: :all_but_first)
+
+    assert output =~ "invalid_control_token_fd"
+    assert output =~ "read_timeout"
+    assert output =~ "FD_CLOSED=true"
+    assert String.to_integer(elapsed_ms) in 2_000..4_000
+  end
+
+  test "a named FIFO is rejected without reopening or blocking" do
+    with_fifo_contents("named-fifo-token", fn fd, file_ref ->
+      System.put_env(@fd_env, Integer.to_string(fd))
       started_at = System.monotonic_time(:millisecond)
 
-      assert {:error, {:invalid_control_token_fd, :read_timeout}} =
+      assert {:error, {:invalid_control_token_fd, :not_anonymous_pipe}} =
                ControlToken.start_link(name: nil)
 
-      elapsed_ms = System.monotonic_time(:millisecond) - started_at
-      assert elapsed_ms >= 2_000
-      assert elapsed_ms < 4_000
+      assert System.monotonic_time(:millisecond) - started_at < 500
       assert {:error, :ebadf} = :prim_file.read(file_ref, 1)
     end)
   end
@@ -185,18 +211,18 @@ defmodule SymphonyElixir.ControlTokenTest do
   end
 
   test "reads and validates data from a native input port" do
-    executable = System.find_executable("sh") || flunk("sh executable not found")
-
-    port =
-      Port.open(
-        {:spawn_executable, executable},
-        [:binary, :eof, args: [~c"-c", ~c"printf owner-port-token"]]
-      )
-
-    Process.unlink(port)
-
     assert {:ok, "owner-port-token"} =
-             ControlToken.read_private_port_for_test(port, 1_000)
+             "owner-port-token"
+             |> output_port()
+             |> ControlToken.read_private_port_for_test(1_000)
+
+    assert {:ok, "injected-owner-port-token"} =
+             ControlToken.read_fd_with_for_test(
+               -1,
+               1_000,
+               fn -1 -> :ok end,
+               fn -1 -> {:ok, output_port("injected-owner-port-token")} end
+             )
   end
 
   test "an invalid configured descriptor fails closed" do
@@ -233,35 +259,72 @@ defmodule SymphonyElixir.ControlTokenTest do
 
   test "native descriptor port setup fails closed for an impossible descriptor" do
     assert {:error, :invalid_fd} = ControlToken.open_private_port_for_test(-1)
+
+    path = Path.join(System.tmp_dir!(), "symphony-control-port-#{System.os_time(:nanosecond)}")
+    File.write!(path, "test-only-port-input")
+
+    try do
+      {:ok, file_ref} = :prim_file.open(String.to_charlist(path), [:read, :binary])
+      assert {:ok, port} = ControlToken.open_private_port_for_test(descriptor_number(file_ref))
+      assert true = Port.close(port)
+      assert :ok = :prim_file.close(file_ref)
+    after
+      File.rm(path)
+    end
   end
 
   test "partial input cannot extend the absolute descriptor deadline" do
-    with_fifo(fn path ->
-      {:ok, file_ref} = :prim_file.open(String.to_charlist(path), [:read, :write, :binary])
+    executable = System.find_executable("sh") || flunk("sh executable not found")
 
-      writer =
-        Task.async(fn ->
-          {:ok, writer_ref} = :prim_file.open(String.to_charlist(path), [:write, :binary])
+    port =
+      Port.open(
+        {:spawn_executable, executable},
+        [:binary, :eof, args: [~c"-c", ~c"for i in 1 2 3 4 5; do printf x; sleep .075; done"]]
+      )
 
-          Enum.each(1..5, fn _index ->
-            :ok = :prim_file.write(writer_ref, "x")
-            Process.sleep(75)
-          end)
+    Process.unlink(port)
+    started_at = System.monotonic_time(:millisecond)
 
-          :ok = :prim_file.close(writer_ref)
-        end)
+    assert {:error, :read_timeout} = ControlToken.read_private_port_for_test(port, 200)
 
-      started_at = System.monotonic_time(:millisecond)
+    elapsed_ms = System.monotonic_time(:millisecond) - started_at
+    assert elapsed_ms >= 200
+    assert elapsed_ms < 350
+  end
 
-      assert {:error, :read_timeout} =
-               ControlToken.read_fd_for_test(descriptor_number(file_ref), 200)
+  test "pipe identity validation is explicit and fail closed on every supported platform" do
+    assert :ok =
+             ControlToken.validate_pipe_identity_for_test(
+               {:unix, :linux},
+               {:ok, "pipe:[12345]"},
+               1
+             )
 
-      elapsed_ms = System.monotonic_time(:millisecond) - started_at
-      assert elapsed_ms >= 200
-      assert elapsed_ms < 350
-      assert {:error, :ebadf} = :prim_file.read(file_ref, 1)
-      Task.shutdown(writer, :brutal_kill)
-    end)
+    assert {:error, :not_anonymous_pipe} =
+             ControlToken.validate_pipe_identity_for_test(
+               {:unix, :linux},
+               {:ok, "/tmp/named-fifo"},
+               1
+             )
+
+    assert {:error, :not_anonymous_pipe} =
+             ControlToken.validate_pipe_identity_for_test({:unix, :linux}, {:error, :enoent}, 0)
+
+    assert :ok =
+             ControlToken.validate_pipe_identity_for_test({:unix, :darwin}, :not_required, 0)
+
+    assert {:error, :not_anonymous_pipe} =
+             ControlToken.validate_pipe_identity_for_test({:unix, :darwin}, :not_required, 1)
+
+    assert {:error, :unsupported_platform} =
+             ControlToken.validate_pipe_identity_for_test({:win32, :nt}, :not_required, 0)
+
+    assert match?(
+             {status, _value} when status in [:ok, :error],
+             ControlToken.descriptor_link_for_test({:unix, :linux}, 0)
+           )
+
+    assert :not_required = ControlToken.descriptor_link_for_test({:unix, :darwin}, 0)
   end
 
   test "the test owner replacement updates the named store" do
@@ -308,6 +371,31 @@ defmodule SymphonyElixir.ControlTokenTest do
       env: [{"CONTROL_TOKEN_FIXTURE", token}],
       stderr_to_stdout: true
     )
+  end
+
+  defp run_with_open_pipe(expression) do
+    script = """
+    sleep 3 |
+    (
+      unset SYMPHONY_CONTROL_TOKEN
+      exec 9<&0
+      export SYMPHONY_CONTROL_TOKEN_FD=9
+      exec "$1" -pa "$2" -e "$3"
+    )
+    """
+
+    System.cmd(
+      "sh",
+      ["-c", script, "control-token-open-pipe", elixir_executable(), ebin_path(), expression],
+      stderr_to_stdout: true
+    )
+  end
+
+  defp output_port(contents) do
+    executable = System.find_executable("printf") || flunk("printf executable not found")
+    port = Port.open({:spawn_executable, executable}, [:binary, :eof, args: [contents]])
+    Process.unlink(port)
+    port
   end
 
   defp with_fifo_contents(contents, assertion) do
