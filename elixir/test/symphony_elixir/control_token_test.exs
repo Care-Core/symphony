@@ -204,6 +204,29 @@ defmodule SymphonyElixir.ControlTokenTest do
     end)
   end
 
+  test "an unlinked named FIFO cannot impersonate an anonymous pipe" do
+    with_fifo(fn path ->
+      writer =
+        Task.async(fn ->
+          {:ok, writer_ref} = :prim_file.open(String.to_charlist(path), [:write, :binary])
+          :ok = :prim_file.write(writer_ref, "unlinked-named-fifo-token")
+          :ok = :prim_file.close(writer_ref)
+        end)
+
+      {:ok, reader_ref} = :prim_file.open(String.to_charlist(path), [:read, :binary])
+      :ok = Task.await(writer)
+      :ok = File.rm(path)
+      System.put_env(@fd_env, Integer.to_string(descriptor_number(reader_ref)))
+      started_at = System.monotonic_time(:millisecond)
+
+      assert {:error, {:invalid_control_token_fd, :not_anonymous_pipe}} =
+               ControlToken.start_link(name: nil)
+
+      assert System.monotonic_time(:millisecond) - started_at < 500
+      assert {:error, :ebadf} = :prim_file.read(reader_ref, 1)
+    end)
+  end
+
   test "reads a prepared token into the owner store" do
     assert {:ok, pid} = ControlToken.start_link(name: nil, source: {:token, "owner-token"})
     assert {:ok, "owner-token"} = ControlToken.fetch(pid)
@@ -216,13 +239,26 @@ defmodule SymphonyElixir.ControlTokenTest do
              |> output_port()
              |> ControlToken.read_private_port_for_test(1_000)
 
-    assert {:ok, "injected-owner-port-token"} =
-             ControlToken.read_fd_with_for_test(
-               -1,
-               1_000,
-               fn -1 -> :ok end,
-               fn -1 -> {:ok, output_port("injected-owner-port-token")} end
-             )
+    path = Path.join(System.tmp_dir!(), "symphony-adopted-fd-#{System.os_time(:nanosecond)}")
+    File.write!(path, "test-only-adopted-fd")
+
+    try do
+      {:ok, source_ref} = :prim_file.open(String.to_charlist(path), [:read, :binary])
+      fd = descriptor_number(source_ref)
+
+      assert {:ok, "injected-owner-port-token"} =
+               ControlToken.read_adopted_fd_for_test(
+                 fd,
+                 source_ref,
+                 1_000,
+                 fn ^source_ref, ^fd -> :ok end,
+                 fn ^fd -> {:ok, output_port("injected-owner-port-token")} end
+               )
+
+      assert {:error, _reason} = :prim_file.read(source_ref, 1)
+    after
+      File.rm(path)
+    end
   end
 
   test "an invalid configured descriptor fails closed" do
@@ -240,6 +276,7 @@ defmodule SymphonyElixir.ControlTokenTest do
       {:ok, file_ref} = :prim_file.open(String.to_charlist(path), [:read, :binary])
       fd = descriptor_number(file_ref)
       :ok = :prim_file.close(file_ref)
+      assert {:error, :invalid_fd} = ControlToken.require_anonymous_pipe_for_test(file_ref, fd)
       System.put_env(@fd_env, Integer.to_string(fd))
 
       assert {:error, {:invalid_control_token_fd, :invalid_fd}} =

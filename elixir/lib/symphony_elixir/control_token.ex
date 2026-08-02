@@ -11,6 +11,10 @@ defmodule SymphonyElixir.ControlToken do
 
   import Bitwise
 
+  require Record
+
+  Record.defrecordp(:file_info, Record.extract(:file_info, from_lib: "kernel/include/file.hrl"))
+
   @fd_env "SYMPHONY_CONTROL_TOKEN_FD"
   @legacy_env "SYMPHONY_CONTROL_TOKEN"
   @max_token_bytes 4_096
@@ -78,15 +82,16 @@ defmodule SymphonyElixir.ControlToken do
     end
 
     @doc false
-    @spec read_fd_with_for_test(
+    @spec read_adopted_fd_for_test(
             integer(),
+            term(),
             non_neg_integer(),
-            (integer() -> term()),
+            (term(), integer() -> term()),
             (integer() -> term())
           ) ::
             term()
-    def read_fd_with_for_test(fd, timeout_ms, inspector, opener),
-      do: read_fd_with_timeout(fd, timeout_ms, inspector, opener)
+    def read_adopted_fd_for_test(fd, source_ref, timeout_ms, inspector, opener),
+      do: read_adopted_fd(fd, source_ref, timeout_ms, inspector, opener)
 
     @doc false
     @spec open_private_port_for_test(integer()) :: {:ok, port()} | {:error, :invalid_fd}
@@ -101,10 +106,16 @@ defmodule SymphonyElixir.ControlToken do
     def descriptor_link_for_test(os_type, fd), do: descriptor_link(os_type, fd)
 
     @doc false
+    @spec require_anonymous_pipe_for_test(term(), integer()) ::
+            :ok | {:error, :invalid_fd | :not_a_pipe | :not_anonymous_pipe | :unsupported_platform}
+    def require_anonymous_pipe_for_test(source_ref, fd),
+      do: require_anonymous_pipe(source_ref, fd)
+
+    @doc false
     @spec validate_pipe_identity_for_test(:os.type(), term(), non_neg_integer()) ::
             :ok | {:error, :not_anonymous_pipe | :unsupported_platform}
-    def validate_pipe_identity_for_test(os_type, link_result, links),
-      do: validate_pipe_identity(os_type, link_result, links)
+    def validate_pipe_identity_for_test(os_type, link_result, device),
+      do: validate_pipe_identity(os_type, link_result, device)
   end
 
   @impl true
@@ -178,20 +189,28 @@ defmodule SymphonyElixir.ControlToken do
   defp read_fd_with_timeout(fd), do: read_fd_with_timeout(fd, @read_timeout_ms)
 
   defp read_fd_with_timeout(fd, timeout_ms) do
-    read_fd_with_timeout(fd, timeout_ms, &require_anonymous_pipe/1, &open_private_port/1)
+    case :prim_file.file_desc_to_ref(fd, [:read, :binary]) do
+      {:ok, source_ref} ->
+        read_adopted_fd(
+          fd,
+          source_ref,
+          timeout_ms,
+          &require_anonymous_pipe/2,
+          &open_private_port/1
+        )
+
+      {:error, _reason} ->
+        {:error, :invalid_fd}
+    end
   end
 
-  defp read_fd_with_timeout(fd, timeout_ms, inspector, opener) do
-    with :ok <- inspector.(fd),
+  defp read_adopted_fd(fd, source_ref, timeout_ms, inspector, opener) do
+    with :ok <- inspector.(source_ref, fd),
          {:ok, port} <- opener.(fd) do
-      try do
-        read_port_with_timeout(port, timeout_ms)
-      after
-        close_inherited_fd(fd)
-      end
-    else
-      {:error, reason} -> reject_and_close(fd, reason)
+      read_port_with_timeout(port, timeout_ms)
     end
+  after
+    :prim_file.close(source_ref)
   end
 
   defp open_private_port(fd) do
@@ -244,13 +263,18 @@ defmodule SymphonyElixir.ControlToken do
     ArgumentError -> :ok
   end
 
-  defp require_anonymous_pipe(fd) do
-    case File.stat("/dev/fd/#{fd}", time: :posix) do
-      {:ok, %File.Stat{mode: mode, links: links}} when band(mode, @file_type_mask) == @fifo_type ->
+  defp require_anonymous_pipe(source_ref, fd) do
+    case :prim_file.read_handle_info(source_ref, time: :posix) do
+      {:ok, info} when band(file_info(info, :mode), @file_type_mask) == @fifo_type ->
         os_type = :os.type()
-        validate_pipe_identity(os_type, descriptor_link(os_type, fd), links)
 
-      {:ok, %File.Stat{}} ->
+        validate_pipe_identity(
+          os_type,
+          descriptor_link(os_type, fd),
+          file_info(info, :major_device)
+        )
+
+      {:ok, _info} ->
         {:error, :not_a_pipe}
 
       {:error, _reason} ->
@@ -261,32 +285,20 @@ defmodule SymphonyElixir.ControlToken do
   defp descriptor_link({:unix, :linux}, fd), do: File.read_link("/proc/self/fd/#{fd}")
   defp descriptor_link(_os_type, _fd), do: :not_required
 
-  defp validate_pipe_identity({:unix, :linux}, {:ok, target}, _links) do
+  defp validate_pipe_identity({:unix, :linux}, {:ok, target}, _device) do
     if Regex.match?(~r/^pipe:\[\d+\]$/, target), do: :ok, else: {:error, :not_anonymous_pipe}
   end
 
-  defp validate_pipe_identity({:unix, :linux}, _link_result, _links),
+  defp validate_pipe_identity({:unix, :linux}, _link_result, _device),
     do: {:error, :not_anonymous_pipe}
 
   defp validate_pipe_identity({:unix, :darwin}, :not_required, 0), do: :ok
 
-  defp validate_pipe_identity({:unix, :darwin}, :not_required, _links),
+  defp validate_pipe_identity({:unix, :darwin}, :not_required, _device),
     do: {:error, :not_anonymous_pipe}
 
-  defp validate_pipe_identity(_os_type, _link_result, _links),
+  defp validate_pipe_identity(_os_type, _link_result, _device),
     do: {:error, :unsupported_platform}
-
-  defp reject_and_close(fd, reason) do
-    close_inherited_fd(fd)
-    {:error, reason}
-  end
-
-  defp close_inherited_fd(fd) do
-    case :prim_file.file_desc_to_ref(fd, [:read, :binary]) do
-      {:ok, file_ref} -> :prim_file.close(file_ref)
-      {:error, _reason} -> :ok
-    end
-  end
 
   defp validate_token(<<>>), do: {:error, :empty_token}
 
