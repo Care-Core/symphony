@@ -72,14 +72,17 @@ defmodule SymphonyElixir.IssueCapabilityTest do
     refute System.get_env(@fd_env)
     assert System.get_env(@restart_env) == @restart_id
 
-    System.delete_env(@restart_env)
-    System.put_env(@fd_env, "9")
-
     assert {:error, :incomplete_issue_capability_configuration} =
-             IssueCapability.child_spec_from_environment()
+             IssueCapability.child_spec_from_environment_for_test(
+               "9",
+               nil,
+               fn "9", 32 ->
+                 send(self(), :partial_descriptor_consumed)
+                 {:ok, key()}
+               end
+             )
 
-    refute System.get_env(@fd_env)
-    refute System.get_env(@restart_env)
+    assert_received :partial_descriptor_consumed
 
     System.put_env(@restart_env, @restart_id)
 
@@ -87,6 +90,27 @@ defmodule SymphonyElixir.IssueCapabilityTest do
              IssueCapability.child_spec_from_environment()
 
     assert System.get_env(@restart_env) == @restart_id
+  end
+
+  test "a same-restart application start reuses the consumed private configuration" do
+    secret = key()
+    :ok = IssueCapability.replace_for_test(secret, @restart_id)
+
+    assert {:ok, child_spec} =
+             IssueCapability.child_spec_from_environment_for_test(
+               nil,
+               @restart_id,
+               fn _, _ -> flunk("same-restart reuse must not reread a descriptor") end
+             )
+
+    assert child_spec.id == IssueCapability
+
+    assert {:error, :incomplete_issue_capability_configuration} =
+             IssueCapability.child_spec_from_environment_for_test(
+               nil,
+               "123e4567-e89b-42d3-a456-426614174099",
+               fn _, _ -> flunk("mismatched restart must not read a descriptor") end
+             )
   end
 
   test "configuration validation requires exactly 32 bytes and a canonical restart id" do
@@ -123,6 +147,13 @@ defmodule SymphonyElixir.IssueCapabilityTest do
                "10",
                @restart_id,
                fn "10", 32 -> {:error, :read_failed} end
+             )
+
+    assert {:error, :incomplete_issue_capability_configuration} =
+             IssueCapability.child_spec_from_environment_for_test(
+               :not_a_descriptor,
+               @restart_id,
+               fn _, _ -> flunk("invalid descriptor types must not be read") end
              )
   end
 
@@ -169,48 +200,172 @@ defmodule SymphonyElixir.IssueCapabilityTest do
     refute output =~ :binary.copy("k", 32)
   end
 
-  test "capabilities bind exact issue session and current restart" do
+  test "request signatures bind the exact body issue session restart and nonce" do
     secret = key()
     :ok = IssueCapability.replace_for_test(secret, @restart_id)
-    capability = capability(secret, @issue, @session, @restart_id)
+    payload = request_payload(@nonce, @session, @restart_id)
+    signature = request_signature(secret, :progress, @nonce, @issue, @session, @restart_id, payload)
 
-    assert :ok = IssueCapability.verify(capability, @issue, @session, @restart_id, @nonce)
+    assert :ok =
+             IssueCapability.verify_request(
+               :progress,
+               signature,
+               @issue,
+               @session,
+               @restart_id,
+               @nonce,
+               payload
+             )
 
-    for {candidate, issue, session, restart_id} <- [
-          {capability, "CC-1899", @session, @restart_id},
-          {capability, @issue, "successor", @restart_id},
-          {capability, @issue, @session, "123e4567-e89b-42d3-a456-426614174099"},
-          {capability <> ".extra", @issue, @session, @restart_id},
-          {String.duplicate("x", 1_025), @issue, @session, @restart_id},
-          {nil, @issue, @session, @restart_id},
-          {"not-base64.signature", @issue, @session, @restart_id},
-          {capability(secret, @issue, @session, @restart_id, %{"extra" => true}), @issue, @session, @restart_id}
+    assert :ok =
+             IssueCapability.verify_request(
+               :progress,
+               signature,
+               @issue,
+               @session,
+               @restart_id,
+               @nonce,
+               payload
+             )
+
+    for {candidate, issue, session, restart_id, candidate_payload} <- [
+          {signature, "CC-1899", @session, @restart_id, payload},
+          {signature, @issue, "successor", @restart_id, payload},
+          {signature, @issue, @session, "123e4567-e89b-42d3-a456-426614174099", payload},
+          {signature <> "extra", @issue, @session, @restart_id, payload},
+          {nil, @issue, @session, @restart_id, payload},
+          {signature, @issue, @session, @restart_id, Map.put(payload, "progress_kind", "tampered")}
         ] do
       assert {:error, :invalid_issue_capability} =
-               IssueCapability.verify(candidate, issue, session, restart_id, @nonce)
+               IssueCapability.verify_request(
+                 :progress,
+                 candidate,
+                 issue,
+                 session,
+                 restart_id,
+                 "123e4567-e89b-42d3-a456-426614174099",
+                 candidate_payload
+               )
     end
 
     assert {:error, :invalid_issue_capability} =
-             IssueCapability.verify(capability, "", @session, @restart_id, @nonce)
+             IssueCapability.verify_request(
+               :progress,
+               signature,
+               "",
+               @session,
+               @restart_id,
+               "123e4567-e89b-42d3-a456-426614174098",
+               payload
+             )
 
     assert {:error, :invalid_issue_capability} =
-             IssueCapability.verify(capability, @issue, @session, @restart_id, "bad-nonce")
+             IssueCapability.verify_request(
+               :progress,
+               signature,
+               @issue,
+               @session,
+               @restart_id,
+               "bad-nonce",
+               payload
+             )
   end
 
-  test "capabilities keep issue and session identities unambiguous" do
+  test "request signatures keep issue and session identities unambiguous" do
     secret = key()
     :ok = IssueCapability.replace_for_test(secret, @restart_id)
-    signed = capability(secret, "A:B", "C", @restart_id)
+    payload = request_payload(@nonce, "C", @restart_id)
+    signed = request_signature(secret, :progress, @nonce, "A:B", "C", @restart_id, payload)
 
-    assert :ok = IssueCapability.verify(signed, "A:B", "C", @restart_id, @nonce)
+    assert :ok =
+             IssueCapability.verify_request(
+               :progress,
+               signed,
+               "A:B",
+               "C",
+               @restart_id,
+               @nonce,
+               payload
+             )
 
     assert {:error, :invalid_issue_capability} =
-             IssueCapability.verify(signed, "A", "B:C", @restart_id, @nonce)
+             IssueCapability.verify_request(
+               :progress,
+               signed,
+               "A",
+               "B:C",
+               @restart_id,
+               "123e4567-e89b-42d3-a456-426614174099",
+               payload
+             )
+  end
+
+  test "request signatures match the CareCore broker wire fixture" do
+    :ok = IssueCapability.replace_for_test(key(), @restart_id)
+
+    payload = %{
+      "capability_nonce" => @nonce,
+      "fingerprint" => %{
+        "contract_revision" => "v1",
+        "required_check_set" => ["Test & Lint"]
+      },
+      "owner_session" => "session-1",
+      "progress_kind" => "workpad_checkpoint",
+      "progress_receipt" => "receipt-1",
+      "restart_id" => @restart_id
+    }
+
+    assert :ok =
+             IssueCapability.verify_request(
+               :progress,
+               "T17JTdqiD6nR4WsnP3W8JtH1SbHuH0BWxzrCLanYnDU",
+               "CC-123",
+               "session-1",
+               @restart_id,
+               @nonce,
+               payload
+             )
+  end
+
+  test "request verification rejects unsupported actions" do
+    :ok = IssueCapability.replace_for_test(key(), @restart_id)
+    successor_nonce = "123e4567-e89b-42d3-a456-426614174099"
+    successor_payload = request_payload(successor_nonce, @session, @restart_id)
+
+    successor_signature =
+      request_signature(
+        key(),
+        :progress,
+        successor_nonce,
+        @issue,
+        @session,
+        @restart_id,
+        successor_payload
+      )
+
+    assert {:error, :invalid_issue_capability} =
+             IssueCapability.verify_request(
+               :unsupported,
+               successor_signature,
+               @issue,
+               @session,
+               @restart_id,
+               successor_nonce,
+               successor_payload
+             )
   end
 
   test "verification and signing fail closed while unconfigured" do
     assert {:error, :issue_capability_not_configured} =
-             IssueCapability.verify("anything", @issue, @session, @restart_id, @nonce)
+             IssueCapability.verify_request(
+               :progress,
+               "anything",
+               @issue,
+               @session,
+               @restart_id,
+               @nonce,
+               request_payload(@nonce, @session, @restart_id)
+             )
 
     assert {:error, :issue_capability_not_configured} =
              IssueCapability.sign_response(
@@ -329,26 +484,42 @@ defmodule SymphonyElixir.IssueCapabilityTest do
 
   defp key, do: :binary.copy(<<7>>, 32)
 
-  defp capability(secret, issue, session, restart_id, additions \\ %{}) do
-    payload =
-      Map.merge(
-        %{
-          "version" => 3,
-          "issue_identifier" => issue,
-          "owner_session" => session,
-          "restart_id" => restart_id
-        },
-        additions
-      )
-
-    encoded_payload = payload |> Jason.encode!() |> Base.url_encode64(padding: false)
-
-    signature =
-      :crypto.mac(:hmac, :sha256, secret, encoded_payload)
-      |> Base.url_encode64(padding: false)
-
-    "#{encoded_payload}.#{signature}"
+  defp request_payload(nonce, session, restart_id) do
+    %{
+      "capability_nonce" => nonce,
+      "fingerprint" => %{"head_sha" => @head, "required_check_set" => ["test"]},
+      "owner_session" => session,
+      "progress_kind" => "validation_receipt",
+      "progress_receipt" => "receipt-1",
+      "restart_id" => restart_id
+    }
   end
+
+  defp request_signature(secret, kind, nonce, issue, session, restart_id, payload) do
+    message =
+      Jason.encode!([
+        1,
+        "request",
+        Atom.to_string(kind),
+        nonce,
+        issue,
+        session,
+        restart_id,
+        canonical_term(payload)
+      ])
+
+    :crypto.mac(:hmac, :sha256, secret, message)
+    |> Base.url_encode64(padding: false)
+  end
+
+  defp canonical_term(value) when is_map(value) do
+    value
+    |> Enum.map(fn {key, nested} -> [to_string(key), canonical_term(nested)] end)
+    |> Enum.sort()
+  end
+
+  defp canonical_term(value) when is_list(value), do: Enum.map(value, &canonical_term/1)
+  defp canonical_term(value), do: value
 
   defp progress_payload do
     %{

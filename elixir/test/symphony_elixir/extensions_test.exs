@@ -715,7 +715,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     unconfigured_issue_conn =
       build_conn()
-      |> Plug.Conn.put_req_header("x-symphony-issue-capability", "unconfigured")
+      |> Plug.Conn.put_req_header("x-symphony-issue-signature", "unconfigured")
 
     assert json_response(
              post(unconfigured_issue_conn, "/api/v1/MT-HTTP/progress", issue_body),
@@ -726,7 +726,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     invalid_issue_conn =
       build_conn()
-      |> Plug.Conn.put_req_header("x-symphony-issue-capability", "invalid")
+      |> Plug.Conn.put_req_header("x-symphony-issue-signature", "invalid")
 
     assert json_response(
              post(invalid_issue_conn, "/api/v1/MT-HTTP/progress", issue_body),
@@ -736,8 +736,8 @@ defmodule SymphonyElixir.ExtensionsTest do
     issue_remote_conn =
       build_conn()
       |> Plug.Conn.put_req_header(
-        "x-symphony-issue-capability",
-        test_issue_capability("MT-HTTP", "thread-http")
+        "x-symphony-issue-signature",
+        test_issue_signature(:progress, "MT-HTTP", "thread-http", test_nonce(), issue_body)
       )
       |> then(&%{&1 | remote_ip: {10, 0, 0, 1}})
 
@@ -879,11 +879,11 @@ defmodule SymphonyElixir.ExtensionsTest do
     :ok = ControlToken.replace_for_test("test-control-token")
     :ok = IssueCapability.replace_for_test(test_capability_key(), test_restart_id())
 
-    issue_conn = fn ->
+    issue_conn = fn kind, nonce, body ->
       build_conn()
       |> Plug.Conn.put_req_header(
-        "x-symphony-issue-capability",
-        test_issue_capability("MT-CONTROL", "thread-http")
+        "x-symphony-issue-signature",
+        test_issue_signature(kind, "MT-CONTROL", "thread-http", nonce, body)
       )
     end
 
@@ -892,17 +892,19 @@ defmodule SymphonyElixir.ExtensionsTest do
       "head_sha" => "0123456789abcdef0123456789abcdef01234567"
     }
 
+    progress_request = %{
+      "capability_nonce" => test_nonce(),
+      "fingerprint" => fingerprint,
+      "owner_session" => "thread-http",
+      "progress_kind" => "workpad_checkpoint",
+      "progress_receipt" => "linear-comment-1",
+      "restart_id" => test_restart_id(),
+      "ignored" => "not-forwarded"
+    }
+
     progress_payload =
-      issue_conn.()
-      |> post("/api/v1/MT-CONTROL/progress", %{
-        "capability_nonce" => test_nonce(),
-        "fingerprint" => fingerprint,
-        "owner_session" => "thread-http",
-        "progress_kind" => "workpad_checkpoint",
-        "progress_receipt" => "linear-comment-1",
-        "restart_id" => test_restart_id(),
-        "ignored" => "not-forwarded"
-      })
+      issue_conn.(:progress, test_nonce(), progress_request)
+      |> post("/api/v1/MT-CONTROL/progress", progress_request)
       |> json_response(200)
 
     assert progress_payload["changed"] == true
@@ -927,17 +929,21 @@ defmodule SymphonyElixir.ExtensionsTest do
                        "progress_receipt" => "linear-comment-1"
                      }}
 
+    review_nonce = "123e4567-e89b-42d3-a456-426614174002"
+
+    review_request = %{
+      "capability_nonce" => review_nonce,
+      "kind" => "full",
+      "owner_session" => "thread-http",
+      "restart_id" => test_restart_id(),
+      "requested_head" => head,
+      "observed_local_head" => head,
+      "observed_remote_head" => head
+    }
+
     review_payload =
-      issue_conn.()
-      |> post("/api/v1/MT-CONTROL/review", %{
-        "capability_nonce" => test_nonce(),
-        "kind" => "full",
-        "owner_session" => "thread-http",
-        "restart_id" => test_restart_id(),
-        "requested_head" => head,
-        "observed_local_head" => head,
-        "observed_remote_head" => head
-      })
+      issue_conn.(:review, review_nonce, review_request)
+      |> post("/api/v1/MT-CONTROL/review", review_request)
       |> json_response(200)
 
     assert review_payload["authorized"] == true
@@ -945,7 +951,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert IssueCapability.verify_response_for_test(
              :review,
-             test_nonce(),
+             review_nonce,
              "MT-CONTROL",
              "thread-http",
              review_payload,
@@ -1407,23 +1413,31 @@ defmodule SymphonyElixir.ExtensionsTest do
   defp test_restart_id, do: "123e4567-e89b-42d3-a456-426614174000"
   defp test_nonce, do: "123e4567-e89b-42d3-a456-426614174001"
 
-  defp test_issue_capability(issue, session) do
-    encoded_payload =
-      %{
-        "version" => 3,
-        "issue_identifier" => issue,
-        "owner_session" => session,
-        "restart_id" => test_restart_id()
-      }
-      |> Jason.encode!()
-      |> Base.url_encode64(padding: false)
+  defp test_issue_signature(kind, issue, session, nonce, payload) do
+    message =
+      Jason.encode!([
+        1,
+        "request",
+        Atom.to_string(kind),
+        nonce,
+        issue,
+        session,
+        test_restart_id(),
+        canonical_term(payload)
+      ])
 
-    signature =
-      :crypto.mac(:hmac, :sha256, test_capability_key(), encoded_payload)
-      |> Base.url_encode64(padding: false)
-
-    "#{encoded_payload}.#{signature}"
+    :crypto.mac(:hmac, :sha256, test_capability_key(), message)
+    |> Base.url_encode64(padding: false)
   end
+
+  defp canonical_term(value) when is_map(value) do
+    value
+    |> Enum.map(fn {key, nested} -> [to_string(key), canonical_term(nested)] end)
+    |> Enum.sort()
+  end
+
+  defp canonical_term(value) when is_list(value), do: Enum.map(value, &canonical_term/1)
+  defp canonical_term(value), do: value
 
   defp static_snapshot do
     %{

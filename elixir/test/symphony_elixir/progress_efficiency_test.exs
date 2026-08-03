@@ -58,7 +58,7 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
 
     :sys.replace_state(pid, fn state ->
       running_entry = Map.fetch!(state.running, issue.id)
-      updated_entry = Map.put(running_entry, :session_id, "thread-successor")
+      updated_entry = Map.put(running_entry, :attempt_session_id, "thread-successor")
       %{state | running: Map.put(state.running, issue.id, updated_entry)}
     end)
 
@@ -77,6 +77,123 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
                issue.identifier,
                progress_attributes(progress_fingerprint(), "successor-checkpoint", owner_session: "thread-successor"),
                pid
+             )
+
+    Process.exit(worker_pid, :shutdown)
+  end
+
+  test "signed request nonces are one-use and scoped to the exact running attempt" do
+    {pid, issue, worker_pid, _workspace_root, _workspace} =
+      start_progress_orchestrator("attempt-scoped-nonces")
+
+    nonce = "123e4567-e89b-42d3-a456-426614174001"
+
+    attributes =
+      progress_attributes(progress_fingerprint(), "checkpoint-1")
+      |> Map.merge(%{
+        issue_request_authorized: true,
+        issue_capability_nonce: nonce
+      })
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(issue.identifier, attributes, pid)
+
+    assert {:error, :replayed_issue_request} =
+             Orchestrator.record_progress(issue.identifier, attributes, pid)
+
+    :sys.replace_state(pid, fn state ->
+      running_entry = Map.fetch!(state.running, issue.id)
+
+      exhausted_entry =
+        Map.put(
+          running_entry,
+          :issue_capability_nonces,
+          1..4_096 |> Enum.map(&"seen-#{&1}") |> MapSet.new()
+        )
+
+      %{state | running: Map.put(state.running, issue.id, exhausted_entry)}
+    end)
+
+    fresh_nonce_attributes =
+      attributes
+      |> Map.put(:issue_capability_nonce, "123e4567-e89b-42d3-a456-426614174002")
+      |> Map.put(:progress_receipt, "capacity-checkpoint")
+
+    assert {:error, :issue_nonce_capacity_exceeded} =
+             Orchestrator.record_progress(issue.identifier, fresh_nonce_attributes, pid)
+
+    :sys.replace_state(pid, fn state ->
+      running_entry = Map.fetch!(state.running, issue.id)
+
+      successor_entry =
+        running_entry
+        |> Map.put(:attempt_session_id, "thread-successor")
+        |> Map.put(:issue_capability_nonces, MapSet.new())
+
+      %{state | running: Map.put(state.running, issue.id, successor_entry)}
+    end)
+
+    successor_attributes =
+      attributes
+      |> Map.put(:owner_session, "thread-successor")
+      |> Map.put(:progress_receipt, "successor-checkpoint")
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(issue.identifier, successor_attributes, pid)
+
+    Process.exit(worker_pid, :shutdown)
+  end
+
+  test "global owner review keeps the explicit fingerprint precondition" do
+    {pid, issue, worker_pid, _workspace_root, _workspace} =
+      start_progress_orchestrator("global-owner-review")
+
+    assert {:ok, %{review_fingerprint: review_hash}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    owner_attributes = %{
+      kind: "full",
+      owner_session_authorized: true,
+      requested_head: @head,
+      observed_local_head: @head,
+      observed_remote_head: @head
+    }
+
+    assert {:error, :review_fingerprint_required} =
+             Orchestrator.authorize_review(issue.identifier, owner_attributes, pid)
+
+    assert {:ok, %{authorized: true, review_fingerprint: ^review_hash}} =
+             Orchestrator.authorize_review(
+               issue.identifier,
+               Map.put(owner_attributes, :review_fingerprint, review_hash),
+               pid
+             )
+
+    Process.exit(worker_pid, :shutdown)
+  end
+
+  test "review heads normalize before authorization and response construction" do
+    {pid, issue, worker_pid, _workspace_root, _workspace} =
+      start_progress_orchestrator("uppercase-review-head")
+
+    upper_head = String.upcase(@head)
+
+    assert {:ok, %{review_fingerprint: review_hash}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(head: upper_head), "checkpoint-1"),
+               pid
+             )
+
+    assert {:ok, %{authorized: true, requested_head: @head}} =
+             authorize_review(pid, issue, review_hash, "full",
+               requested_head: upper_head,
+               observed_local_head: upper_head,
+               observed_remote_head: upper_head
              )
 
     Process.exit(worker_pid, :shutdown)
@@ -572,6 +689,7 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
       issue: issue,
       worker_host: nil,
       workspace_path: workspace,
+      attempt_session_id: "thread-turn",
       session_id: "thread-turn",
       last_codex_message: nil,
       last_codex_timestamp: nil,

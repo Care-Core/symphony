@@ -447,6 +447,45 @@ defmodule SymphonyElixir.WorkspaceAndConfigTest do
     end
   end
 
+  test "attempt-scoped hooks receive the supervisor-issued session literally" do
+    test_root =
+      Path.join(
+        System.tmp_dir!(),
+        "symphony-elixir-workspace-hook-attempt-#{System.unique_integer([:positive])}"
+      )
+
+    previous_session = System.get_env("SYMPHONY_SESSION_ID")
+
+    on_exit(fn ->
+      restore_env("SYMPHONY_SESSION_ID", previous_session)
+      File.rm_rf(test_root)
+    end)
+
+    workspace_root = Path.join(test_root, "workspaces")
+    System.put_env("SYMPHONY_SESSION_ID", "ambient-stale-session")
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      workspace_root: workspace_root,
+      hook_before_run: "printf '%s' \"$SYMPHONY_SESSION_ID\" > before-run.session",
+      hook_after_run: "printf '%s' \"$SYMPHONY_SESSION_ID\" > after-run.session"
+    )
+
+    issue = %Issue{id: "issue-attempt", identifier: "MT-ATTEMPT"}
+    attempt_session_id = "attempt-session-1"
+
+    assert {:ok, workspace} = Workspace.create_for_issue(issue)
+
+    assert :ok =
+             Workspace.run_before_run_hook(workspace, issue, nil, attempt_session_id: attempt_session_id)
+
+    assert :ok =
+             Workspace.run_after_run_hook(workspace, issue, nil, attempt_session_id: attempt_session_id)
+
+    assert File.read!(Path.join(workspace, "before-run.session")) == attempt_session_id
+    assert File.read!(Path.join(workspace, "after-run.session")) == attempt_session_id
+    assert System.get_env("SYMPHONY_SESSION_ID") == "ambient-stale-session"
+  end
+
   test "workspace retries after_create after a failed new workspace bootstrap" do
     test_root =
       Path.join(

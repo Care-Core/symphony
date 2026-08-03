@@ -306,11 +306,16 @@ public active restart UUID as `SYMPHONY_RESTART_ID`. Startup consumes and closes
 descriptor before any child starts. A partial, invalid, non-pipe, or wrongly sized configuration
 fails startup closed; absence of both capability inputs leaves this optional path disabled.
 
-An issue-scoped progress or review request carries `x-symphony-issue-capability` plus
-`owner_session`, `restart_id`, and a fresh UUID `capability_nonce`. The version-3 capability must
-authenticate separate exact `issue_identifier` and `owner_session` fields plus the active restart. The orchestrator
-then atomically requires that session to remain the issue's currently running session. Review may
-omit `review_fingerprint`; Symphony uses the currently registered fingerprint internally.
+The issue-local version-3 capability stays inside the trusted CareCore broker and is never sent over
+loopback. Each progress or review transition carries `x-symphony-issue-signature` plus
+`owner_session`, `restart_id`, and a fresh UUID `capability_nonce`. The signature is base64url
+HMAC-SHA256 over a canonical form of the exact request body, issue, supervisor-issued attempt ID,
+restart, action, and nonce. Symphony authenticates the signature first, then its orchestrator
+atomically consumes the nonce and mutates state only while that attempt ID remains the issue's
+currently running attempt. Each running attempt owns its bounded nonce set, so replays fail closed,
+agent exit releases the set, and one attempt cannot permanently exhaust proof control for later
+work. Review may omit `review_fingerprint` only on this scoped path; the global owner-token path
+still requires it.
 
 Successful issue-scoped responses echo `issue_capability_nonce` and include
 `issue_capability_signature`. The signature is base64url HMAC-SHA256 with the same key over the
@@ -319,8 +324,9 @@ JSON encoding of one of these fixed arrays:
 - progress: `[1,"progress",nonce,issue,session,restart,changed,progress_hash,review_hash]`
 - review: `[1,"review",nonce,issue,session,restart,authorized,authorization,kind,review_round_count,security_review_count,review_hash,requested_head]`
 
-This lets the owner broker reject a process that races to impersonate the loopback HTTP listener.
-Supplying an issue-capability header always selects the scoped path and never falls back to global
+This lets the owner broker reject a process that races to impersonate the loopback HTTP listener,
+while an impersonator cannot reuse the observed request signature for a different mutation.
+Supplying an issue-signature header always selects the scoped path and never falls back to global
 control-token authorization.
 
 Progress and review state is durable and fail-closed. Review authorization reuses an accepted full

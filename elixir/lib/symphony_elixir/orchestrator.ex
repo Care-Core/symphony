@@ -16,6 +16,7 @@ defmodule SymphonyElixir.Orchestrator do
   @phase_resume_pending_reason "input_token_resume_pending"
   @resume_phases ~w(implementation validation review-fix hosted-closeout landing)
   @progress_fingerprint_fields ~w(contract_revision base_sha head_sha diff_checksum matrix_checksum required_check_set latest_human_comment_checkpoint full_review_verdict hosted_receipt)
+  @max_issue_request_nonces 4_096
   @review_fingerprint_fields ~w(contract_revision base_sha head_sha diff_checksum matrix_checksum required_check_set latest_human_comment_checkpoint)
   @review_kinds ~w(full delta security)
   @sha256_checksum_pattern ~r/\A(?:sha256:)?([0-9a-f]{64})\z/i
@@ -1298,9 +1299,15 @@ defmodule SymphonyElixir.Orchestrator do
          worker_host,
          phase_budget
        ) do
+    attempt_session_id =
+      24
+      |> :crypto.strong_rand_bytes()
+      |> Base.url_encode64(padding: false)
+
     case Task.Supervisor.start_child(state.task_supervisor, fn ->
            state.agent_runner.(issue, recipient,
              attempt: attempt,
+             attempt_session_id: attempt_session_id,
              worker_host: worker_host,
              resume_phase: phase_budget_value(phase_budget, :phase),
              max_additional_input_tokens: phase_budget_value(phase_budget, :effective_additional_input_tokens),
@@ -1322,6 +1329,8 @@ defmodule SymphonyElixir.Orchestrator do
             issue: issue,
             worker_host: worker_host,
             workspace_path: nil,
+            attempt_session_id: attempt_session_id,
+            issue_capability_nonces: MapSet.new(),
             session_id: nil,
             last_codex_message: nil,
             last_codex_timestamp: nil,
@@ -2380,9 +2389,23 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp record_progress_state(state, issue_identifier, attributes) do
-    with {:ok, issue_id} <-
-           require_active_owner_session(state, issue_identifier, attributes),
-         {:ok, fingerprint} <-
+    case require_active_owner_session(state, issue_identifier, attributes) do
+      {:ok, issue_id} ->
+        case consume_issue_request_nonce(state, issue_id, attributes) do
+          {:ok, authorized_state} ->
+            record_authorized_progress(authorized_state, issue_id, issue_identifier, attributes)
+
+          {:error, reason} ->
+            {:error, reason, state}
+        end
+
+      {:error, reason} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp record_authorized_progress(state, issue_id, issue_identifier, attributes) do
+    with {:ok, fingerprint} <-
            normalize_progress_fingerprint(option_value(attributes, :fingerprint)),
          {:ok, progress_kind} <-
            normalize_progress_kind(option_value(attributes, :progress_kind)),
@@ -2482,19 +2505,34 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp authorize_review_state(state, issue_identifier, attributes) do
-    with {:ok, issue_id} <-
-           require_active_owner_session(state, issue_identifier, attributes),
-         %{} = progress <- Map.get(state.progress, issue_id),
+    case require_active_owner_session(state, issue_identifier, attributes) do
+      {:ok, issue_id} ->
+        case consume_issue_request_nonce(state, issue_id, attributes) do
+          {:ok, authorized_state} ->
+            authorize_consumed_review(authorized_state, issue_id, attributes)
+
+          {:error, reason} ->
+            {:error, reason, state}
+        end
+
+      {:error, reason} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp authorize_consumed_review(state, issue_id, attributes) do
+    with %{} = progress <- Map.get(state.progress, issue_id),
          {:ok, kind} <- normalize_review_kind(option_value(attributes, :kind)),
-         requested_fingerprint when is_binary(requested_fingerprint) <-
+         {:ok, requested_fingerprint} <-
            requested_review_fingerprint(attributes, progress),
          true <- requested_fingerprint == Map.get(progress, "review_fingerprint_hash"),
-         requested_head when is_binary(requested_head) <-
-           option_value(attributes, :requested_head),
-         true <- valid_commit_sha?(requested_head),
+         {:ok, requested_head} <-
+           normalize_commit_sha(option_value(attributes, :requested_head)),
          true <- fingerprint_contains_head?(Map.get(progress, "fingerprint", %{}), requested_head),
-         ^requested_head <- option_value(attributes, :observed_local_head),
-         ^requested_head <- option_value(attributes, :observed_remote_head),
+         {:ok, ^requested_head} <-
+           normalize_commit_sha(option_value(attributes, :observed_local_head)),
+         {:ok, ^requested_head} <-
+           normalize_commit_sha(option_value(attributes, :observed_remote_head)),
          {:ok, _eligible} <-
            increment_review_round(progress, kind, option_value(attributes, :human_override)) do
       authorization =
@@ -2547,7 +2585,7 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp require_running_owner_session(state, issue_id, attributes) do
     case Map.get(state.running, issue_id) do
-      %{session_id: current_session} when is_binary(current_session) ->
+      %{attempt_session_id: current_session} when is_binary(current_session) ->
         if option_value(attributes, :owner_session) == current_session,
           do: {:ok, issue_id},
           else: {:error, :stale_issue_session}
@@ -2557,8 +2595,50 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  defp consume_issue_request_nonce(state, issue_id, attributes) do
+    if option_value(attributes, :issue_request_authorized) == true do
+      running_entry = Map.fetch!(state.running, issue_id)
+      nonce = option_value(attributes, :issue_capability_nonce)
+      seen_nonces = Map.get(running_entry, :issue_capability_nonces, MapSet.new())
+
+      cond do
+        not is_binary(nonce) or nonce == "" ->
+          {:error, :invalid_issue_capability}
+
+        MapSet.member?(seen_nonces, nonce) ->
+          {:error, :replayed_issue_request}
+
+        MapSet.size(seen_nonces) >= @max_issue_request_nonces ->
+          {:error, :issue_nonce_capacity_exceeded}
+
+        true ->
+          updated_entry =
+            Map.put(running_entry, :issue_capability_nonces, MapSet.put(seen_nonces, nonce))
+
+          {:ok, %{state | running: Map.put(state.running, issue_id, updated_entry)}}
+      end
+    else
+      {:ok, state}
+    end
+  end
+
   defp requested_review_fingerprint(attributes, progress) do
-    option_value(attributes, :review_fingerprint) || Map.get(progress, "review_fingerprint_hash")
+    case option_value(attributes, :review_fingerprint) do
+      value when is_binary(value) ->
+        {:ok, value}
+
+      _ ->
+        if option_value(attributes, :owner_session_authorized) == true,
+          do: {:error, :review_fingerprint_required},
+          else: scoped_review_fingerprint(progress)
+    end
+  end
+
+  defp scoped_review_fingerprint(progress) do
+    case Map.get(progress, "review_fingerprint_hash") do
+      value when is_binary(value) -> {:ok, value}
+      _ -> {:error, :review_fingerprint_required}
+    end
   end
 
   defp normalize_progress_fingerprint(fingerprint) when is_map(fingerprint) do
@@ -3208,6 +3288,12 @@ defmodule SymphonyElixir.Orchestrator do
   defp valid_commit_sha?(value),
     do: is_binary(value) and Regex.match?(~r/\A[0-9a-f]{40}\z/i, value)
 
+  defp normalize_commit_sha(value) do
+    if valid_commit_sha?(value),
+      do: {:ok, String.downcase(value)},
+      else: {:error, :invalid_commit_sha}
+  end
+
   defp valid_sha_container?(value) when is_binary(value), do: valid_commit_sha?(value)
 
   defp valid_sha_container?(value) when is_map(value) and map_size(value) > 0,
@@ -3237,8 +3323,8 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp fingerprint_contains_head?(fingerprint, head) do
     case Map.get(fingerprint, "head_sha") do
-      ^head -> true
-      heads when is_map(heads) -> head in Map.values(heads)
+      stored when is_binary(stored) -> String.downcase(stored) == head
+      heads when is_map(heads) -> Enum.any?(Map.values(heads), &(is_binary(&1) and String.downcase(&1) == head))
       _ -> false
     end
   end

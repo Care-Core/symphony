@@ -2046,6 +2046,7 @@ defmodule SymphonyElixir.AppServerTest do
     previous_control_token_fd = System.get_env("SYMPHONY_CONTROL_TOKEN_FD")
     previous_issue_capability_fd = System.get_env("SYMPHONY_ISSUE_CAPABILITY_KEY_FD")
     previous_issue_branch = System.get_env("SYMPHONY_ISSUE_BRANCH_NAME")
+    previous_attempt_session = System.get_env("SYMPHONY_SESSION_ID")
     previous_home = System.get_env("HOME")
     previous_trace = System.get_env("SYMP_TEST_CODEx_TRACE")
 
@@ -2056,6 +2057,7 @@ defmodule SymphonyElixir.AppServerTest do
       restore_env("SYMPHONY_CONTROL_TOKEN_FD", previous_control_token_fd)
       restore_env("SYMPHONY_ISSUE_CAPABILITY_KEY_FD", previous_issue_capability_fd)
       restore_env("SYMPHONY_ISSUE_BRANCH_NAME", previous_issue_branch)
+      restore_env("SYMPHONY_SESSION_ID", previous_attempt_session)
       restore_env("HOME", previous_home)
       restore_env("SYMP_TEST_CODEx_TRACE", previous_trace)
     end)
@@ -2077,6 +2079,7 @@ defmodule SymphonyElixir.AppServerTest do
       export SYMPHONY_CONTROL_TOKEN_FD='777'
       export SYMPHONY_ISSUE_CAPABILITY_KEY_FD='779'
       export SYMPHONY_ISSUE_BRANCH_NAME='profile-branch-that-must-not-reach-child'
+      export SYMPHONY_SESSION_ID='profile-stale-attempt'
       export #{profile_marker_env}=1
       """)
 
@@ -2086,6 +2089,7 @@ defmodule SymphonyElixir.AppServerTest do
       System.put_env("SYMPHONY_CONTROL_TOKEN_FD", "778")
       System.put_env("SYMPHONY_ISSUE_CAPABILITY_KEY_FD", "780")
       System.put_env("SYMPHONY_ISSUE_BRANCH_NAME", "ambient-branch-that-must-not-reach-child")
+      System.put_env("SYMPHONY_SESSION_ID", "ambient-stale-attempt")
       System.put_env("HOME", bash_home)
       System.put_env("SYMP_TEST_CODEx_TRACE", trace_file)
 
@@ -2099,6 +2103,7 @@ defmodule SymphonyElixir.AppServerTest do
       printf 'CONTROL_FD:%s\n' "$SYMPHONY_CONTROL_TOKEN_FD" >> "$trace_file"
       printf 'ISSUE_CAPABILITY_FD:%s\n' "$SYMPHONY_ISSUE_CAPABILITY_KEY_FD" >> "$trace_file"
       printf 'ISSUE_BRANCH:%s\n' "$SYMPHONY_ISSUE_BRANCH_NAME" >> "$trace_file"
+      printf 'ATTEMPT_SESSION:%s\n' "$SYMPHONY_SESSION_ID" >> "$trace_file"
       count=0
 
       while IFS= read -r line; do
@@ -2143,7 +2148,9 @@ defmodule SymphonyElixir.AppServerTest do
         labels: ["security"]
       }
 
-      assert {:ok, _result} = AppServer.run(workspace, "Do not inherit tracker auth", issue)
+      assert {:ok, _result} =
+               AppServer.run(workspace, "Do not inherit tracker auth", issue, attempt_session_id: "attempt-session-1")
+
       assert File.read!(trace_file) =~ "PROFILE_LOADED:1\n"
       assert File.read!(trace_file) =~ "CANONICAL_SECRET:\n"
       assert File.read!(trace_file) =~ "CUSTOM_SECRET:\n"
@@ -2151,6 +2158,7 @@ defmodule SymphonyElixir.AppServerTest do
       assert File.read!(trace_file) =~ "CONTROL_FD:\n"
       assert File.read!(trace_file) =~ "ISSUE_CAPABILITY_FD:\n"
       assert File.read!(trace_file) =~ "ISSUE_BRANCH:\n"
+      assert File.read!(trace_file) =~ "ATTEMPT_SESSION:attempt-session-1\n"
       refute File.read!(trace_file) =~ "secret-that-must-not-reach-child"
       refute File.read!(trace_file) =~ "branch-that-must-not-reach-child"
     after
@@ -2235,7 +2243,8 @@ defmodule SymphonyElixir.AppServerTest do
                  remote_workspace,
                  "Run remote worker",
                  issue,
-                 worker_host: "worker-01:2200"
+                 worker_host: "worker-01:2200",
+                 attempt_session_id: "attempt-remote-1"
                )
 
       trace = File.read!(trace_file)
@@ -2248,6 +2257,9 @@ defmodule SymphonyElixir.AppServerTest do
 
       assert argv_line =~
                "unset SYMPHONY_CONTROL_TOKEN SYMPHONY_CONTROL_TOKEN_FD SYMPHONY_ISSUE_CAPABILITY_KEY_FD SYMPHONY_ISSUE_BRANCH_NAME LINEAR_API_KEY"
+
+      assert argv_line =~ "export SYMPHONY_SESSION_ID="
+      assert argv_line =~ "attempt-remote-1"
 
       assert argv_line =~ "exec "
       assert argv_line =~ "fake-remote-codex app-server"

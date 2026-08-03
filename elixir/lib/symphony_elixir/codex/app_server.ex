@@ -11,6 +11,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   @turn_start_id 3
   @token_warning_steer_id "symphony-token-budget-warning"
   @issue_branch_env "SYMPHONY_ISSUE_BRANCH_NAME"
+  @attempt_session_env "SYMPHONY_SESSION_ID"
   @port_line_bytes 1_048_576
   @max_stream_log_bytes 1_000
   @max_answered_connector_elicitation_ids 256
@@ -43,10 +44,12 @@ defmodule SymphonyElixir.Codex.AppServer do
   @spec start_session(Path.t(), keyword()) :: {:ok, session()} | {:error, term()}
   def start_session(workspace, opts \\ []) do
     worker_host = Keyword.get(opts, :worker_host)
+    attempt_session_id = Keyword.get(opts, :attempt_session_id)
     dynamic_tool_binding = DynamicTool.bind()
 
     with {:ok, expanded_workspace} <- validate_workspace_cwd(workspace, worker_host),
-         {:ok, port} <- start_port(expanded_workspace, worker_host, dynamic_tool_binding) do
+         {:ok, port} <-
+           start_port(expanded_workspace, worker_host, dynamic_tool_binding, attempt_session_id) do
       metadata = port |> port_metadata(worker_host) |> Map.put(:codex_app_server_port, port)
 
       with {:ok, session_policies} <- session_policies(expanded_workspace, worker_host),
@@ -231,7 +234,7 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, nil, dynamic_tool_binding) do
+  defp start_port(workspace, nil, dynamic_tool_binding, attempt_session_id) do
     executable = System.find_executable("bash")
 
     if is_nil(executable) do
@@ -244,9 +247,12 @@ defmodule SymphonyElixir.Codex.AppServer do
             :binary,
             :exit_status,
             :stderr_to_stdout,
-            args: [~c"-lc", String.to_charlist(local_launch_command(dynamic_tool_binding))],
+            args: [
+              ~c"-lc",
+              String.to_charlist(local_launch_command(dynamic_tool_binding, attempt_session_id))
+            ],
             cd: String.to_charlist(workspace),
-            env: child_scrub_port_env(dynamic_tool_binding),
+            env: child_port_env(dynamic_tool_binding, attempt_session_id),
             line: @port_line_bytes
           ]
         )
@@ -255,35 +261,50 @@ defmodule SymphonyElixir.Codex.AppServer do
     end
   end
 
-  defp start_port(workspace, worker_host, dynamic_tool_binding) when is_binary(worker_host) do
-    remote_command = remote_launch_command(workspace, dynamic_tool_binding)
+  defp start_port(workspace, worker_host, dynamic_tool_binding, attempt_session_id)
+       when is_binary(worker_host) do
+    remote_command = remote_launch_command(workspace, dynamic_tool_binding, attempt_session_id)
     SSH.start_port(worker_host, remote_command, line: @port_line_bytes)
   end
 
-  defp local_launch_command(dynamic_tool_binding) do
+  defp local_launch_command(dynamic_tool_binding, attempt_session_id) do
     [
       child_scrub_unset_command(dynamic_tool_binding),
+      attempt_session_export_command(attempt_session_id),
       "exec #{Config.settings!().codex.command}"
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
   end
 
-  defp remote_launch_command(workspace, dynamic_tool_binding) when is_binary(workspace) do
+  defp remote_launch_command(workspace, dynamic_tool_binding, attempt_session_id)
+       when is_binary(workspace) do
     [
       "cd #{shell_escape(workspace)}",
       child_scrub_unset_command(dynamic_tool_binding),
+      attempt_session_export_command(attempt_session_id),
       "exec #{Config.settings!().codex.command}"
     ]
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" && ")
   end
 
-  defp child_scrub_port_env(dynamic_tool_binding) do
-    dynamic_tool_binding
-    |> child_scrub_environment_names()
-    |> Enum.map(fn name -> {String.to_charlist(name), false} end)
+  defp child_port_env(dynamic_tool_binding, attempt_session_id) do
+    scrubbed =
+      dynamic_tool_binding
+      |> child_scrub_environment_names()
+      |> Enum.map(fn name -> {String.to_charlist(name), false} end)
+
+    [{String.to_charlist(@attempt_session_env), port_environment_value(attempt_session_id)} | scrubbed]
   end
+
+  defp port_environment_value(value) when is_binary(value), do: String.to_charlist(value)
+  defp port_environment_value(_value), do: false
+
+  defp attempt_session_export_command(value) when is_binary(value),
+    do: "export #{@attempt_session_env}=#{shell_escape(value)}"
+
+  defp attempt_session_export_command(_value), do: "unset #{@attempt_session_env}"
 
   defp child_scrub_unset_command(dynamic_tool_binding) do
     case child_scrub_environment_names(dynamic_tool_binding) do

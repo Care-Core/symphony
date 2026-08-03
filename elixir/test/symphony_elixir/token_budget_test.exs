@@ -661,6 +661,8 @@ defmodule SymphonyElixir.TokenBudgetTest do
     assert_receive {:agent_runner_opts, ^issue, recipient, opts}, 1_000
     assert is_pid(recipient)
     assert opts[:attempt] == 1
+    assert opts[:attempt_session_id] == updated_state.running[issue.id].attempt_session_id
+    assert opts[:attempt_session_id] =~ ~r/^[A-Za-z0-9_-]{32}$/
     assert opts[:resume_phase] == "validation"
     assert opts[:max_additional_input_tokens] == 100
     assert is_function(opts[:continue_after_turn], 1)
