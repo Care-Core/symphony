@@ -146,6 +146,26 @@ defmodule SymphonyElixir.HoldStoreTest do
             }} = HoldStore.load(workspace_root)
   end
 
+  test "load normalizes a canonical string app-server PID and persist writes an integer" do
+    workspace_root = workspace_root("string-app-server-pid")
+    encoded_hold = Map.put(encoded_hold(), "codex_app_server_pid", "6822")
+
+    write_json_state!(workspace_root, %{"version" => 1, "holds" => [encoded_hold]})
+
+    assert {:ok,
+            %{
+              "issue-a" => %{codex_app_server_pid: 6822} = hold
+            } = holds} = HoldStore.load(workspace_root)
+
+    assert :ok = HoldStore.persist(workspace_root, holds)
+
+    assert %{
+             "holds" => [%{"codex_app_server_pid" => 6822}]
+           } = workspace_root |> state_path() |> File.read!() |> Jason.decode!()
+
+    assert {:ok, %{"issue-a" => ^hold}} = HoldStore.load(workspace_root)
+  end
+
   test "load rejects corrupt JSON" do
     workspace_root = workspace_root("corrupt-json")
     state_path = write_state!(workspace_root, "not-json")
@@ -229,6 +249,19 @@ defmodule SymphonyElixir.HoldStoreTest do
       {:input_token_tier_limit, "input_token_tier_limit", 0},
       {:input_token_tier_limit, "input_token_tier_limit", "1000"},
       {:cleanup_pending, "cleanup_pending", "false"},
+      {:codex_app_server_pid, "codex_app_server_pid", 0},
+      {:codex_app_server_pid, "codex_app_server_pid", -1},
+      {:codex_app_server_pid, "codex_app_server_pid", ""},
+      {:codex_app_server_pid, "codex_app_server_pid", "0"},
+      {:codex_app_server_pid, "codex_app_server_pid", "01"},
+      {:codex_app_server_pid, "codex_app_server_pid", "+1"},
+      {:codex_app_server_pid, "codex_app_server_pid", "-1"},
+      {:codex_app_server_pid, "codex_app_server_pid", " 1"},
+      {:codex_app_server_pid, "codex_app_server_pid", "1 "},
+      {:codex_app_server_pid, "codex_app_server_pid", "1\n"},
+      {:codex_app_server_pid, "codex_app_server_pid", "1.0"},
+      {:codex_app_server_pid, "codex_app_server_pid", "not-a-pid"},
+      {:codex_app_server_pid, "codex_app_server_pid", []},
       {:held_at, "held_at", ""},
       {:held_at, "held_at", 1}
     ]
