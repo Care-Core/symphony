@@ -37,8 +37,19 @@ defmodule SymphonyElixir.Application do
 
     case SymphonyElixir.ControlToken.child_spec_from_environment() do
       {:ok, control_token_child} ->
+        start_runtime_with_control_token(control_token_child)
+
+      {:error, reason} ->
+        {:error, {:invalid_control_token_fd, reason}}
+    end
+  end
+
+  defp start_runtime_with_control_token(control_token_child) do
+    case SymphonyElixir.IssueCapability.child_spec_from_environment() do
+      {:ok, issue_capability_child} ->
         children = [
           control_token_child,
+          issue_capability_child,
           {Phoenix.PubSub, name: SymphonyElixir.PubSub},
           SymphonyElixir.WorkflowStore,
           SymphonyElixir.AgentRuntimeSupervisor,
@@ -53,7 +64,7 @@ defmodule SymphonyElixir.Application do
         )
 
       {:error, reason} ->
-        {:error, {:invalid_control_token_fd, reason}}
+        {:error, {:invalid_issue_capability_fd, reason}}
     end
   end
 

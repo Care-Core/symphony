@@ -4,7 +4,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   import Phoenix.ConnTest
   import Phoenix.LiveViewTest
 
-  alias SymphonyElixir.ControlToken
+  alias SymphonyElixir.{ControlToken, IssueCapability}
   alias SymphonyElixir.Linear.Adapter
   alias SymphonyElixir.Tracker.Memory
 
@@ -117,11 +117,14 @@ defmodule SymphonyElixir.ExtensionsTest do
   setup do
     endpoint_config = Application.get_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, [])
     control_token = ControlToken.fetch()
+    issue_capability = IssueCapability.fetch()
     :ok = ControlToken.replace_for_test(nil)
+    :ok = IssueCapability.replace_for_test(nil, nil)
 
     on_exit(fn ->
       Application.put_env(:symphony_elixir, SymphonyElixirWeb.Endpoint, endpoint_config)
       restore_control_token(control_token)
+      restore_issue_capability(issue_capability)
     end)
 
     :ok
@@ -702,6 +705,46 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert json_response(get(remote_conn, "/api/v1/state"), 403)["error"]["code"] ==
              "loopback_only"
+
+    issue_body = %{
+      "owner_session" => "thread-http",
+      "restart_id" => test_restart_id(),
+      "capability_nonce" => test_nonce(),
+      "fingerprint" => %{}
+    }
+
+    unconfigured_issue_conn =
+      build_conn()
+      |> Plug.Conn.put_req_header("x-symphony-issue-capability", "unconfigured")
+
+    assert json_response(
+             post(unconfigured_issue_conn, "/api/v1/MT-HTTP/progress", issue_body),
+             503
+           )["error"]["code"] == "issue_capability_not_configured"
+
+    :ok = IssueCapability.replace_for_test(test_capability_key(), test_restart_id())
+
+    invalid_issue_conn =
+      build_conn()
+      |> Plug.Conn.put_req_header("x-symphony-issue-capability", "invalid")
+
+    assert json_response(
+             post(invalid_issue_conn, "/api/v1/MT-HTTP/progress", issue_body),
+             401
+           )["error"]["code"] == "invalid_issue_capability"
+
+    issue_remote_conn =
+      build_conn()
+      |> Plug.Conn.put_req_header(
+        "x-symphony-issue-capability",
+        test_issue_capability("MT-HTTP", "thread-http")
+      )
+      |> then(&%{&1 | remote_ip: {10, 0, 0, 1}})
+
+    assert json_response(
+             post(issue_remote_conn, "/api/v1/MT-HTTP/progress", issue_body),
+             403
+           )["error"]["code"] == "loopback_only"
   end
 
   test "phoenix stop api returns a durable held receipt" do
@@ -802,6 +845,11 @@ defmodule SymphonyElixir.ExtensionsTest do
   test "phoenix control api forwards progress and review but denies deferred waits" do
     orchestrator_name = Module.concat(__MODULE__, :ProgressControlApiOrchestrator)
 
+    progress_hash = String.duplicate("a", 64)
+    review_hash = String.duplicate("b", 64)
+    authorization_hash = String.duplicate("c", 64)
+    head = "0123456789abcdef0123456789abcdef01234567"
+
     {:ok, _pid} =
       StaticOrchestrator.start_link(
         name: orchestrator_name,
@@ -811,25 +859,32 @@ defmodule SymphonyElixir.ExtensionsTest do
           {:ok,
            %{
              changed: true,
-             progress_fingerprint: "progress-hash",
-             review_fingerprint: "review-hash"
+             progress_fingerprint: progress_hash,
+             review_fingerprint: review_hash
            }},
         review:
           {:ok,
            %{
              authorized: true,
+             authorization: authorization_hash,
              kind: "full",
              review_round_count: 1,
-             review_fingerprint: "review-hash"
+             security_review_count: 0,
+             review_fingerprint: review_hash,
+             requested_head: head
            }}
       )
 
     start_test_endpoint(orchestrator: orchestrator_name, snapshot_timeout_ms: 50)
     :ok = ControlToken.replace_for_test("test-control-token")
+    :ok = IssueCapability.replace_for_test(test_capability_key(), test_restart_id())
 
-    control_conn = fn ->
+    issue_conn = fn ->
       build_conn()
-      |> Plug.Conn.put_req_header("x-symphony-control-token", "test-control-token")
+      |> Plug.Conn.put_req_header(
+        "x-symphony-issue-capability",
+        test_issue_capability("MT-CONTROL", "thread-http")
+      )
     end
 
     fingerprint = %{
@@ -838,35 +893,47 @@ defmodule SymphonyElixir.ExtensionsTest do
     }
 
     progress_payload =
-      control_conn.()
+      issue_conn.()
       |> post("/api/v1/MT-CONTROL/progress", %{
+        "capability_nonce" => test_nonce(),
         "fingerprint" => fingerprint,
+        "owner_session" => "thread-http",
         "progress_kind" => "workpad_checkpoint",
         "progress_receipt" => "linear-comment-1",
+        "restart_id" => test_restart_id(),
         "ignored" => "not-forwarded"
       })
       |> json_response(200)
 
-    assert progress_payload == %{
-             "changed" => true,
-             "progress_fingerprint" => "progress-hash",
-             "review_fingerprint" => "review-hash"
-           }
+    assert progress_payload["changed"] == true
+    assert progress_payload["progress_fingerprint"] == progress_hash
+    assert progress_payload["review_fingerprint"] == review_hash
+    assert progress_payload["issue_capability_nonce"] == test_nonce()
+
+    assert IssueCapability.verify_response_for_test(
+             :progress,
+             test_nonce(),
+             "MT-CONTROL",
+             "thread-http",
+             progress_payload,
+             progress_payload["issue_capability_signature"]
+           )
 
     assert_received {:record_progress_called, "MT-CONTROL",
                      %{
                        "fingerprint" => ^fingerprint,
+                       "owner_session" => "thread-http",
                        "progress_kind" => "workpad_checkpoint",
                        "progress_receipt" => "linear-comment-1"
                      }}
 
-    head = "0123456789abcdef0123456789abcdef01234567"
-
     review_payload =
-      control_conn.()
+      issue_conn.()
       |> post("/api/v1/MT-CONTROL/review", %{
+        "capability_nonce" => test_nonce(),
         "kind" => "full",
-        "review_fingerprint" => "review-hash",
+        "owner_session" => "thread-http",
+        "restart_id" => test_restart_id(),
         "requested_head" => head,
         "observed_local_head" => head,
         "observed_remote_head" => head
@@ -876,17 +943,26 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert review_payload["authorized"] == true
     assert review_payload["review_round_count"] == 1
 
+    assert IssueCapability.verify_response_for_test(
+             :review,
+             test_nonce(),
+             "MT-CONTROL",
+             "thread-http",
+             review_payload,
+             review_payload["issue_capability_signature"]
+           )
+
     assert_received {:authorize_review_called, "MT-CONTROL",
                      %{
                        "kind" => "full",
-                       "review_fingerprint" => "review-hash",
+                       "owner_session" => "thread-http",
                        "requested_head" => ^head,
                        "observed_local_head" => ^head,
                        "observed_remote_head" => ^head
                      }}
 
     wait_error =
-      control_conn.()
+      control_conn()
       |> post("/api/v1/MT-CONTROL/wait", %{
         "expected_head" => head,
         "receipt_path" => "/tmp/MT-CONTROL/output/checks.jsonl",
@@ -1320,6 +1396,34 @@ defmodule SymphonyElixir.ExtensionsTest do
 
   defp restore_control_token({:error, :control_token_not_configured}),
     do: ControlToken.replace_for_test(nil)
+
+  defp restore_issue_capability({:ok, %{key: key, restart_id: restart_id}}),
+    do: IssueCapability.replace_for_test(key, restart_id)
+
+  defp restore_issue_capability({:error, :issue_capability_not_configured}),
+    do: IssueCapability.replace_for_test(nil, nil)
+
+  defp test_capability_key, do: :binary.copy(<<9>>, 32)
+  defp test_restart_id, do: "123e4567-e89b-42d3-a456-426614174000"
+  defp test_nonce, do: "123e4567-e89b-42d3-a456-426614174001"
+
+  defp test_issue_capability(issue, session) do
+    encoded_payload =
+      %{
+        "version" => 3,
+        "issue_identifier" => issue,
+        "owner_session" => session,
+        "restart_id" => test_restart_id()
+      }
+      |> Jason.encode!()
+      |> Base.url_encode64(padding: false)
+
+    signature =
+      :crypto.mac(:hmac, :sha256, test_capability_key(), encoded_payload)
+      |> Base.url_encode64(padding: false)
+
+    "#{encoded_payload}.#{signature}"
+  end
 
   defp static_snapshot do
     %{
