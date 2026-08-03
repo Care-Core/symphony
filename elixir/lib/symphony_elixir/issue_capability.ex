@@ -15,7 +15,6 @@ defmodule SymphonyElixir.IssueCapability do
   @fd_env "SYMPHONY_ISSUE_CAPABILITY_KEY_FD"
   @restart_env "SYMPHONY_RESTART_ID"
   @key_bytes 32
-  @max_capability_bytes 1_024
   @persistent_key {__MODULE__, :configuration}
   @restart_pattern ~r/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
   @nonce_pattern @restart_pattern
@@ -113,26 +112,34 @@ defmodule SymphonyElixir.IssueCapability do
   @spec fetch(GenServer.server()) :: fetch_result()
   def fetch(server \\ __MODULE__), do: GenServer.call(server, :fetch)
 
-  @doc "Verifies a capability for one exact issue, owner session, and active restart."
-  @spec verify(String.t(), String.t(), String.t(), String.t(), String.t()) ::
-          :ok | {:error, atom()}
-  def verify(capability, issue_identifier, owner_session, restart_id, nonce) do
-    with {:ok, %{key: key, restart_id: active_restart_id}} <- fetch(),
-         :ok <- require_identity(issue_identifier, owner_session, restart_id),
-         :ok <- require_nonce(nonce),
-         true <- restart_id == active_restart_id,
-         true <- is_binary(capability),
-         [encoded_payload, provided_signature] <- String.split(capability, ".", parts: 3),
-         true <- byte_size(capability) <= @max_capability_bytes,
-         true <- secure_equal?(provided_signature, sign(key, encoded_payload)),
-         {:ok, payload_json} <- Base.url_decode64(encoded_payload, padding: false),
-         {:ok, payload} <- Jason.decode(payload_json),
-         true <- valid_payload?(payload, issue_identifier, owner_session, restart_id) do
-      :ok
-    else
-      {:error, :issue_capability_not_configured} = error -> error
-      _ -> {:error, :invalid_issue_capability}
-    end
+  @doc "Authenticates one nonce-bound issue request before the orchestrator consumes it atomically."
+  @spec verify_request(
+          :progress | :review,
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          String.t(),
+          map()
+        ) :: :ok | {:error, atom()}
+  def verify_request(
+        kind,
+        signature,
+        issue_identifier,
+        owner_session,
+        restart_id,
+        nonce,
+        payload
+      ) do
+    verify_request_signature(
+      kind,
+      signature,
+      issue_identifier,
+      owner_session,
+      restart_id,
+      nonce,
+      payload
+    )
   end
 
   @doc "Signs a nonce-bound response so the owner broker can reject a listener impersonator."
@@ -154,8 +161,11 @@ defmodule SymphonyElixir.IssueCapability do
   @impl true
   def init(opts) do
     case Keyword.get(opts, :source, :prepared) do
-      :prepared -> {:ok, :ready}
-      _ -> {:stop, :invalid_issue_capability_source}
+      :prepared ->
+        {:ok, %{}}
+
+      _ ->
+        {:stop, :invalid_issue_capability_source}
     end
   end
 
@@ -172,8 +182,14 @@ defmodule SymphonyElixir.IssueCapability do
 
   defp load_environment(nil, nil, _descriptor_reader), do: {:ok, stored_configuration()}
 
-  defp load_environment(descriptor, restart_id, descriptor_reader)
-       when is_binary(descriptor) and is_binary(restart_id) do
+  defp load_environment(nil, restart_id, _descriptor_reader) when is_binary(restart_id) do
+    case stored_configuration() do
+      %{restart_id: ^restart_id} = configuration -> {:ok, configuration}
+      _ -> {:error, :incomplete_issue_capability_configuration}
+    end
+  end
+
+  defp load_environment(descriptor, restart_id, descriptor_reader) when is_binary(descriptor) do
     with {:ok, key} <- descriptor_reader.(descriptor, @key_bytes) do
       validate_configuration(key, restart_id)
     end
@@ -199,6 +215,13 @@ defmodule SymphonyElixir.IssueCapability do
     else
       {:error, :invalid_issue_capability_restart_id}
     end
+  end
+
+  defp validate_configuration(key, restart_id)
+       when is_binary(key) and byte_size(key) == @key_bytes do
+    if is_binary(restart_id),
+      do: {:error, :invalid_issue_capability_restart_id},
+      else: {:error, :incomplete_issue_capability_configuration}
   end
 
   defp validate_configuration(key, _restart_id) when is_binary(key),
@@ -236,14 +259,48 @@ defmodule SymphonyElixir.IssueCapability do
 
   defp require_nonce(_nonce), do: {:error, :invalid_nonce}
 
-  defp valid_payload?(payload, issue_identifier, owner_session, restart_id) do
-    payload == %{
-      "version" => 3,
-      "issue_identifier" => issue_identifier,
-      "owner_session" => owner_session,
-      "restart_id" => restart_id
-    }
+  defp verify_request_signature(
+         kind,
+         signature,
+         issue_identifier,
+         owner_session,
+         restart_id,
+         nonce,
+         payload
+       ) do
+    with {:ok, %{key: key, restart_id: active_restart_id}} <- stored_configuration_result(),
+         true <- restart_id == active_restart_id,
+         {:ok, message} <-
+           request_message(kind, nonce, issue_identifier, owner_session, restart_id, payload),
+         true <- secure_equal?(signature, sign(key, message)) do
+      :ok
+    else
+      {:error, :issue_capability_not_configured} = error -> error
+      _ -> {:error, :invalid_issue_capability}
+    end
   end
+
+  defp request_message(kind, nonce, issue_identifier, owner_session, restart_id, payload)
+       when kind in [:progress, :review] and is_map(payload) do
+    with :ok <- require_identity(issue_identifier, owner_session, restart_id),
+         :ok <- require_nonce(nonce) do
+      Jason.encode([
+        1,
+        "request",
+        Atom.to_string(kind),
+        nonce,
+        issue_identifier,
+        owner_session,
+        restart_id,
+        canonical_term(payload)
+      ])
+    else
+      _ -> {:error, :invalid_issue_capability_request}
+    end
+  end
+
+  defp request_message(_kind, _nonce, _issue_identifier, _owner_session, _restart_id, _payload),
+    do: {:error, :invalid_issue_capability_request}
 
   defp response_message(kind, nonce, issue_identifier, owner_session, restart_id, payload)
        when kind in [:progress, :review] and is_map(payload) do
@@ -320,6 +377,15 @@ defmodule SymphonyElixir.IssueCapability do
   end
 
   defp non_negative_integer?(value), do: is_integer(value) and value >= 0
+
+  defp canonical_term(value) when is_map(value) do
+    value
+    |> Enum.map(fn {key, nested} -> [to_string(key), canonical_term(nested)] end)
+    |> Enum.sort()
+  end
+
+  defp canonical_term(value) when is_list(value), do: Enum.map(value, &canonical_term/1)
+  defp canonical_term(value), do: value
 
   defp value(map, key), do: Map.get(map, key, Map.get(map, Atom.to_string(key)))
   defp hash?(value), do: is_binary(value) and Regex.match?(~r/^[0-9a-f]{64}$/, value)

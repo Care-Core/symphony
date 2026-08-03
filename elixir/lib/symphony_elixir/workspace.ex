@@ -8,6 +8,7 @@ defmodule SymphonyElixir.Workspace do
 
   @remote_workspace_marker "__SYMPHONY_WORKSPACE__"
   @issue_branch_env "SYMPHONY_ISSUE_BRANCH_NAME"
+  @attempt_session_env "SYMPHONY_SESSION_ID"
 
   @type worker_host :: String.t() | nil
 
@@ -229,9 +230,10 @@ defmodule SymphonyElixir.Workspace do
 
   def remove_issue_workspaces(_identifier, _worker_host), do: :ok
 
-  @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host()) ::
+  @spec run_before_run_hook(Path.t(), map() | String.t() | nil, worker_host(), keyword()) ::
           :ok | {:error, term()}
-  def run_before_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
+  def run_before_run_hook(workspace, issue_or_identifier, worker_host \\ nil, opts \\ [])
+      when is_binary(workspace) and is_list(opts) do
     issue_context = issue_context(issue_or_identifier)
     hooks = Config.settings!().hooks
 
@@ -240,12 +242,13 @@ defmodule SymphonyElixir.Workspace do
         :ok
 
       command ->
-        run_hook(command, workspace, issue_context, "before_run", worker_host)
+        run_hook(command, workspace, issue_context, "before_run", worker_host, opts)
     end
   end
 
-  @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host()) :: :ok
-  def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil) when is_binary(workspace) do
+  @spec run_after_run_hook(Path.t(), map() | String.t() | nil, worker_host(), keyword()) :: :ok
+  def run_after_run_hook(workspace, issue_or_identifier, worker_host \\ nil, opts \\ [])
+      when is_binary(workspace) and is_list(opts) do
     issue_context = issue_context(issue_or_identifier)
     hooks = Config.settings!().hooks
 
@@ -254,7 +257,7 @@ defmodule SymphonyElixir.Workspace do
         :ok
 
       command ->
-        run_hook(command, workspace, issue_context, "after_run", worker_host)
+        run_hook(command, workspace, issue_context, "after_run", worker_host, opts)
         |> ignore_hook_failure()
     end
   end
@@ -403,18 +406,20 @@ defmodule SymphonyElixir.Workspace do
   defp ignore_hook_failure(:ok), do: :ok
   defp ignore_hook_failure({:error, _reason}), do: :ok
 
-  defp run_hook(command, workspace, issue_context, hook_name, nil) do
+  defp run_hook(command, workspace, issue_context, hook_name, worker_host, opts \\ [])
+
+  defp run_hook(command, workspace, issue_context, hook_name, nil, opts) do
     timeout_ms = Config.settings!().hooks.timeout_ms
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=local")
 
     task =
       Task.async(fn ->
-        hook_command = hook_environment_command(issue_context) <> "\n" <> command
+        hook_command = hook_environment_command(issue_context, opts) <> "\n" <> command
 
         System.cmd("sh", ["-lc", hook_command],
           cd: workspace,
-          env: hook_environment(issue_context),
+          env: hook_environment(issue_context, opts),
           stderr_to_stdout: true
         )
       end)
@@ -432,14 +437,15 @@ defmodule SymphonyElixir.Workspace do
     end
   end
 
-  defp run_hook(command, workspace, issue_context, hook_name, worker_host) when is_binary(worker_host) do
+  defp run_hook(command, workspace, issue_context, hook_name, worker_host, opts)
+       when is_binary(worker_host) do
     timeout_ms = Config.settings!().hooks.timeout_ms
 
     Logger.info("Running workspace hook hook=#{hook_name} #{issue_log_context(issue_context)} workspace=#{workspace} worker_host=#{worker_host}")
 
     script =
       [
-        hook_environment_command(issue_context),
+        hook_environment_command(issue_context, opts),
         "cd #{shell_escape(workspace)} && #{command}"
       ]
       |> Enum.join("\n")
@@ -587,12 +593,28 @@ defmodule SymphonyElixir.Workspace do
     "'" <> String.replace(value, "'", "'\"'\"'") <> "'"
   end
 
-  defp hook_environment(issue_context) do
-    [{@issue_branch_env, hook_branch_name(issue_context)}]
+  defp hook_environment(issue_context, opts) do
+    [
+      {@issue_branch_env, hook_branch_name(issue_context)},
+      {@attempt_session_env, attempt_session_id(opts)}
+    ]
   end
 
-  defp hook_environment_command(issue_context) do
-    "export #{@issue_branch_env}=#{shell_escape(hook_branch_name(issue_context))}"
+  defp hook_environment_command(issue_context, opts) do
+    [
+      "export #{@issue_branch_env}=#{shell_escape(hook_branch_name(issue_context))}",
+      "export #{@attempt_session_env}=#{shell_escape(attempt_session_id(opts))}"
+    ]
+    |> Enum.join("\n")
+  end
+
+  defp hook_environment_command(issue_context), do: hook_environment_command(issue_context, [])
+
+  defp attempt_session_id(opts) do
+    case Keyword.get(opts, :attempt_session_id) do
+      value when is_binary(value) -> value
+      _ -> ""
+    end
   end
 
   defp hook_branch_name(%{branch_name: branch_name}) when is_binary(branch_name), do: branch_name

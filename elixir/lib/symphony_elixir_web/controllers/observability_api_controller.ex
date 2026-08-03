@@ -9,7 +9,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   alias SymphonyElixir.{ControlToken, IssueCapability}
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
-  @issue_capability_header "x-symphony-issue-capability"
+  @issue_signature_header "x-symphony-issue-signature"
 
   @spec state(Conn.t(), map()) :: Conn.t()
   def state(conn, _params) do
@@ -127,9 +127,16 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     attributes =
       Map.take(params, ["fingerprint", "owner_session", "progress_kind", "progress_receipt"])
 
-    if issue_capability_supplied?(conn) do
-      issue_capability_transition(conn, issue_identifier, params, :progress, fn ->
-        Presenter.progress_payload(issue_identifier, attributes, orchestrator())
+    if issue_signature_supplied?(conn) do
+      issue_capability_transition(conn, issue_identifier, params, :progress, fn nonce ->
+        Presenter.progress_payload(
+          issue_identifier,
+          Map.merge(attributes, %{
+            issue_request_authorized: true,
+            issue_capability_nonce: nonce
+          }),
+          orchestrator()
+        )
       end)
     else
       controlled_transition(conn, fn ->
@@ -155,9 +162,16 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
         "human_override"
       ])
 
-    if issue_capability_supplied?(conn) do
-      issue_capability_transition(conn, issue_identifier, params, :review, fn ->
-        Presenter.review_payload(issue_identifier, attributes, orchestrator())
+    if issue_signature_supplied?(conn) do
+      issue_capability_transition(conn, issue_identifier, params, :review, fn nonce ->
+        Presenter.review_payload(
+          issue_identifier,
+          Map.merge(attributes, %{
+            issue_request_authorized: true,
+            issue_capability_nonce: nonce
+          }),
+          orchestrator()
+        )
       end)
     else
       controlled_transition(conn, fn ->
@@ -232,18 +246,21 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     owner_session = Map.get(params, "owner_session")
     restart_id = Map.get(params, "restart_id")
     nonce = Map.get(params, "capability_nonce")
+    signed_payload = Map.drop(params, ["issue_identifier"])
 
     with :ok <- require_loopback(conn),
-         {:ok, capability} <- issue_capability_header(conn),
+         {:ok, signature} <- issue_signature_header(conn),
          :ok <-
-           IssueCapability.verify(
-             capability,
+           IssueCapability.verify_request(
+             kind,
+             signature,
              issue_identifier,
              owner_session,
              restart_id,
-             nonce
+             nonce,
+             signed_payload
            ),
-         {:ok, payload} <- transition.(),
+         {:ok, payload} <- transition.(nonce),
          {:ok, signature} <-
            IssueCapability.sign_response(kind, nonce, issue_identifier, owner_session, payload) do
       json(
@@ -269,11 +286,20 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
       {:error, :issue_capability_not_configured} ->
         error_response(conn, 503, "issue_capability_not_configured", "Issue capability authorization is not configured")
 
+      {:error, :replayed_issue_request} ->
+        error_response(conn, 409, "replayed_issue_request", "Issue request nonce has already been consumed")
+
+      {:error, :issue_nonce_capacity_exceeded} ->
+        error_response(conn, 503, "issue_nonce_capacity_exceeded", "Issue request nonce capacity is unavailable")
+
       {:error, :invalid_issue_capability} ->
         error_response(conn, 401, "invalid_issue_capability", "Invalid issue capability")
 
       {:error, :invalid_issue_capability_response} ->
         error_response(conn, 503, "invalid_issue_capability_response", "Issue capability response could not be authenticated")
+
+      {:error, :unavailable} ->
+        error_response(conn, 503, "unavailable", "Issue control is temporarily unavailable")
 
       {:error, reason} ->
         error_response(conn, 422, Atom.to_string(reason), "Progress transition rejected: #{reason}")
@@ -310,15 +336,15 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
-  defp issue_capability_header(conn) do
-    case get_req_header(conn, @issue_capability_header) do
-      [capability] when is_binary(capability) and capability != "" -> {:ok, capability}
+  defp issue_signature_header(conn) do
+    case get_req_header(conn, @issue_signature_header) do
+      [signature] when is_binary(signature) and signature != "" -> {:ok, signature}
       _ -> {:error, :invalid_issue_capability}
     end
   end
 
-  defp issue_capability_supplied?(conn),
-    do: get_req_header(conn, @issue_capability_header) != []
+  defp issue_signature_supplied?(conn),
+    do: get_req_header(conn, @issue_signature_header) != []
 
   defp control_token do
     ControlToken.fetch()
