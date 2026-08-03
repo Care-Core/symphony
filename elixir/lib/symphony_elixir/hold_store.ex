@@ -306,7 +306,7 @@ defmodule SymphonyElixir.HoldStore do
          } = encoded_hold
        ) do
     cleanup_pending = Map.get(encoded_hold, "cleanup_pending", false)
-    codex_app_server_pid = Map.get(encoded_hold, "codex_app_server_pid")
+    encoded_codex_app_server_pid = Map.get(encoded_hold, "codex_app_server_pid")
     warning_threshold = Map.get(encoded_hold, "warning_threshold")
     warning_observed_at = Map.get(encoded_hold, "warning_observed_at")
     checkpoint_grace = Map.get(encoded_hold, "checkpoint_grace")
@@ -332,7 +332,8 @@ defmodule SymphonyElixir.HoldStore do
          :ok <- require_optional_string(worker_host, :worker_host),
          :ok <- require_optional_string(workspace_path, :workspace_path),
          :ok <- require_boolean(cleanup_pending, :cleanup_pending),
-         :ok <- require_optional_positive_integer(codex_app_server_pid, :codex_app_server_pid),
+         {:ok, codex_app_server_pid} <-
+           normalize_optional_pid(encoded_codex_app_server_pid),
          :ok <- require_optional_positive_integer(warning_threshold, :warning_threshold),
          :ok <- require_optional_non_negative_integer(warning_observed_at, :warning_observed_at),
          :ok <- require_optional_positive_integer(checkpoint_grace, :checkpoint_grace),
@@ -539,6 +540,24 @@ defmodule SymphonyElixir.HoldStore do
   defp require_optional_positive_integer(nil, _field), do: :ok
   defp require_optional_positive_integer(value, _field) when is_integer(value) and value > 0, do: :ok
   defp require_optional_positive_integer(_value, field), do: {:error, {:invalid_field, field}}
+
+  defp normalize_optional_pid(nil), do: {:ok, nil}
+  defp normalize_optional_pid(value) when is_integer(value) and value > 0, do: {:ok, value}
+
+  defp normalize_optional_pid(value) when is_binary(value) do
+    case Integer.parse(value) do
+      {pid, ""} when pid > 0 ->
+        if Integer.to_string(pid) == value,
+          do: {:ok, pid},
+          else: {:error, {:invalid_field, :codex_app_server_pid}}
+
+      _other ->
+        {:error, {:invalid_field, :codex_app_server_pid}}
+    end
+  end
+
+  defp normalize_optional_pid(_value),
+    do: {:error, {:invalid_field, :codex_app_server_pid}}
 
   defp require_non_negative_integer(value, _field) when is_integer(value) and value >= 0, do: :ok
   defp require_non_negative_integer(_value, field), do: {:error, {:invalid_field, field}}
