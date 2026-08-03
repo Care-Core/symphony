@@ -2380,7 +2380,8 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp record_progress_state(state, issue_identifier, attributes) do
-    with issue_id when is_binary(issue_id) <- find_known_issue_id(state, issue_identifier),
+    with {:ok, issue_id} <-
+           require_active_owner_session(state, issue_identifier, attributes),
          {:ok, fingerprint} <-
            normalize_progress_fingerprint(option_value(attributes, :fingerprint)),
          {:ok, progress_kind} <-
@@ -2400,7 +2401,6 @@ defmodule SymphonyElixir.Orchestrator do
         progress_receipt
       )
     else
-      nil -> {:error, :issue_not_found, state}
       {:error, reason} -> {:error, reason, state}
     end
   end
@@ -2482,11 +2482,12 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp authorize_review_state(state, issue_identifier, attributes) do
-    with issue_id when is_binary(issue_id) <- find_known_issue_id(state, issue_identifier),
+    with {:ok, issue_id} <-
+           require_active_owner_session(state, issue_identifier, attributes),
          %{} = progress <- Map.get(state.progress, issue_id),
          {:ok, kind} <- normalize_review_kind(option_value(attributes, :kind)),
          requested_fingerprint when is_binary(requested_fingerprint) <-
-           option_value(attributes, :review_fingerprint),
+           requested_review_fingerprint(attributes, progress),
          true <- requested_fingerprint == Map.get(progress, "review_fingerprint_hash"),
          requested_head when is_binary(requested_head) <-
            option_value(attributes, :requested_head),
@@ -2530,6 +2531,34 @@ defmodule SymphonyElixir.Orchestrator do
       {:error, reason} -> {:error, reason, state}
       _ -> {:error, :stale_review_head, state}
     end
+  end
+
+  defp require_active_owner_session(state, issue_identifier, attributes) do
+    case find_known_issue_id(state, issue_identifier) do
+      nil ->
+        {:error, :issue_not_found}
+
+      issue_id ->
+        if option_value(attributes, :owner_session_authorized) == true,
+          do: {:ok, issue_id},
+          else: require_running_owner_session(state, issue_id, attributes)
+    end
+  end
+
+  defp require_running_owner_session(state, issue_id, attributes) do
+    case Map.get(state.running, issue_id) do
+      %{session_id: current_session} when is_binary(current_session) ->
+        if option_value(attributes, :owner_session) == current_session,
+          do: {:ok, issue_id},
+          else: {:error, :stale_issue_session}
+
+      _ ->
+        {:error, :issue_not_running}
+    end
+  end
+
+  defp requested_review_fingerprint(attributes, progress) do
+    option_value(attributes, :review_fingerprint) || Map.get(progress, "review_fingerprint_hash")
   end
 
   defp normalize_progress_fingerprint(fingerprint) when is_map(fingerprint) do

@@ -288,7 +288,7 @@ owner-side store. A configured invalid, closed, non-pipe, malformed, or oversize
 startup closed. When the descriptor variable is absent, control remains unconfigured. The legacy
 `SYMPHONY_CONTROL_TOKEN` environment secret is not accepted.
 
-Mutating routes accept only loopback requests carrying the configured value in
+Owner control routes accept only loopback requests carrying the configured value in
 `x-symphony-control-token`:
 
 - `POST /api/v1/<issue_identifier>/stop`
@@ -298,6 +298,30 @@ Mutating routes accept only loopback requests carrying the configured value in
 - `POST /api/v1/<issue_identifier>/review` with `kind`, `review_fingerprint`, `requested_head`,
   `observed_local_head`, and `observed_remote_head`; an additional review round also requires the
   recorded `human_override`
+
+An owner launcher can additionally enable issue-scoped progress and review without sharing that
+global token. It writes the existing 32-byte issue-capability HMAC key to an inherited anonymous
+pipe, sets `SYMPHONY_ISSUE_CAPABILITY_KEY_FD` to the numeric read descriptor, and supplies the
+public active restart UUID as `SYMPHONY_RESTART_ID`. Startup consumes and closes the private
+descriptor before any child starts. A partial, invalid, non-pipe, or wrongly sized configuration
+fails startup closed; absence of both capability inputs leaves this optional path disabled.
+
+An issue-scoped progress or review request carries `x-symphony-issue-capability` plus
+`owner_session`, `restart_id`, and a fresh UUID `capability_nonce`. The version-3 capability must
+authenticate separate exact `issue_identifier` and `owner_session` fields plus the active restart. The orchestrator
+then atomically requires that session to remain the issue's currently running session. Review may
+omit `review_fingerprint`; Symphony uses the currently registered fingerprint internally.
+
+Successful issue-scoped responses echo `issue_capability_nonce` and include
+`issue_capability_signature`. The signature is base64url HMAC-SHA256 with the same key over the
+JSON encoding of one of these fixed arrays:
+
+- progress: `[1,"progress",nonce,issue,session,restart,changed,progress_hash,review_hash]`
+- review: `[1,"review",nonce,issue,session,restart,authorized,authorization,kind,review_round_count,security_review_count,review_hash,requested_head]`
+
+This lets the owner broker reject a process that races to impersonate the loopback HTTP listener.
+Supplying an issue-capability header always selects the scoped path and never falls back to global
+control-token authorization.
 
 Progress and review state is durable and fail-closed. Review authorization reuses an accepted full
 review only for the same exact fingerprint/head and otherwise allows the bounded full-then-delta

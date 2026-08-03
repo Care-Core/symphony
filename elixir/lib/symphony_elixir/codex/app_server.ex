@@ -4,7 +4,7 @@ defmodule SymphonyElixir.Codex.AppServer do
   """
 
   require Logger
-  alias SymphonyElixir.{Codex.DynamicTool, Config, ControlToken, PathSafety, SSH}
+  alias SymphonyElixir.{Codex.DynamicTool, Config, ControlToken, IssueCapability, PathSafety, SSH}
 
   @initialize_id 1
   @thread_start_id 2
@@ -294,6 +294,7 @@ defmodule SymphonyElixir.Codex.AppServer do
 
   defp child_scrub_environment_names(dynamic_tool_binding) do
     (ControlToken.secret_environment_names() ++
+       IssueCapability.secret_environment_names() ++
        [@issue_branch_env | dynamic_tool_binding.secret_environment_names])
     |> valid_environment_names()
     |> Enum.uniq()

@@ -45,6 +45,43 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
     assert {:error, :issue_not_found} = authorize_review(pid, issue, review_hash, "full")
   end
 
+  test "a retired owner session cannot mutate its successor's progress or review state" do
+    {pid, issue, worker_pid, _workspace_root, _workspace} =
+      start_progress_orchestrator("stale-owner-session")
+
+    assert {:ok, %{review_fingerprint: review_hash}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    :sys.replace_state(pid, fn state ->
+      running_entry = Map.fetch!(state.running, issue.id)
+      updated_entry = Map.put(running_entry, :session_id, "thread-successor")
+      %{state | running: Map.put(state.running, issue.id, updated_entry)}
+    end)
+
+    assert {:error, :stale_issue_session} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "stale-checkpoint"),
+               pid
+             )
+
+    assert {:error, :stale_issue_session} =
+             authorize_review(pid, issue, review_hash, "full")
+
+    assert {:ok, %{changed: true}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "successor-checkpoint", owner_session: "thread-successor"),
+               pid
+             )
+
+    Process.exit(worker_pid, :shutdown)
+  end
+
   test "checksum prefix formatting preserves a completed full review for delta authorization" do
     {pid, issue, worker_pid, workspace_root, _workspace} =
       start_progress_orchestrator("review-checksum-prefix")
@@ -599,6 +636,7 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
   defp progress_attributes(fingerprint, receipt, overrides \\ []) do
     %{
       fingerprint: fingerprint,
+      owner_session: Keyword.get(overrides, :owner_session, "thread-turn"),
       progress_kind: Keyword.get(overrides, :progress_kind, "workpad_checkpoint"),
       progress_receipt: receipt
     }
@@ -611,6 +649,7 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
       issue.identifier,
       %{
         kind: kind,
+        owner_session: Keyword.get(overrides, :owner_session, "thread-turn"),
         review_fingerprint: review_hash,
         requested_head: requested_head,
         observed_local_head: Keyword.get(overrides, :observed_local_head, requested_head),
