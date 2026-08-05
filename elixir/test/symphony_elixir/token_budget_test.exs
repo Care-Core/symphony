@@ -217,28 +217,167 @@ defmodule SymphonyElixir.TokenBudgetTest do
     refute Process.alive?(worker_pid)
   end
 
-  test "delivered warning is held when checkpoint grace is exhausted" do
-    {pid, server, issue, worker_pid, _workspace_root} =
+  test "delivered warning arms one durable hold while the checkpoint turn finishes" do
+    {pid, server, issue, worker_pid, workspace_root} =
       start_budget_orchestrator("checkpoint-grace", 100)
 
-    put_running_entry(pid, issue, worker_pid,
-      input_token_limit: 100,
-      input_token_warning_ratio: 0.70,
-      input_token_checkpoint_grace: 10,
-      input_token_warning_sent: true,
-      input_token_warning_status: "delivered",
-      input_token_warning_threshold: 70,
-      input_token_warning_observed_at: 70
-    )
+    put_running_entry(pid, issue, worker_pid, checkpoint_grace_options())
 
     send_token_update(pid, issue.id, 80)
     snapshot = Orchestrator.snapshot(server, 1_000)
 
-    assert snapshot.running == []
+    assert [%{identifier: identifier}] = snapshot.running
+    assert identifier == issue.identifier
     assert snapshot.retrying == []
 
     assert [%{reason: "input_token_checkpoint_grace", limit: 100, observed_tokens: 80}] =
              snapshot.held
+
+    assert Process.alive?(worker_pid)
+
+    issue_id = issue.id
+    assert {:ok, %{^issue_id => armed_hold}} = SymphonyElixir.HoldStore.load(workspace_root)
+
+    assert {:error, :issue_running} =
+             Orchestrator.resume_issue(
+               issue.identifier,
+               %{phase: "implementation", max_additional_input_tokens: 50},
+               server
+             )
+
+    assert :sys.get_state(pid).retry_attempts == %{}
+    assert {:ok, %{^issue_id => ^armed_hold}} = SymphonyElixir.HoldStore.load(workspace_root)
+    assert Process.alive?(worker_pid)
+
+    send_token_update(pid, issue.id, 81)
+
+    assert {:ok, %{^issue_id => repeated_hold}} = SymphonyElixir.HoldStore.load(workspace_root)
+    assert repeated_hold == armed_hold
+    assert Process.alive?(worker_pid)
+
+    assert :stop =
+             AgentRunner.continue_after_turn_for_test(issue,
+               continue_after_turn: fn ^issue_id ->
+                 GenServer.call(pid, {:continue_after_turn, issue_id})
+               end
+             )
+
+    running_ref = :sys.get_state(pid).running[issue.id].ref
+    send(pid, {:DOWN, running_ref, :process, worker_pid, :normal})
+
+    assert [%{reason: "input_token_checkpoint", observed_tokens: 81}] =
+             Orchestrator.snapshot(server, 1_000).held
+
+    assert Orchestrator.snapshot(server, 1_000).running == []
+    assert Orchestrator.snapshot(server, 1_000).retrying == []
+  end
+
+  test "checkpoint grace fails closed before warning delivery is confirmed" do
+    {pid, server, issue, worker_pid, _workspace_root} =
+      start_budget_orchestrator("checkpoint-grace-requested", 100)
+
+    put_running_entry(
+      pid,
+      issue,
+      worker_pid,
+      checkpoint_grace_options(input_token_warning_status: "requested")
+    )
+
+    send_token_update(pid, issue.id, 80)
+
+    assert Orchestrator.snapshot(server, 1_000).running == []
+
+    assert [%{reason: "input_token_checkpoint_grace", observed_tokens: 80}] =
+             Orchestrator.snapshot(server, 1_000).held
+
+    refute Process.alive?(worker_pid)
+  end
+
+  test "checkpoint grace persistence failure terminates the checkpoint turn" do
+    {pid, _server, issue, worker_pid, workspace_root} =
+      start_budget_orchestrator("checkpoint-grace-persistence", 100)
+
+    File.mkdir_p!(Path.join(workspace_root, ".symphony-holds.json"))
+
+    put_running_entry(pid, issue, worker_pid, checkpoint_grace_options())
+
+    send_token_update(pid, issue.id, 80)
+
+    state = :sys.get_state(pid)
+    assert state.running == %{}
+    assert state.hold_store_available == false
+    assert state.holds[issue.id].reason == "input_token_checkpoint_grace"
+    assert MapSet.member?(state.claimed, issue.id)
+    refute Process.alive?(worker_pid)
+  end
+
+  test "hard limit still terminates a checkpoint turn after grace is armed" do
+    {pid, server, issue, worker_pid, _workspace_root} =
+      start_budget_orchestrator("checkpoint-grace-hard-limit", 100)
+
+    put_running_entry(pid, issue, worker_pid, checkpoint_grace_options())
+
+    send_token_update(pid, issue.id, 80)
+    assert [_running] = Orchestrator.snapshot(server, 1_000).running
+
+    send_token_update(pid, issue.id, 100)
+
+    assert Orchestrator.snapshot(server, 1_000).running == []
+
+    assert [%{reason: "input_token_limit", observed_tokens: 100}] =
+             Orchestrator.snapshot(server, 1_000).held
+
+    refute Process.alive?(worker_pid)
+  end
+
+  test "abnormal checkpoint exit replaces the armed hold with a failed hold" do
+    {pid, server, issue, worker_pid, _workspace_root} =
+      start_budget_orchestrator("checkpoint-grace-failed-exit", 100)
+
+    put_running_entry(pid, issue, worker_pid, checkpoint_grace_options())
+
+    send_token_update(pid, issue.id, 80)
+    running_ref = :sys.get_state(pid).running[issue.id].ref
+    send(pid, {:DOWN, running_ref, :process, worker_pid, :boom})
+
+    assert Orchestrator.snapshot(server, 1_000).running == []
+    assert Orchestrator.snapshot(server, 1_000).retrying == []
+
+    assert [%{reason: "input_token_checkpoint_failed", observed_tokens: 80}] =
+             Orchestrator.snapshot(server, 1_000).held
+  end
+
+  test "a stalled checkpoint turn replaces the armed hold with a failed hold" do
+    {pid, server, issue, worker_pid, workspace_root} =
+      start_budget_orchestrator("checkpoint-grace-stall", 100)
+
+    write_workflow_file!(Workflow.workflow_file_path(),
+      tracker_kind: "memory",
+      workspace_root: workspace_root,
+      codex_input_token_limit: 100,
+      codex_stall_timeout_ms: 1_000
+    )
+
+    put_running_entry(pid, issue, worker_pid, checkpoint_grace_options())
+
+    send_token_update(pid, issue.id, 80)
+    assert [_running] = Orchestrator.snapshot(server, 1_000).running
+
+    :sys.replace_state(pid, fn state ->
+      update_in(
+        state.running[issue.id],
+        &Map.put(&1, :last_codex_timestamp, DateTime.add(DateTime.utc_now(), -5, :second))
+      )
+    end)
+
+    send(pid, :tick)
+    Process.sleep(100)
+
+    assert Orchestrator.snapshot(server, 1_000).running == []
+    assert Orchestrator.snapshot(server, 1_000).retrying == []
+
+    assert [%{reason: "input_token_checkpoint_failed", observed_tokens: 80}] =
+             Orchestrator.snapshot(server, 1_000).held
 
     refute Process.alive?(worker_pid)
   end
@@ -779,6 +918,21 @@ defmodule SymphonyElixir.TokenBudgetTest do
     end)
 
     {pid, name, issue, worker_pid, workspace_root}
+  end
+
+  defp checkpoint_grace_options(overrides \\ []) do
+    Keyword.merge(
+      [
+        input_token_limit: 100,
+        input_token_warning_ratio: 0.70,
+        input_token_checkpoint_grace: 10,
+        input_token_warning_sent: true,
+        input_token_warning_status: "delivered",
+        input_token_warning_threshold: 70,
+        input_token_warning_observed_at: 70
+      ],
+      overrides
+    )
   end
 
   defp put_running_entry(pid, issue, worker_pid, overrides) do
