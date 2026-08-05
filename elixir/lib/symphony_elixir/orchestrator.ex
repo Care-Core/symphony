@@ -751,6 +751,19 @@ defmodule SymphonyElixir.Orchestrator do
           observed
         )
 
+      checkpoint_hold_armed?(state, issue_id) ->
+        state
+
+      checkpoint_grace_exhausted?(running_entry, observed) and
+          Map.get(running_entry, :input_token_warning_status) == "delivered" ->
+        arm_input_token_budget_hold(
+          state,
+          issue_id,
+          running_entry,
+          "input_token_checkpoint_grace",
+          observed
+        )
+
       checkpoint_grace_exhausted?(running_entry, observed) ->
         hold_input_token_budget_issue(
           state,
@@ -773,6 +786,13 @@ defmodule SymphonyElixir.Orchestrator do
     grace = Map.get(running_entry, :input_token_checkpoint_grace)
 
     is_integer(baseline) and is_integer(grace) and grace > 0 and observed - baseline >= grace
+  end
+
+  defp checkpoint_hold_armed?(state, issue_id) do
+    match?(
+      %{reason: "input_token_checkpoint_grace"},
+      Map.get(state.holds, issue_id)
+    )
   end
 
   defp warning_threshold_reached?(running_entry, observed) do
@@ -856,6 +876,29 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.error("Failed to persist token-budget hold issue_id=#{issue_id} reason=#{inspect(persist_reason)}")
 
         held_state
+        |> Map.put(:hold_store_available, false)
+        |> terminate_running_issue(issue_id, false)
+        |> Map.update!(:claimed, &MapSet.put(&1, issue_id))
+    end
+  end
+
+  defp arm_input_token_budget_hold(state, issue_id, running_entry, reason, observed) do
+    hold = build_input_token_budget_hold(issue_id, running_entry, reason, observed)
+
+    armed_state = %{
+      state
+      | holds: Map.put(state.holds, issue_id, hold),
+        claimed: MapSet.put(state.claimed, issue_id)
+    }
+
+    case HoldStore.persist(Config.local_workspace_root(), armed_state.holds) do
+      :ok ->
+        armed_state
+
+      {:error, persist_reason} ->
+        Logger.error("Failed to persist armed token-budget hold issue_id=#{issue_id} reason=#{inspect(persist_reason)}")
+
+        armed_state
         |> Map.put(:hold_store_available, false)
         |> terminate_running_issue(issue_id, false)
         |> Map.update!(:claimed, &MapSet.put(&1, issue_id))
@@ -2057,7 +2100,11 @@ defmodule SymphonyElixir.Orchestrator do
     do: {:reply, {:error, :deferred_wait_disabled}, state}
 
   def handle_call({:continue_after_turn, issue_id}, _from, state) do
-    {:reply, not waiting_watcher?(state, issue_id), state}
+    continue? =
+      not waiting_watcher?(state, issue_id) and
+        not checkpoint_hold_armed?(state, issue_id)
+
+    {:reply, continue?, state}
   end
 
   def handle_call(:request_refresh, _from, state) do
@@ -2267,6 +2314,11 @@ defmodule SymphonyElixir.Orchestrator do
          _options
        ) do
     {:reply, {:error, :progress_state_unavailable}, state}
+  end
+
+  defp authorize_resume(%State{running: running} = state, issue_id, _hold, _options)
+       when is_map_key(running, issue_id) do
+    {:reply, {:error, :issue_running}, state}
   end
 
   defp authorize_resume(state, issue_id, hold, options) do
