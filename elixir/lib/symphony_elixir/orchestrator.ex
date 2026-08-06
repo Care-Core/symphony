@@ -2897,11 +2897,19 @@ defmodule SymphonyElixir.Orchestrator do
   defp require_override_author(%{human_author?: true}), do: :ok
   defp require_override_author(_record), do: {:error, :review_override_author_not_human}
 
-  defp require_override_timestamp(%{created_at: created_at}, timestamp) do
-    if is_binary(created_at) and created_at == timestamp,
+  # Bind to `updated_at`, not `created_at`. That is the field live override
+  # references actually carry, and it is the security-correct choice: editing a
+  # comment advances `updated_at`, so an edit invalidates any authorization minted
+  # against the prior content. Binding to `created_at` would let an authorized
+  # comment be rewritten after the fact while its override stayed valid.
+  defp require_override_timestamp(%{updated_at: updated_at}, timestamp) do
+    if is_binary(updated_at) and updated_at == timestamp,
       do: :ok,
       else: {:error, :review_override_timestamp_mismatch}
   end
+
+  defp require_override_timestamp(_record, _timestamp),
+    do: {:error, :review_override_timestamp_mismatch}
 
   defp validate_review_override(progress, override) do
     case Map.get(progress, "used_review_overrides", []) do

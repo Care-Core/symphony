@@ -228,6 +228,7 @@ defmodule SymphonyElixir.Linear.Client do
     comment(id: $id) {
       id
       createdAt
+      updatedAt
       issue {
         identifier
       }
@@ -251,9 +252,27 @@ defmodule SymphonyElixir.Linear.Client do
   The returned `:human_author?` is true only when the comment carries an active
   human `user` and no `botActor`. Linear attributes agent/integration comments to
   a `botActor`, so its presence positively identifies a non-human author.
+
+  `:updated_at` — not `:created_at` — is the field an override reference binds to.
+  Verified against three live references in use:
+
+      35d03f7d-…@2026-08-06T15:14:10.490Z  createdAt .572Z  updatedAt .490Z
+      748481fc-…@2026-08-06T11:34:18.357Z  createdAt .637Z  updatedAt .357Z
+      54f4046d-…@2026-08-06T09:41:42.006Z  createdAt .033Z  updatedAt .006Z
+
+  This is also the security-correct choice: editing a comment advances `updatedAt`,
+  so an edit invalidates any authorization minted against the prior content. Binding
+  to `createdAt` would let an authorized comment be rewritten after the fact while
+  its override stayed valid. `:created_at` is still returned for diagnostics.
   """
   @spec fetch_review_override_comment(String.t(), keyword()) ::
-          {:ok, %{issue_identifier: String.t(), created_at: String.t(), human_author?: boolean()}}
+          {:ok,
+           %{
+             issue_identifier: String.t(),
+             created_at: String.t(),
+             updated_at: String.t(),
+             human_author?: boolean()
+           }}
           | {:error, term()}
   def fetch_review_override_comment(comment_id, opts \\ []) when is_binary(comment_id) do
     case graphql(@review_override_comment_query, %{"id" => comment_id}, opts) do
@@ -269,13 +288,15 @@ defmodule SymphonyElixir.Linear.Client do
        when is_map(comment) do
     issue_identifier = get_in(comment, ["issue", "identifier"])
     created_at = Map.get(comment, "createdAt")
+    updated_at = Map.get(comment, "updatedAt")
 
-    if is_binary(issue_identifier) and issue_identifier != "" and is_binary(created_at) and
-         created_at != "" do
+    if is_binary(issue_identifier) and issue_identifier != "" and is_binary(updated_at) and
+         updated_at != "" do
       {:ok,
        %{
          issue_identifier: issue_identifier,
          created_at: created_at,
+         updated_at: updated_at,
          human_author?: human_comment_author?(comment)
        }}
     else

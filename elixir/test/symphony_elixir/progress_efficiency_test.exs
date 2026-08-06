@@ -179,21 +179,24 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
          {:ok,
           %{
             issue_identifier: "MT-HOA-VALID",
-            created_at: "2026-08-06T15:14:10.490Z",
+            created_at: "2026-08-06T15:14:10.572Z",
+            updated_at: "2026-08-06T15:14:10.490Z",
             human_author?: true
           }}, :authorized},
         {"HOA-03 a comment on a different issue is denied", "hoa-wrong-issue",
          {:ok,
           %{
             issue_identifier: "MT-SOME-OTHER-ISSUE",
-            created_at: "2026-08-06T15:14:10.490Z",
+            created_at: "2026-08-06T15:14:10.572Z",
+            updated_at: "2026-08-06T15:14:10.490Z",
             human_author?: true
           }}, :denied},
         {"HOA-04 a comment authored by a bot actor is denied", "hoa-bot-author",
          {:ok,
           %{
             issue_identifier: "MT-HOA-BOT-AUTHOR",
-            created_at: "2026-08-06T15:14:10.490Z",
+            created_at: "2026-08-06T15:14:10.572Z",
+            updated_at: "2026-08-06T15:14:10.490Z",
             human_author?: false
           }}, :denied},
         {"HOA-05 a timestamp mismatch is denied", "hoa-timestamp",
@@ -201,6 +204,7 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
           %{
             issue_identifier: "MT-HOA-TIMESTAMP",
             created_at: "2026-08-06T09:00:00.000Z",
+            updated_at: "2026-08-06T09:00:00.000Z",
             human_author?: true
           }}, :denied},
         {"HOA-02 a non-existent comment is denied", "hoa-missing",
@@ -268,7 +272,8 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
       {:ok,
        %{
          issue_identifier: "MT-HOA-REPLAY",
-         created_at: "2026-08-06T15:14:10.490Z",
+         created_at: "2026-08-06T15:14:10.572Z",
+         updated_at: "2026-08-06T15:14:10.490Z",
          human_author?: true
        }}
     end)
