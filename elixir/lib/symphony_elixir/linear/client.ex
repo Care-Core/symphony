@@ -223,6 +223,77 @@ defmodule SymphonyElixir.Linear.Client do
     end
   end
 
+  @review_override_comment_query """
+  query SymphonyReviewOverrideComment($id: String!) {
+    comment(id: $id) {
+      id
+      createdAt
+      issue {
+        identifier
+      }
+      user {
+        id
+        active
+      }
+      botActor {
+        id
+      }
+    }
+  }
+  """
+
+  @doc """
+  Resolve one Linear comment referenced by a human review override.
+
+  Returns a normalized authenticity record. Every failure path is an error —
+  the caller must treat anything other than `{:ok, record}` as a denial.
+
+  The returned `:human_author?` is true only when the comment carries an active
+  human `user` and no `botActor`. Linear attributes agent/integration comments to
+  a `botActor`, so its presence positively identifies a non-human author.
+  """
+  @spec fetch_review_override_comment(String.t(), keyword()) ::
+          {:ok, %{issue_identifier: String.t(), created_at: String.t(), human_author?: boolean()}}
+          | {:error, term()}
+  def fetch_review_override_comment(comment_id, opts \\ []) when is_binary(comment_id) do
+    case graphql(@review_override_comment_query, %{"id" => comment_id}, opts) do
+      {:ok, body} -> normalize_review_override_comment(body)
+      {:error, reason} -> {:error, {:review_override_lookup_failed, reason}}
+    end
+  end
+
+  defp normalize_review_override_comment(%{"errors" => [_ | _]}),
+    do: {:error, :review_override_lookup_failed}
+
+  defp normalize_review_override_comment(%{"data" => %{"comment" => comment}})
+       when is_map(comment) do
+    issue_identifier = get_in(comment, ["issue", "identifier"])
+    created_at = Map.get(comment, "createdAt")
+
+    if is_binary(issue_identifier) and issue_identifier != "" and is_binary(created_at) and
+         created_at != "" do
+      {:ok,
+       %{
+         issue_identifier: issue_identifier,
+         created_at: created_at,
+         human_author?: human_comment_author?(comment)
+       }}
+    else
+      {:error, :review_override_comment_malformed}
+    end
+  end
+
+  defp normalize_review_override_comment(_body), do: {:error, :review_override_comment_missing}
+
+  defp human_comment_author?(comment) do
+    # Fail closed: an author is human only when a bot actor is definitively absent
+    # and an active user record is definitively present.
+    case {Map.get(comment, "botActor"), Map.get(comment, "user")} do
+      {nil, %{"id" => id, "active" => true}} when is_binary(id) and id != "" -> true
+      _other -> false
+    end
+  end
+
   @spec graphql(String.t(), map(), keyword()) :: {:ok, map()} | {:error, term()}
   def graphql(query, variables \\ %{}, opts \\ [])
       when is_binary(query) and is_map(variables) and is_list(opts) do
