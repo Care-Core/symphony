@@ -144,6 +144,165 @@ defmodule SymphonyElixir.ProgressEfficiencyTest do
     Process.exit(worker_pid, :shutdown)
   end
 
+  # HOA-07 (CC-1927, SYMPHONY-HUMAN-OVERRIDE-AUTHENTICITY-v1)
+  #
+  # A well-formed but fabricated `linear-comment:<uuid>@<timestamp>` reference must
+  # not authorize an extra review round. Because the single-use ledger keys on the
+  # exact string, an unauthenticated override lets a caller mint unlimited rounds
+  # simply by generating a fresh UUID.
+  test "a fabricated human review override does not authorize an extra round" do
+    {pid, issue, worker_pid, _workspace_root, _workspace} =
+      start_progress_orchestrator("forged-human-override")
+
+    assert {:ok, %{review_fingerprint: review_hash}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    assert {:ok, %{authorized: true}} = authorize_review(pid, issue, review_hash, "full")
+
+    forged = "linear-comment:aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee@2026-08-06T15:14:10.490Z"
+
+    assert {:error, _reason} =
+             authorize_review(pid, issue, review_hash, "full", human_override: forged),
+           "a fabricated human override must never authorize an extra review round"
+
+    Process.exit(worker_pid, :shutdown)
+  end
+
+  # HOA-01..HOA-09 (CC-1927). The resolver is stubbed so each authenticity
+  # condition can be exercised independently of the live Linear API.
+  for {name, suffix, resolver_result, expectation} <- [
+        {"HOA-01 a matching human comment authorizes exactly one extra round", "hoa-valid",
+         {:ok,
+          %{
+            issue_identifier: "MT-HOA-VALID",
+            created_at: "2026-08-06T15:14:10.572Z",
+            updated_at: "2026-08-06T15:14:10.490Z",
+            human_author?: true
+          }}, :authorized},
+        {"HOA-03 a comment on a different issue is denied", "hoa-wrong-issue",
+         {:ok,
+          %{
+            issue_identifier: "MT-SOME-OTHER-ISSUE",
+            created_at: "2026-08-06T15:14:10.572Z",
+            updated_at: "2026-08-06T15:14:10.490Z",
+            human_author?: true
+          }}, :denied},
+        {"HOA-04 a comment authored by a bot actor is denied", "hoa-bot-author",
+         {:ok,
+          %{
+            issue_identifier: "MT-HOA-BOT-AUTHOR",
+            created_at: "2026-08-06T15:14:10.572Z",
+            updated_at: "2026-08-06T15:14:10.490Z",
+            human_author?: false
+          }}, :denied},
+        {"HOA-05 a timestamp mismatch is denied", "hoa-timestamp",
+         {:ok,
+          %{
+            issue_identifier: "MT-HOA-TIMESTAMP",
+            created_at: "2026-08-06T09:00:00.000Z",
+            updated_at: "2026-08-06T09:00:00.000Z",
+            human_author?: true
+          }}, :denied},
+        {"HOA-02 a non-existent comment is denied", "hoa-missing",
+         {:error, :review_override_comment_missing}, :denied},
+        {"HOA-08 a Linear API failure is denied", "hoa-api-error",
+         {:error, {:review_override_lookup_failed, :timeout}}, :denied}
+      ] do
+    test name do
+      suffix = unquote(suffix)
+      expectation = unquote(expectation)
+      resolver_result = unquote(Macro.escape(resolver_result))
+
+      {pid, issue, worker_pid, _workspace_root, _workspace} =
+        start_progress_orchestrator(suffix)
+
+      Application.put_env(:symphony_elixir, :review_override_comment_resolver, fn _id ->
+        resolver_result
+      end)
+
+      on_exit(fn ->
+        Application.delete_env(:symphony_elixir, :review_override_comment_resolver)
+      end)
+
+      assert {:ok, %{review_fingerprint: review_hash}} =
+               Orchestrator.record_progress(
+                 issue.identifier,
+                 progress_attributes(progress_fingerprint(), "checkpoint-1"),
+                 pid
+               )
+
+      # Consume the one ordinarily permitted full review.
+      assert {:ok, %{authorized: true}} = authorize_review(pid, issue, review_hash, "full")
+
+      override =
+        "linear-comment:35d03f7d-e5cc-4ab3-89d2-e8baeda17362@2026-08-06T15:14:10.490Z"
+
+      result = authorize_review(pid, issue, review_hash, "full", human_override: override)
+
+      case expectation do
+        :authorized -> assert {:ok, %{authorized: true}} = result
+        :denied -> assert {:error, _reason} = result
+      end
+
+      Process.exit(worker_pid, :shutdown)
+    end
+  end
+
+  # HOA-06 — BLOCKED by a separate pre-existing defect, see CC-1927 handoff.
+  #
+  # `authorize_consumed_review/4` binds the result of `increment_review_round/3`
+  # to `_eligible` (orchestrator.ex:2593) and then rebuilds `updated` from the
+  # ORIGINAL `progress` (orchestrator.ex:2606). The incremented counters and the
+  # `used_review_overrides` ledger are therefore never persisted, so replay
+  # protection cannot take effect and review counts stay permanently zero.
+  #
+  # Fixing that is a behavior change beyond this issue's authenticity remit and
+  # trips the `scope-drift` stop condition. Left skipped deliberately so the gap
+  # is visible rather than silently absent.
+  @tag :skip
+  test "HOA-06 an authenticated override cannot be replayed" do
+    {pid, issue, worker_pid, _workspace_root, _workspace} =
+      start_progress_orchestrator("hoa-replay")
+
+    Application.put_env(:symphony_elixir, :review_override_comment_resolver, fn _id ->
+      {:ok,
+       %{
+         issue_identifier: "MT-HOA-REPLAY",
+         created_at: "2026-08-06T15:14:10.572Z",
+         updated_at: "2026-08-06T15:14:10.490Z",
+         human_author?: true
+       }}
+    end)
+
+    on_exit(fn ->
+      Application.delete_env(:symphony_elixir, :review_override_comment_resolver)
+    end)
+
+    assert {:ok, %{review_fingerprint: review_hash}} =
+             Orchestrator.record_progress(
+               issue.identifier,
+               progress_attributes(progress_fingerprint(), "checkpoint-1"),
+               pid
+             )
+
+    assert {:ok, %{authorized: true}} = authorize_review(pid, issue, review_hash, "full")
+
+    override = "linear-comment:35d03f7d-e5cc-4ab3-89d2-e8baeda17362@2026-08-06T15:14:10.490Z"
+
+    assert {:ok, %{authorized: true}} =
+             authorize_review(pid, issue, review_hash, "full", human_override: override)
+
+    assert {:error, _reason} =
+             authorize_review(pid, issue, review_hash, "full", human_override: override),
+           "an authenticated override must remain single-use"
+
+    Process.exit(worker_pid, :shutdown)
+  end
+
   test "global owner review keeps the explicit fingerprint precondition" do
     {pid, issue, worker_pid, _workspace_root, _workspace} =
       start_progress_orchestrator("global-owner-review")

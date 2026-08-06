@@ -2561,7 +2561,7 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, issue_id} ->
         case consume_issue_request_nonce(state, issue_id, attributes) do
           {:ok, authorized_state} ->
-            authorize_consumed_review(authorized_state, issue_id, attributes)
+            authorize_consumed_review(authorized_state, issue_id, issue_identifier, attributes)
 
           {:error, reason} ->
             {:error, reason, state}
@@ -2572,9 +2572,14 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp authorize_consumed_review(state, issue_id, attributes) do
+  defp authorize_consumed_review(state, issue_id, issue_identifier, attributes) do
     with %{} = progress <- Map.get(state.progress, issue_id),
          {:ok, kind} <- normalize_review_kind(option_value(attributes, :kind)),
+         :ok <-
+           authenticate_review_override(
+             issue_identifier,
+             option_value(attributes, :human_override)
+           ),
          {:ok, requested_fingerprint} <-
            requested_review_fingerprint(attributes, progress),
          true <- requested_fingerprint == Map.get(progress, "review_fingerprint_hash"),
@@ -2826,6 +2831,85 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp valid_human_override?(override),
     do: is_binary(override) and Regex.match?(@human_override_pattern, override)
+
+  # SYMPHONY-HUMAN-OVERRIDE-AUTHENTICITY-v1 (CC-1927).
+  #
+  # Format validity is not authorization. A well-formed reference is trivially
+  # forgeable by the sandboxed agent, and the single-use ledger keys on the exact
+  # string, so an unauthenticated override yields unlimited extra rounds. Resolve
+  # the reference against the live Linear comment and fail closed on anything
+  # other than a complete match.
+  defp authenticate_review_override(_issue_identifier, nil), do: :ok
+
+  defp authenticate_review_override(issue_identifier, override) do
+    if valid_human_override?(override) do
+      with {:ok, comment_id, timestamp} <- split_human_override(override),
+           {:ok, record} <- resolve_review_override_comment(comment_id),
+           :ok <- require_override_issue(record, issue_identifier),
+           :ok <- require_override_author(record),
+           :ok <- require_override_timestamp(record, timestamp) do
+        :ok
+      else
+        {:error, reason} -> {:error, reason}
+        _other -> {:error, :review_override_unauthenticated}
+      end
+    else
+      # A malformed override is a denial, not a silent downgrade to "no override".
+      {:error, :review_override_invalid}
+    end
+  end
+
+  defp split_human_override(override) do
+    case String.split(override, "@", parts: 2) do
+      ["linear-comment:" <> comment_id, timestamp]
+      when byte_size(comment_id) > 0 and byte_size(timestamp) > 0 ->
+        {:ok, comment_id, timestamp}
+
+      _other ->
+        {:error, :review_override_invalid}
+    end
+  end
+
+  defp resolve_review_override_comment(comment_id) do
+    resolver =
+      Application.get_env(
+        :symphony_elixir,
+        :review_override_comment_resolver,
+        &SymphonyElixir.Linear.Client.fetch_review_override_comment/1
+      )
+
+    try do
+      case resolver.(comment_id) do
+        {:ok, %{} = record} -> {:ok, record}
+        {:error, _reason} -> {:error, :review_override_unauthenticated}
+        _other -> {:error, :review_override_unauthenticated}
+      end
+    rescue
+      _exception -> {:error, :review_override_unauthenticated}
+    catch
+      _kind, _value -> {:error, :review_override_unauthenticated}
+    end
+  end
+
+  defp require_override_issue(%{issue_identifier: identifier}, identifier), do: :ok
+  defp require_override_issue(_record, _identifier), do: {:error, :review_override_wrong_issue}
+
+  defp require_override_author(%{human_author?: true}), do: :ok
+  defp require_override_author(_record), do: {:error, :review_override_author_not_human}
+
+  # Bind to `updated_at`, not `created_at`. That is the field live override
+  # references actually carry, and it is the security-correct choice: editing a
+  # comment advances `updated_at`, so an edit invalidates any authorization minted
+  # against the prior content. Binding to `created_at` would let an authorized
+  # comment be rewritten after the fact while its override stayed valid.
+  defp require_override_timestamp(%{updated_at: updated_at}, timestamp) do
+    if is_binary(updated_at) and updated_at == timestamp,
+      do: :ok,
+      else: {:error, :review_override_timestamp_mismatch}
+  end
+
+  defp require_override_timestamp(_record, _timestamp),
+    do: {:error, :review_override_timestamp_mismatch}
 
   defp validate_review_override(progress, override) do
     case Map.get(progress, "used_review_overrides", []) do
